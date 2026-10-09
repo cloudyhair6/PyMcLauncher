@@ -18,6 +18,7 @@ Before running the launcher, make sure you have the following installed on your 
    ```
 
 2. **Install Node Modules:**
+   node 24.19.0
    Because the `node_modules` folder isn't copied over when sharing the project, you must install the required Node dependencies manually. Run the following command in the project directory:
    ```bash
    npm install
