@@ -44,6 +44,8 @@ If you prefer to install dependencies and run the launcher manually from a termi
 
 ---
 
+any bugs please report in the [issues](https://github.com/cloudyhair6/PyMcLauncher/issues/new).
+
 ## Project Structure
 
 - `launcher.py` — Main graphical launcher interface (PyQt6).
