@@ -8,11 +8,18 @@ import zipfile
 from pathlib import Path
 import os
 
-# Enable UTF-8 output on Windows
+# Enable UTF-8 output on Windows without replacing/closing sys.stdout.buffer
 if sys.platform == 'win32':
     os.environ['PYTHONIOENCODING'] = 'utf-8'
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+
+_pkg_dir = Path(__file__).resolve().parent
+_root_dir = _pkg_dir.parent if _pkg_dir.name == "backend" else _pkg_dir
+for _p in [str(_pkg_dir), str(_root_dir)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from utils import (
     get_dir,
     ensure_download_dir, 
@@ -46,27 +53,25 @@ def list_versions():
     print(f"{'Version':<20} {'Type':<15} {'Release Date':<30}")
     print("-" * 70)
     
-    for version_id, version_type in versions:
+    for version_id, version_type, release_date in versions:
         type_label = version_type.replace("old_", "").upper()
-        print(f"{version_id:<20} {type_label:<15}")
+        print(f"{version_id:<20} {type_label:<15} {release_date:<30}")
     
     print("-" * 70)
 
-def download_version(version_id, jar_type="client"):
+def download_version(version_id, jar_type="client", json_mode=None, is_dev_mode=None):
     """Download Minecraft game JAR for a specific version."""
-    global dev_mode, download_dir_name
+    global dev_mode, download_dir_name, json_output
+    if json_mode is not None:
+        json_output = json_mode
+    if is_dev_mode is not None:
+        dev_mode = is_dev_mode
     
     ensure_download_dir()
     
     print(f"Downloading Minecraft {version_id} ({jar_type})...")
     
-    # Get version info
-    version_info = get_version_info(version_id)
-    if not version_info:
-        print(f"Error: Version {version_id} not found")
-        return False
-    
-    # Get version JSON which contains download URLs
+    # Get version JSON which contains download URLs (uses local cache if available)
     version_json = get_version_json(version_id)
     if not version_json:
         print(f"Error: Could not fetch metadata for version {version_id}")
@@ -95,9 +100,14 @@ def download_version(version_id, jar_type="client"):
                 sys.stdout.flush()
             if verify_sha1(file_path, expected_sha1):
                 print(f"[OK] Version {version_id} ({jar_type}) already exists and verified.")
-            return True
+                if dev_mode:
+                    extract_source_code(version_id, jar_type, version_json)
+                return True
+            print(f"[WARN] Existing {jar_type}.jar failed SHA-1 verification. Re-downloading...")
         elif not expected_sha1:
             print(f"[OK] Version {version_id} ({jar_type}) already exists.")
+            if dev_mode:
+                extract_source_code(version_id, jar_type, version_json)
             return True
     
     # Download the file
@@ -117,60 +127,17 @@ def download_version(version_id, jar_type="client"):
         return False
 
 def extract_source_code(version_id, jar_type, version_json):
-    """Extract source code from mapping files if available."""
-    global download_dir_name
-    import subprocess
-    
-    print(f"\nExtracting source code for {version_id} ({jar_type})...")
-    
-    # Check for mapping files in version JSON
-    if 'downloads' not in version_json:
-        print("No mappings available")
-        return
-    
-    mapping_key = f"{jar_type}_mappings"
-    if mapping_key not in version_json['downloads']:
-        print(f"No {jar_type} mappings available for version {version_id}")
-        return
-    
-    mappings_download = version_json['downloads'][mapping_key]
-    mappings_url = mappings_download['url']
-    
-    # Download mappings file
-    mappings_dir = get_download_dir() / "mappings"
-    mappings_dir.mkdir(parents=True, exist_ok=True)
-    mappings_path = mappings_dir / f"{version_id}-{jar_type}.txt"
-    
-    print(f"Downloading {jar_type} mappings...")
-    if not download_file(mappings_url, mappings_path):
-        print(f"Failed to download {jar_type} mappings")
-        return
-    
-    print(f"[OK] Downloaded mappings to {mappings_path}")
-    
-    # Extract deobfuscated source code
-    source_dir = get_download_dir() / "source" / f"{version_id}-{jar_type}"
-    
-    print(f"\nGenerating deobfuscated Java source files...")
-    print(f"This may take a minute or two...\n")
-    
-    try:
-        # Call the extract_source_code.py script
-        script_path = Path(__file__).parent / "extract_source_code.py"
-        result = subprocess.run(
-            [sys.executable, str(script_path), 
-             "--mappings", str(mappings_path),
-             "--output", str(source_dir)],
-            capture_output=False
-        )
-        
-        if result.returncode == 0:
-            print(f"[OK] Source code extracted to: {source_dir}")
-        else:
-            print(f"[FAIL] Failed to extract source code")
-    
-    except Exception as e:
-        print(f"Error extracting source code: {e}")
+    """Extract and decompile source code for any Minecraft version."""
+    from extract_source_code import extract_version_source
+    jar_path = get_dir("versions") / f"{version_id}-{jar_type}.jar"
+    source_dir = get_dir("source") / f"{version_id}-{jar_type}"
+    extract_version_source(
+        version_id=version_id,
+        jar_type=jar_type,
+        jar_path=jar_path,
+        output_dir=source_dir,
+        json_output=globals().get('json_output', False)
+    )
 
 def main():
     global dev_mode, download_dir_name
@@ -221,14 +188,12 @@ def main():
     global json_output
     json_output = args.json
     
-    # Handle directory setup
+    # Handle directory setup (respect active profile in launcher_config.json unless --dir is passed)
+    if args.dev_mode:
+        dev_mode = True
     if args.dir:
         set_download_dir(args.dir)
         download_dir_name = args.dir
-    elif args.dev_mode:
-        dev_mode = True
-        download_dir_name = "dev_minecraft_downloads"
-        set_download_dir(download_dir_name)
     
     if args.version.lower() == "list":
         list_versions()

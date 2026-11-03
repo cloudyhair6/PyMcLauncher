@@ -1,0 +1,19 @@
+{
+    "PC App only (comes with development soon will without)": {
+        "Files": [
+            "setup-start.bat",
+            "installer_and_updater.py",
+            "launcher.py",
+            "requirements.txt",
+            "README.md",
+            "backend/",
+            "images/"
+        ],
+        "Update Ignore Files": [
+            ".cache/",
+            "__pycache__/",
+            "minecraft_downloads/"
+        ],
+        "Message": "Run the setup-start.bat file first, it will tell you what to do next!"
+    }
+}

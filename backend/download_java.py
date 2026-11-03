@@ -22,21 +22,32 @@ import hashlib
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
-# Import utils for formatting
-sys.path.insert(0, str(Path(__file__).parent))
+# Ensure backend and root directories are in sys.path
+_pkg_dir = Path(__file__).resolve().parent
+_root_dir = _pkg_dir.parent if _pkg_dir.name == "backend" else _pkg_dir
+for _p in [str(_pkg_dir), str(_root_dir)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 try:
-    from utils import get_download_dir, get_dir, set_download_dir
+    from utils import get_download_dir, get_dir, set_download_dir, ROOT_DIR
     json_output = False
 except ImportError:
+    ROOT_DIR = _root_dir
     def get_download_dir():
-        return Path('minecraft_downloads')
+        return ROOT_DIR / 'minecraft_downloads'
     
     def set_download_dir(path):
         pass
 
 
 def get_minecraft_version_manifest() -> Optional[Dict]:
-    """Get Minecraft version manifest"""
+    """Get Minecraft version manifest using shared utils cache"""
+    try:
+        from utils import fetch_version_manifest
+        return fetch_version_manifest()
+    except Exception:
+        pass
     try:
         response = requests.get(
             'https://launchermeta.mojang.com/mc/game/version_manifest.json',
@@ -50,7 +61,14 @@ def get_minecraft_version_manifest() -> Optional[Dict]:
 
 
 def get_version_info(version_id: str) -> Optional[Dict]:
-    """Get detailed version info"""
+    """Get detailed version info (using shared in-memory + disk cache first)"""
+    try:
+        from utils import get_version_json
+        cached = get_version_json(version_id)
+        if cached:
+            return cached
+    except Exception:
+        pass
     try:
         manifest = get_minecraft_version_manifest()
         if not manifest:
@@ -164,7 +182,7 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
             if globals().get('json_output', False):
                 print(json.dumps({"type": "progress", "progress": 100, "status": "Verifying Java installation..."}))
                 sys.stdout.flush()
-            if verify_java_installation(str(java_exec)):
+            if verify_java_installation(str(java_exec), expected_major_version=major_version):
                 logger.info(f"[OK] Java runtime {component} (v{major_version}) already downloaded")
                 return True
             else:
@@ -173,6 +191,24 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
                     shutil.rmtree(java_home, onerror=remove_readonly)
                 except Exception as e:
                     logger.warning(f"Failed to clean corrupt Java installation: {e}")
+
+        # Java Runtime Re-Use: Check existing runtimes across all directories & system before downloading
+        existing_exec = find_existing_java_runtime(component, major_version)
+        if existing_exec and existing_exec.exists():
+            existing_home = existing_exec.parent.parent
+            logger.info(f"[INFO] Re-using existing Java runtime for {component} (v{major_version}) from {existing_home}")
+            if existing_home.resolve() != java_home.resolve():
+                try:
+                    if platform.system() == 'Windows':
+                        import _winapi
+                        _winapi.CreateJunction(str(existing_home.resolve()), str(java_home.resolve()))
+                        logger.info(f"[OK] Created junction for {component} in {output_dir}")
+                    else:
+                        java_home.symlink_to(existing_home, target_is_directory=True)
+                except Exception:
+                    pass
+            logger.info(f"[OK] Java runtime {component} (v{major_version}) ready via runtime re-use")
+            return True
             
         logger.info(f"Downloading Java runtime {component} (Version {major_version}) from Adoptium...")
         
@@ -196,14 +232,15 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
                         f.write(chunk)
                         downloaded += len(chunk)
                         if total_size:
-                            percent = (downloaded / total_size) * 100
+                            dl_percent = (downloaded / total_size) * 100.0
+                            overall_percent = dl_percent * 0.5
                             if globals().get('json_output', False):
-                                if percent - last_percent >= 1.0 or percent == 100:
-                                    print(json.dumps({"type": "progress", "progress": percent, "status": f"Downloading Java: {percent:.1f}%"}))
+                                if dl_percent - last_percent >= 1.0 or dl_percent >= 100.0:
+                                    print(json.dumps({"type": "progress", "progress": overall_percent, "status": f"Downloading Java ({dl_percent:.1f}%): {overall_percent:.1f}%"}))
                                     sys.stdout.flush()
-                                    last_percent = percent
+                                    last_percent = dl_percent
                             else:
-                                sys.stdout.write(f"\rDownloading Java: {percent:.1f}%")
+                                sys.stdout.write(f"\rDownloading Java: {dl_percent:.1f}% (Overall: {overall_percent:.1f}%)")
                                 sys.stdout.flush()
             if not globals().get('json_output', False):
                 print()
@@ -215,18 +252,19 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
                     # Adoptium zips usually have a root folder like 'jdk-17.0.8+7-jre'
                     # We want to extract its contents directly into java_home, or just extract and rename
                     members = z.infolist()
-                    total_members = len(members)
+                    total_members = max(len(members), 1)
                     last_percent = -1
                     for i, member in enumerate(members):
                         z.extract(member, output_dir)
-                        percent = (i / total_members) * 100
+                        ext_percent = ((i + 1) / total_members) * 100.0
+                        overall_percent = 50.0 + (ext_percent * 0.5)
                         if globals().get('json_output', False):
-                            if percent - last_percent >= 1.0 or i == total_members - 1:
-                                print(json.dumps({"type": "progress", "progress": percent, "status": f"Extracting Java: {percent:.1f}%"}))
+                            if ext_percent - last_percent >= 1.0 or i == total_members - 1:
+                                print(json.dumps({"type": "progress", "progress": overall_percent, "status": f"Extracting Java ({ext_percent:.1f}%): {overall_percent:.1f}%"}))
                                 sys.stdout.flush()
-                                last_percent = percent
+                                last_percent = ext_percent
                         else:
-                            sys.stdout.write(f"\rExtracting Java: {percent:.1f}%")
+                            sys.stdout.write(f"\rExtracting Java: {ext_percent:.1f}% (Overall: {overall_percent:.1f}%)")
                             sys.stdout.flush()
                     if not globals().get('json_output', False):
                         print()
@@ -240,18 +278,19 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
                 import tarfile
                 with tarfile.open(tmp_archive, 'r:gz') as t:
                     members = t.getmembers()
-                    total_members = len(members)
+                    total_members = max(len(members), 1)
                     last_percent = -1
                     for i, member in enumerate(members):
                         t.extract(member, output_dir)
-                        percent = (i / total_members) * 100
+                        ext_percent = ((i + 1) / total_members) * 100.0
+                        overall_percent = 50.0 + (ext_percent * 0.5)
                         if globals().get('json_output', False):
-                            if percent - last_percent >= 1.0 or i == total_members - 1:
-                                print(json.dumps({"type": "progress", "progress": percent, "status": f"Extracting Java: {percent:.1f}%"}))
+                            if ext_percent - last_percent >= 1.0 or i == total_members - 1:
+                                print(json.dumps({"type": "progress", "progress": overall_percent, "status": f"Extracting Java ({ext_percent:.1f}%): {overall_percent:.1f}%"}))
                                 sys.stdout.flush()
-                                last_percent = percent
+                                last_percent = ext_percent
                         else:
-                            sys.stdout.write(f"\rExtracting Java: {percent:.1f}%")
+                            sys.stdout.write(f"\rExtracting Java: {ext_percent:.1f}% (Overall: {overall_percent:.1f}%)")
                             sys.stdout.flush()
                     if not globals().get('json_output', False):
                         print()
@@ -282,28 +321,231 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
         return False
 
 
-def verify_java_installation(java_path: Optional[str] = None) -> bool:
-    """Verify Java installation"""
+_VERIFIED_JAVA_DISK_CACHE = ROOT_DIR / ".cache" / "verified_java.json"
+_verified_java_mem_cache = {}
+
+
+def _load_verified_java_cache() -> Dict:
+    try:
+        if _VERIFIED_JAVA_DISK_CACHE.exists():
+            with open(_VERIFIED_JAVA_DISK_CACHE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_verified_java_cache(cache_data: Dict):
+    try:
+        _VERIFIED_JAVA_DISK_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_VERIFIED_JAVA_DISK_CACHE, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, indent=2)
+    except Exception:
+        pass
+
+
+def parse_java_major_version(ver_str: str) -> Optional[int]:
+    """Parse major version number from java -version output or version string (e.g. '1.8.0_351' -> 8, '25.0.5' -> 25)."""
+    try:
+        clean = ver_str.strip('"\'; \r\n')
+        parts = clean.split('.')
+        if parts:
+            if parts[0] == '1' and len(parts) > 1:
+                return int(parts[1])
+            return int(parts[0])
+    except Exception:
+        pass
+    return None
+
+
+def get_java_version_details(java_exec: str) -> Optional[Dict]:
+    """Query java executable and return {'major_version': int, 'version_str': str} with disk mtime caching."""
+    p = Path(java_exec)
+    if not p.exists():
+        return None
+    try:
+        mtime = p.stat().st_mtime
+        key = str(p.resolve())
+        if key in _verified_java_mem_cache and _verified_java_mem_cache[key].get("mtime") == mtime:
+            return _verified_java_mem_cache[key]
+
+        disk_cache = _load_verified_java_cache()
+        if key in disk_cache and disk_cache[key].get("mtime") == mtime:
+            _verified_java_mem_cache[key] = disk_cache[key]
+            return disk_cache[key]
+
+        result = subprocess.run(
+            [str(p.resolve()), '-version'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
+        )
+        if result.returncode == 0:
+            lines = (result.stderr or result.stdout or "").splitlines()
+            ver_str = "unknown"
+            for line in lines:
+                if "version" in line.lower():
+                    spl = line.split()
+                    if len(spl) >= 3:
+                        ver_str = spl[2].strip('"')
+                        break
+            major = parse_java_major_version(ver_str)
+            entry = {
+                "mtime": mtime,
+                "version_str": ver_str,
+                "major_version": major
+            }
+            _verified_java_mem_cache[key] = entry
+            disk_cache[key] = entry
+            _save_verified_java_cache(disk_cache)
+            return entry
+    except Exception:
+        pass
+    return None
+
+
+def verify_java_installation(java_path: Optional[str] = None, expected_major_version: Optional[int] = None) -> bool:
+    """Verify Java installation (using fast persistent mtime caching)."""
     try:
         if java_path is None:
             java_path = 'java'
-        
+        p = Path(java_path)
+        if p.is_file():
+            details = get_java_version_details(str(p))
+            if details and details.get("major_version"):
+                if expected_major_version is not None:
+                    if details["major_version"] < expected_major_version:
+                        return False
+                logger.info(f"[OK] Java found: \"{details.get('version_str')}\"")
+                return True
+
+        # Fallback for system PATH 'java'
         result = subprocess.run(
             [java_path, '-version'],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=5,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
         )
-        
         if result.returncode == 0:
-            logger.info(f"[OK] Java found: {result.stderr.split()[2] if result.stderr else 'unknown version'}")
+            ver_str = result.stderr.split()[2].strip('"') if result.stderr and len(result.stderr.split()) >= 3 else 'unknown version'
+            logger.info(f"[OK] Java found: \"{ver_str}\"")
             return True
-        else:
-            logger.error("Java not found or not in PATH")
-            return False
-    
+        return False
     except Exception as e:
         logger.error(f"Failed to verify Java: {e}")
+        return False
+
+
+def find_existing_java_runtime(component: str, major_version: int) -> Optional[Path]:
+    """
+    Search for an already downloaded and verified Java runtime matching the requested component / major version.
+    Looks across:
+    1. Active profile java directory
+    2. Default java directory (minecraft_downloads/java)
+    3. Global .cache/java
+    4. Any other profiles configured in launcher_config.json
+    5. System Java (JAVA_HOME, Program Files)
+    """
+    exe_name = 'java.exe' if platform.system() == 'Windows' else 'java'
+    candidate_homes = []
+
+    # 1. Configured java dir
+    try:
+        candidate_homes.append(get_dir("java") / component)
+    except Exception:
+        pass
+
+    # 2. Default java dir
+    candidate_homes.append(ROOT_DIR / "minecraft_downloads" / "java" / component)
+
+    # 3. .cache/java
+    candidate_homes.append(ROOT_DIR / ".cache" / "java" / component)
+
+    # 4. Other profiles in config
+    try:
+        from utils import load_launcher_config
+        config = load_launcher_config()
+        for prof in config.get("profiles", {}).values():
+            if isinstance(prof, dict):
+                if "java" in prof:
+                    candidate_homes.append(Path(prof["java"]) / component)
+                if "base" in prof:
+                    candidate_homes.append(Path(prof["base"]) / "java" / component)
+    except Exception:
+        pass
+
+    # Check candidate homes
+    seen = set()
+    for home in candidate_homes:
+        try:
+            resolved = str(home.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+        except Exception:
+            pass
+
+        if home.exists() and home.is_dir():
+            java_exec = home / 'bin' / exe_name
+            if not java_exec.exists():
+                found = list(home.rglob(exe_name))
+                if found:
+                    java_exec = found[0]
+            if java_exec.exists() and verify_java_installation(str(java_exec), expected_major_version=major_version):
+                return java_exec
+
+    # 5. Check JAVA_HOME
+    java_home_env = os.environ.get("JAVA_HOME")
+    if java_home_env:
+        jh = Path(java_home_env)
+        j_bin = jh / 'bin' / exe_name
+        if j_bin.exists() and verify_java_installation(str(j_bin), expected_major_version=major_version):
+            return j_bin
+
+    # 6. Check common Windows JDK/JRE directories
+    if platform.system() == 'Windows':
+        common_roots = [
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Java",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Eclipse Adoptium",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Microsoft",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "BellSoft",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Amazon Corretto",
+        ]
+        for c_root in common_roots:
+            if c_root.exists():
+                for sub in c_root.iterdir():
+                    if sub.is_dir():
+                        j_bin = sub / 'bin' / exe_name
+                        if j_bin.exists() and verify_java_installation(str(j_bin), expected_major_version=major_version):
+                            return j_bin
+
+    return None
+
+
+def ensure_java_for_version(version_id: str, json_mode: bool = True, custom_dir: Optional[str] = None) -> bool:
+    """In-process entry point to verify or download Java for a Minecraft version."""
+    global json_output
+    json_output = json_mode
+    if custom_dir:
+        set_download_dir(custom_dir)
+
+    logger.info(f"Preparing Java download for Minecraft {version_id}...")
+    java_info = get_java_version_info(version_id)
+    if not java_info:
+        logger.error("[FAILURE] Could not determine Java version")
+        return False
+
+    component = java_info.get('component')
+    logger.info(f"[INFO] Java version {java_info.get('major_version')} required")
+    logger.info(f"[INFO] Component: {component}")
+
+    if download_java_runtime(java_info.get('major_version'), component, get_dir("java") if custom_dir else None):
+        logger.info("[SUCCESS] Java runtime ready")
+        return True
+    else:
+        logger.error("[FAILURE] Failed to download Java runtime")
         return False
 
 

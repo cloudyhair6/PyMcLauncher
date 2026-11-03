@@ -1,25 +1,77 @@
 import sys
 import json
 import os
+import re
+import threading
+import logging
 from pathlib import Path
+
+# Redirect Python bytecode cache (__pycache__) into .cache/pycache to keep workspace root clean
+_root_dir = Path(__file__).resolve().parent
+_cache_dir = _root_dir / ".cache"
+_pycache_dir = _cache_dir / "pycache"
+try:
+    _pycache_dir.mkdir(parents=True, exist_ok=True)
+    sys.pycache_prefix = str(_pycache_dir)
+except Exception:
+    pass
+
+# Ensure backend directory is in sys.path
+_backend_dir = _root_dir / "backend"
+if str(_backend_dir) not in sys.path:
+    sys.path.insert(0, str(_backend_dir))
+if str(_root_dir) not in sys.path:
+    sys.path.insert(0, str(_root_dir))
+
+def get_script_path(script_name: str) -> str:
+    """Resolve backend script path, preferring backend/ directory."""
+    b_path = _backend_dir / script_name
+    if b_path.exists():
+        return str(b_path)
+    r_path = _root_dir / script_name
+    if r_path.exists():
+        return str(r_path)
+    return script_name
+
+def get_image_path(rel_path: str) -> str:
+    """Resolve image path from images/ (with fallback to files/)."""
+    img_path = _root_dir / "images" / rel_path
+    if img_path.exists():
+        return str(img_path)
+    files_path = _root_dir / "files" / rel_path
+    if files_path.exists():
+        return str(files_path)
+    return str(img_path)
+
+# Pre-import download and launch modules in-process so they share Mojang manifest/version caches
+# and avoid repeated Python interpreter startup overhead during the launch pipeline
+import download_java
+import download_minecraft
+import extract_source_code
+import download_libraries
+import download_assets
+import command_executor
 
 # Suppress harmless Chromium hardware acceleration warnings
 os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-logging"
+os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
 
 from PyQt6 import QtCore
 from PyQt6.QtCore import Qt, QUrl, QUrlQuery, QProcess, QTimer, QRect, QEvent, QTime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QGridLayout, 
                              QLabel, QProgressBar, QTextEdit, QHBoxLayout, QPushButton, QMessageBox, 
                              QStackedWidget, QComboBox, QDialog, QCheckBox, QStyledItemDelegate, QStyle, QFileDialog, QGroupBox, QRadioButton,
-                             QListWidget, QListWidgetItem)
+                             QListWidget, QListWidgetItem, QSpinBox)
 from PyQt6.QtGui import QFont, QIcon, QPalette, QColor, QImage, QPainter, QPixmap, QMouseEvent, QCursor
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineProfile
 from utils import (
-    get_dir,get_available_versions, get_downloaded_versions,  
-                   delete_version_files, load_launcher_config, 
-                   save_launcher_config, get_auth_cache, save_auth_cache, clear_auth_cache, get_active_profile_id, load_accounts, save_accounts, 
-                   has_any_downloads, delete_all_downloads, fetch_player_textures)
+    get_dir, get_available_versions, get_downloaded_versions,  
+    delete_version_files, load_launcher_config, 
+    save_launcher_config, get_auth_cache, save_auth_cache, clear_auth_cache, get_active_profile_id, load_accounts, save_accounts, 
+    has_any_downloads, delete_all_downloads, has_any_source, delete_source_folder, fetch_player_textures,
+    is_minecraft_window_visible
+)
 
 
 
@@ -32,7 +84,7 @@ class DirectoriesDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Custom Directories")
-        self.setFixedSize(500, 420)
+        self.setFixedSize(500, 450)
         
         self.config = load_launcher_config()
         self.profiles = self.config.get("profiles", {
@@ -43,7 +95,8 @@ class DirectoriesDialog(QDialog):
                 "versions": "minecraft_downloads/versions",
                 "java": "minecraft_downloads/java",
                 "saves": "minecraft_downloads/saves",
-                "indexes": "minecraft_downloads/indexes"
+                "indexes": "minecraft_downloads/indexes",
+                "source": "minecraft_downloads/source"
             }
         })
         self.active_profile = self.config.get("active_profile", "Default")
@@ -87,7 +140,7 @@ class DirectoriesDialog(QDialog):
         self.form_layout.addRow("Base (All):", base_layout)
         
         # Subdirectories
-        for key in ["assets", "libraries", "versions", "java", "saves", "indexes"]:
+        for key in ["assets", "libraries", "versions", "java", "saves", "indexes", "source"]:
             row_layout = QHBoxLayout()
             inp = QLineEdit()
             btn = QPushButton("Browse...")
@@ -100,10 +153,7 @@ class DirectoriesDialog(QDialog):
         layout.addLayout(self.form_layout)
         
         
-        # Hide Release Date
-        self.hide_date_cb = QCheckBox("Hide release date in version list")
-        self.hide_date_cb.setChecked(hide_release_date)
-        layout.addWidget(self.hide_date_cb)
+
         
         btn_layout = QHBoxLayout()
         save_btn = QPushButton("Save & Set Active")
@@ -172,11 +222,81 @@ class DirectoriesDialog(QDialog):
         self.config["active_profile"] = prof
         save_launcher_config(self.config)
 
+
+def run_deletion_with_progress(parent_widget, title: str, worker_fn, log_callback=None) -> bool:
+    """
+    Run a deletion callable `worker_fn(progress_cb, log_cb)` in a background QThread while displaying
+    a responsive modal progress dialog (indeterminate bar while indexing, 0-100% bar while deleting).
+    """
+    dlg = QDialog(parent_widget)
+    dlg.setWindowTitle(title)
+    dlg.setFixedSize(460, 120)
+    dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+    dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint)
+    if parent_widget and parent_widget.styleSheet():
+        dlg.setStyleSheet(parent_widget.styleSheet())
+
+    vlayout = QVBoxLayout(dlg)
+    vlayout.setContentsMargins(20, 20, 20, 20)
+    vlayout.setSpacing(12)
+
+    status_lbl = QLabel("Indexing files to delete...")
+    status_lbl.setWordWrap(True)
+    vlayout.addWidget(status_lbl)
+
+    pbar = QProgressBar()
+    pbar.setRange(0, 0)  # Start in indeterminate indexing mode
+    vlayout.addWidget(pbar)
+
+    class _DeleteWorker(QtCore.QThread):
+        progress_sig = QtCore.pyqtSignal(float, str)
+        log_sig = QtCore.pyqtSignal(str)
+        done_sig = QtCore.pyqtSignal(bool)
+
+        def run(self_thread):
+            try:
+                res = worker_fn(self_thread.progress_sig.emit, self_thread.log_sig.emit)
+                self_thread.done_sig.emit(bool(res))
+            except Exception as e:
+                self_thread.log_sig.emit(f"[Error] {e}")
+                self_thread.done_sig.emit(False)
+
+    result_holder = [False]
+    worker = _DeleteWorker(dlg)
+
+    def _on_progress(pct: float, msg: str):
+        status_lbl.setText(msg)
+        if pct < 0:
+            if pbar.maximum() != 0:
+                pbar.setRange(0, 0)
+        else:
+            if pbar.maximum() == 0:
+                pbar.setRange(0, 100)
+            pbar.setValue(int(pct))
+            pbar.setFormat(f"{pct:.1f}%")
+
+    def _on_log(msg: str):
+        if log_callback:
+            log_callback(msg)
+
+    def _on_done(ok: bool):
+        result_holder[0] = ok
+        dlg.accept()
+
+    worker.progress_sig.connect(_on_progress)
+    worker.log_sig.connect(_on_log)
+    worker.done_sig.connect(_on_done)
+    worker.start()
+    dlg.exec()
+    worker.wait()
+    return result_holder[0]
+
+
 class VersionOptionsDialog(QDialog):
-    def __init__(self, current_filters, show_downloaded_only, skip_verification, show_console, remember_version, hide_release_date, parent=None):
+    def __init__(self, current_filters, show_downloaded_only, skip_verification, show_console, remember_version, hide_release_date, dev_mode=False, show_access_token=False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Version Options")
-        self.setFixedSize(300, 350)
+        self.setFixedSize(360, 465)
         self.setStyleSheet(parent.styleSheet())
         layout = QVBoxLayout(self)
         
@@ -184,6 +304,7 @@ class VersionOptionsDialog(QDialog):
         self.show_downloaded_only = show_downloaded_only
         self.skip_verification = skip_verification
         self.show_console = show_console
+        self.show_access_token = show_access_token
         self.checkboxes = {}
         
         # Version types
@@ -210,20 +331,70 @@ class VersionOptionsDialog(QDialog):
         self.show_console_cb = QCheckBox("Show Console Log")
         self.show_console_cb.setChecked(self.show_console)
         layout.addWidget(self.show_console_cb)
+
+        # Show Access Token in Console Log (off by default)
+        self.show_access_token_cb = QCheckBox("Show Access Token in Console Log")
+        self.show_access_token_cb.setChecked(self.show_access_token)
+        layout.addWidget(self.show_access_token_cb)
         
         # Remember Version
         self.remember_cb = QCheckBox("Remember last played version")
         self.remember_cb.setChecked(remember_version)
         layout.addWidget(self.remember_cb)
+
+        # Hide Release Date
+        self.hide_date_cb = QCheckBox("Hide release date in version list")
+        self.hide_date_cb.setChecked(hide_release_date)
+        layout.addWidget(self.hide_date_cb)
+
+        # Dev Mode (--dev-mode)
+        self.dev_mode_cb = QCheckBox("Dev Mode (unpack readable assets & source)")
+        self.dev_mode_cb.setChecked(dev_mode)
+        layout.addWidget(self.dev_mode_cb)
+
+        # Garbage Collect Logs Older Than setting
+        config = load_launcher_config()
+        log_row = QHBoxLayout()
+        self.gc_delete_logs_cb = QCheckBox("Auto-delete logs older than:")
+        self.gc_delete_logs_cb.setChecked(config.get("gc_delete_logs", True))
+        self.gc_log_age_spin = QSpinBox()
+        self.gc_log_age_spin.setRange(0, 9999)
+        self.gc_log_age_spin.setValue(int(config.get("gc_log_max_age_value", 7)))
+        self.gc_log_age_unit = QComboBox()
+        self.gc_log_age_unit.addItems(["Minutes", "Hours", "Days"])
+        self.gc_log_age_unit.setCurrentText(config.get("gc_log_max_age_unit", "Days"))
+        self.gc_delete_logs_cb.toggled.connect(self.gc_log_age_spin.setEnabled)
+        self.gc_delete_logs_cb.toggled.connect(self.gc_log_age_unit.setEnabled)
+        self.gc_log_age_spin.setEnabled(self.gc_delete_logs_cb.isChecked())
+        self.gc_log_age_unit.setEnabled(self.gc_delete_logs_cb.isChecked())
+        log_row.addWidget(self.gc_delete_logs_cb)
+        log_row.addWidget(self.gc_log_age_spin)
+        log_row.addWidget(self.gc_log_age_unit)
+        layout.addLayout(log_row)
         
         btn_layout = QHBoxLayout()
         
+        any_game_running = bool(parent and len(getattr(parent, 'running_instances', [])) > 0)
+
         # Delete All Downloads button
         if has_any_downloads():
             self.delete_all_btn = QPushButton("Delete All Downloads")
             self.delete_all_btn.setStyleSheet("color: red; font-weight: bold;")
             self.delete_all_btn.clicked.connect(self.on_delete_all_clicked)
+            if any_game_running:
+                self.delete_all_btn.setEnabled(False)
+                self.delete_all_btn.setToolTip("Close all running Minecraft instances before deleting downloads.")
             btn_layout.addWidget(self.delete_all_btn)
+
+        # Delete Source Folder button
+        if has_any_source():
+            self.delete_src_btn = QPushButton("Delete Source Folder")
+            self.delete_src_btn.setStyleSheet("color: #cc4400; font-weight: bold;")
+            self.delete_src_btn.clicked.connect(self.on_delete_source_clicked)
+            if any_game_running:
+                self.delete_src_btn.setEnabled(False)
+                self.delete_src_btn.setToolTip("Close all running Minecraft instances before deleting source/dev assets.")
+            btn_layout.addWidget(self.delete_src_btn)
             
         ok_btn = QPushButton("Save")
         ok_btn.clicked.connect(self.accept)
@@ -233,22 +404,20 @@ class VersionOptionsDialog(QDialog):
         
     def on_delete_all_clicked(self):
         reply = QMessageBox.question(self, 'Confirm Delete All', 
-                                     "Are you sure you want to delete ALL downloaded Minecraft versions, assets, and libraries?\n\nThis will free up space but you will need to re-download everything to play.\n\n(This will NOT delete your saves, worlds, or configurations)",
+                                     "Are you sure you want to delete ALL downloaded Minecraft versions, assets, and libraries?\n\nThis will free up space but you will need to re-download everything to play.\n\n(This will NOT delete your saves, worlds, source folder, or configurations)",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                      QMessageBox.StandardButton.No)
         
         if reply == QMessageBox.StandardButton.Yes:
             self.parent().log("")
             self.parent().log("=== Starting Deletion ===")
-            self.parent().step_progress_bar.setFormat("Deleting All Downloads...")
-            
-            def delete_progress(percent, status):
-                self.parent().task_progress_bar.setValue(int(percent))
-                self.parent().status_label.setText(status)
-                self.parent().log(status)
-                QApplication.processEvents()
-                
-            if delete_all_downloads(progress_callback=delete_progress):
+            ok = run_deletion_with_progress(
+                self,
+                "Deleting All Downloads...",
+                lambda prog_cb, log_cb: delete_all_downloads(progress_callback=prog_cb, log_callback=log_cb),
+                log_callback=self.parent().log
+            )
+            if ok:
                 self.parent().log("[System] Successfully deleted all downloaded files.")
                 self.parent().status_label.setText("Deletion complete.")
                 QMessageBox.information(self, "Success", "All downloads have been successfully deleted.")
@@ -273,8 +442,46 @@ class VersionOptionsDialog(QDialog):
     def get_show_console(self):
         return self.show_console_cb.isChecked()
 
+    def get_show_access_token(self):
+        return self.show_access_token_cb.isChecked()
+
     def get_remember_version(self):
         return self.remember_cb.isChecked()
+
+    def on_delete_source_clicked(self):
+        reply = QMessageBox.question(
+            self,
+            'Confirm Delete Source Folder',
+            f"Are you sure you want to delete the extracted source code folder ({get_dir('source')}) and unpacked dev-mode assets in {get_dir('assets')} (e.g., icons, minecraft, etc.)?\n\n(Normal cached game assets in assets/objects and assets/indexes will NOT be deleted.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.parent().log("[System] Deleting extracted source folder and unpacked dev-mode assets...")
+            ok = run_deletion_with_progress(
+                self,
+                "Deleting Source Folder & Dev Assets...",
+                lambda prog_cb, log_cb: delete_source_folder(progress_callback=prog_cb, log_callback=log_cb),
+                log_callback=self.parent().log
+            )
+            if ok:
+                self.parent().log("[System] Successfully deleted source folder and unpacked dev-mode assets.")
+                QMessageBox.information(self, "Success", "The source folder and unpacked dev-mode assets have been deleted.")
+                if hasattr(self, 'delete_src_btn'):
+                    self.delete_src_btn.setVisible(False)
+            else:
+                self.parent().log("[Error] Failed to delete source folder.")
+                QMessageBox.warning(self, "Error", "Failed to delete some files in the source folder.")
+
+    def get_dev_mode(self):
+        return self.dev_mode_cb.isChecked()
+
+    def get_log_gc_settings(self):
+        return (
+            self.gc_delete_logs_cb.isChecked(),
+            self.gc_log_age_spin.value(),
+            self.gc_log_age_unit.currentText()
+        )
 
 from PyQt6.QtGui import QPainter, QColor, QPixmap, QImage, QMouseEvent
 from PyQt6 import QtCore
@@ -294,7 +501,8 @@ def get_animation_js(anim_type):
     if anim_type == "idle":
         inner = """
             window.skinViewer.animation = new skinview3d.IdleAnimation();
-            window.skinViewer.playerObject.backEquipment = 'cape';
+            window.skinViewer.playerObject.backEquipment = window.hasCapeLoaded ? 'cape' : null;
+            if (!window.hasCapeLoaded && window.skinViewer.playerObject.cape) window.skinViewer.playerObject.cape.visible = false;
             window.skinViewer.playerObject.rotation.x = 0;
             window.skinViewer.playerObject.rotation.y = 0;
             window.skinViewer.playerObject.position.y = 0;
@@ -302,14 +510,16 @@ def get_animation_js(anim_type):
     elif anim_type == "walk":
         inner = """
             window.skinViewer.animation = new skinview3d.WalkingAnimation();
-            window.skinViewer.playerObject.backEquipment = 'cape';
+            window.skinViewer.playerObject.backEquipment = window.hasCapeLoaded ? 'cape' : null;
+            if (!window.hasCapeLoaded && window.skinViewer.playerObject.cape) window.skinViewer.playerObject.cape.visible = false;
             window.skinViewer.playerObject.rotation.x = 0;
             window.skinViewer.playerObject.rotation.y = 0;
             window.skinViewer.playerObject.position.y = 0;
         """
     elif anim_type == "swim":
         inner = """
-            window.skinViewer.playerObject.backEquipment = 'cape';
+            window.skinViewer.playerObject.backEquipment = window.hasCapeLoaded ? 'cape' : null;
+            if (!window.hasCapeLoaded && window.skinViewer.playerObject.cape) window.skinViewer.playerObject.cape.visible = false;
             window.skinViewer.animation = new skinview3d.FunctionAnimation(function(player, progress, delta) {
                 try {
                     player.rotation.x = Math.PI / 2;
@@ -611,7 +821,17 @@ class ChangeSkinDialog(QDialog):
             js = f"""
             if (window.skinViewer) {{
                 if ("{s_path}") window.skinViewer.loadSkin("{s_path}", {{ model: "{model}" }});
-                if ("{c_path}") {{ window.skinViewer.loadCape("{c_path}", {{ backEquipment: "{back_eq}" }}); }} else {{ window.skinViewer.loadCape(null); }}
+                if ("{c_path}") {{
+                    window.hasCapeLoaded = true;
+                    window.skinViewer.loadCape("{c_path}", {{ backEquipment: "{back_eq}" }});
+                }} else {{
+                    window.hasCapeLoaded = false;
+                    window.skinViewer.loadCape(null);
+                    if (window.skinViewer.playerObject) {{
+                        window.skinViewer.playerObject.backEquipment = null;
+                        if (window.skinViewer.playerObject.cape) window.skinViewer.playerObject.cape.visible = false;
+                    }}
+                }}
             }}
             """
             self.web_view.page().runJavaScript(js)
@@ -643,7 +863,7 @@ class ChangeSkinDialog(QDialog):
         access_token = self.auth_data.get('mc_access_token')
         if not access_token:
             QMessageBox.critical(self, "Error", "Minecraft Access Token not found. Please re-login.")
-            self.login_btn.setVisible(True)
+            if self.parent() and hasattr(self.parent().window(), "login_btn"): self.parent().window().login_btn.setVisible(True)
             return
 
         from PyQt6.QtWidgets import QProgressDialog
@@ -680,7 +900,7 @@ class ChangeSkinDialog(QDialog):
                     has_errors = True
                     messages.append(f"Skin Upload Error ({response.status_code}): {response.text}")
                     if response.status_code == 401:
-                        self.login_btn.setVisible(True)
+                        if self.parent() and hasattr(self.parent().window(), "login_btn"): self.parent().window().login_btn.setVisible(True)
             except Exception as e:
                 has_errors = True
                 messages.append(f"Skin Upload Exception: {str(e)}")
@@ -704,7 +924,7 @@ class ChangeSkinDialog(QDialog):
                     has_errors = True
                     messages.append(f"Cape Update Error ({c_resp.status_code}): {c_resp.text}")
                     if c_resp.status_code == 401:
-                        self.login_btn.setVisible(True)
+                        if self.parent() and hasattr(self.parent().window(), "login_btn"): self.parent().window().login_btn.setVisible(True)
             except Exception as e:
                 has_errors = True
                 messages.append(f"Cape Update Exception: {str(e)}")
@@ -756,10 +976,10 @@ class LocatorBarWidget(QWidget):
 
         import os
         import json
-        bg_path = os.path.join("files", "locator_bar", "locator_bar_background.png")
-        dot_path = os.path.join("files", "locator_bar", "locator_bar_dot", "default_0.png")
-        arrow_up_path = os.path.join("files", "locator_bar", "locator_bar_arrow_up.png")
-        arrow_down_path = os.path.join("files", "locator_bar", "locator_bar_arrow_down.png")
+        bg_path = get_image_path("locator_bar/locator_bar_background.png")
+        dot_path = get_image_path("locator_bar/locator_bar_dot/default_0.png")
+        arrow_up_path = get_image_path("locator_bar/locator_bar_arrow_up.png")
+        arrow_down_path = get_image_path("locator_bar/locator_bar_arrow_down.png")
 
         self.bg_pixmap = QPixmap(bg_path)
         
@@ -1021,7 +1241,7 @@ class ProfileBannerWidget(QWidget):
         self.web_view.setVisible(self.options.get("show_3d_skin", True))
         left_layout.addWidget(self.web_view)
 
-        left_layout.addSpacing(-30)
+        left_layout.addSpacing(0)  # Fixed missing button
         
         self.change_skin_btn = QPushButton("Change Skin/Cape")
         self.change_skin_btn.setFixedWidth(150)
@@ -1060,10 +1280,12 @@ class ProfileBannerWidget(QWidget):
 
         from PyQt6.QtGui import QPixmap
         import os
-        mc_logo_path = "files/minecraft-logo-svg-vector.svg"
+        mc_logo_path = get_image_path("minecraft-logo-svg-vector.svg")
         if os.path.exists(mc_logo_path):
             mc_logo = QLabel()
-            mc_logo_pix = QPixmap(mc_logo_path).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            mc_logo_pix = QPixmap(mc_logo_path)
+            if not mc_logo_pix.isNull():
+                mc_logo_pix = mc_logo_pix.scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             mc_logo.setPixmap(mc_logo_pix)
             mc_name_layout.addWidget(mc_logo)
 
@@ -1093,9 +1315,12 @@ class ProfileBannerWidget(QWidget):
         gt_row = QHBoxLayout()
         gt_row.setAlignment(Qt.AlignmentFlag.AlignRight)
         gt_row.setSpacing(4)
-        if os.path.exists("files/icons8-xbox-24.svg"):
+        xbox_icon_path = get_image_path("icons8-xbox-24.svg")
+        if os.path.exists(xbox_icon_path):
             xbox_logo = QLabel()
-            xbox_logo_pix = QPixmap("files/icons8-xbox-24.svg").scaled(18, 18, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            xbox_logo_pix = QPixmap(xbox_icon_path)
+            if not xbox_logo_pix.isNull():
+                xbox_logo_pix = xbox_logo_pix.scaled(18, 18, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             xbox_logo.setPixmap(xbox_logo_pix)
             gt_row.addWidget(xbox_logo)
 
@@ -1109,10 +1334,12 @@ class ProfileBannerWidget(QWidget):
         gs_row.setSpacing(4)
         gamerscore_val = auth_data.get('xbox_gamerscore')
         if gamerscore_val:
-            gamerscore_icon_path = "files/xbox-gamerscore.svg"
+            gamerscore_icon_path = get_image_path("xbox-gamerscore.svg")
             if os.path.exists(gamerscore_icon_path):
                 gs_logo = QLabel()
-                gs_logo_pix = QPixmap(gamerscore_icon_path).scaled(14, 14, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                gs_logo_pix = QPixmap(gamerscore_icon_path)
+                if not gs_logo_pix.isNull():
+                    gs_logo_pix = gs_logo_pix.scaled(14, 14, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
                 gs_logo.setPixmap(gs_logo_pix)
                 gs_row.addWidget(gs_logo)
             
@@ -1145,7 +1372,9 @@ class ProfileBannerWidget(QWidget):
 
         if textures.get('gamerpic'):
             pic_label = QLabel()
-            pixmap = QPixmap(textures['gamerpic']).scaled(50, 50, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            pixmap = QPixmap(textures['gamerpic'])
+            if not pixmap.isNull():
+                pixmap = pixmap.scaled(50, 50, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             pic_label.setPixmap(pixmap)
             right_layout.addWidget(pic_label)
 
@@ -1261,7 +1490,17 @@ class ProfileBannerWidget(QWidget):
             js = f"""
             if (window.skinViewer) {{
                 if ("{s_data}") window.skinViewer.loadSkin("{s_data}", {{ model: "{model}" }});
-                if ("{c_data}") {{ window.skinViewer.loadCape("{c_data}", {{ backEquipment: "{back_eq}" }}); }} else {{ window.skinViewer.loadCape(null); }}
+                if ("{c_data}") {{
+                    window.hasCapeLoaded = true;
+                    window.skinViewer.loadCape("{c_data}", {{ backEquipment: "{back_eq}" }});
+                }} else {{
+                    window.hasCapeLoaded = false;
+                    window.skinViewer.loadCape(null);
+                    if (window.skinViewer.playerObject) {{
+                        window.skinViewer.playerObject.backEquipment = null;
+                        if (window.skinViewer.playerObject.cape) window.skinViewer.playerObject.cape.visible = false;
+                    }}
+                }}
             }}
             """
             self.web_view.page().runJavaScript(js)
@@ -1326,7 +1565,7 @@ class AccountSwitchDialog(QDialog):
                 
             import os
             import urllib.request
-            os.makedirs(".cache", exist_ok=True)
+            os.makedirs(f".cache/{pid}", exist_ok=True)
             pic_path = f".cache/{pid}/gamerpic.png"
             if not os.path.exists(pic_path):
                 url = pdata.get("xbox_gamerpic_url")
@@ -1370,9 +1609,9 @@ class AccountSwitchDialog(QDialog):
             # Delete cache
             import shutil
             import os
-            cache_dir = f".cache/{pid}/minecraft-auth-cache"
+            cache_dir = f".cache/{pid}"
             if os.path.exists(cache_dir):
-                try: shutil.rmtree(cache_dir)
+                try: shutil.rmtree(cache_dir, ignore_errors=True)
                 except: pass
                 
         if self.accounts.get("active_profile") == pid:
@@ -1393,17 +1632,162 @@ class AccountSwitchDialog(QDialog):
         self.accept()
 
 
+class DownloadPipelineWorker(QtCore.QThread):
+    progress_sig = QtCore.pyqtSignal(int, int, str, float, str)
+    log_sig = QtCore.pyqtSignal(str)
+    done_sig = QtCore.pyqtSignal(bool, object, str)
+
+    def __init__(self, version, auth_data, is_offline, is_trial, dev_mode, quick_play, skip_verification, parent=None):
+        super().__init__(parent)
+        self.version = version
+        self.auth_data = auth_data or {}
+        self.is_offline = is_offline
+        self.is_trial = is_trial
+        self.dev_mode = dev_mode
+        self.quick_play = quick_play
+        self.skip_verification = skip_verification
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        try:
+            is_downloaded = self.version in get_downloaded_versions()
+            need_downloads = not (is_downloaded and (self.skip_verification or self.is_offline) and not self.dev_mode)
+
+            steps = []
+            if need_downloads:
+                steps.append(("Java", lambda: download_java.ensure_java_for_version(self.version, json_mode=True)))
+                steps.append(("Game Client", lambda: download_minecraft.download_version(self.version, jar_type="client", json_mode=True, is_dev_mode=self.dev_mode)))
+                if self.dev_mode:
+                    steps.append(("JAR Resources", lambda: extract_source_code.extract_version_source(version_id=self.version, jar_type="client", json_output=True, step="resources")))
+                    steps.append(("Decompiling Classes", lambda: extract_source_code.extract_version_source(version_id=self.version, jar_type="client", json_output=True, step="decompile")))
+                steps.append(("Libraries", lambda: download_libraries.download_libraries(self.version, json_mode=True, is_dev_mode=self.dev_mode)))
+                steps.append(("Assets", lambda: download_assets.download_assets(self.version, json_mode=True, is_dev_mode=self.dev_mode)))
+
+            total_steps = len(steps) + 1  # +1 for launching game
+            current_step_info = ["", 1]
+
+            def on_redirect_line(line: str):
+                line = line.strip()
+                if not line:
+                    return
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict) and obj.get("type") == "progress":
+                        task_pct = float(obj.get("progress", 0))
+                        status_str = obj.get("status", "")
+                        self.progress_sig.emit(
+                            current_step_info[1],
+                            total_steps,
+                            current_step_info[0],
+                            task_pct,
+                            status_str
+                        )
+                        return
+                except Exception:
+                    pass
+                self.log_sig.emit(line)
+
+            class _ThreadStdout:
+                def __init__(self, callback):
+                    self.callback = callback
+                    self.buf = ""
+                def write(self, text):
+                    self.buf += text
+                    while "\n" in self.buf:
+                        chunk, self.buf = self.buf.split("\n", 1)
+                        chunk = chunk.strip("\r")
+                        if chunk:
+                            self.callback(chunk)
+                def flush(self):
+                    if self.buf.strip():
+                        self.callback(self.buf.strip())
+                        self.buf = ""
+
+            orig_stdout = sys.stdout
+            orig_stderr = sys.stderr
+
+            try:
+                redirector = _ThreadStdout(on_redirect_line)
+                sys.stdout = redirector
+                sys.stderr = redirector
+
+                for idx, (step_name, step_fn) in enumerate(steps):
+                    if self._is_cancelled:
+                        self.done_sig.emit(False, None, "Launch sequence cancelled.")
+                        return
+
+                    step_num = idx + 1
+                    current_step_info[0] = step_name
+                    current_step_info[1] = step_num
+
+                    self.progress_sig.emit(step_num, total_steps, step_name, 0.0, f"[{step_num}/{total_steps}] Verifying {step_name}...")
+                    self.log_sig.emit(f"\n> Running step [{step_num}/{total_steps}]: {step_name}")
+
+                    success = step_fn()
+                    redirector.flush()
+
+                    if not success:
+                        self.done_sig.emit(False, None, f"Step '{step_name}' failed.")
+                        return
+
+                    self.progress_sig.emit(step_num, total_steps, step_name, 100.0, f"[{step_num}/{total_steps}] {step_name} ready.")
+            finally:
+                sys.stdout = orig_stdout
+                sys.stderr = orig_stderr
+
+            if self._is_cancelled:
+                self.done_sig.emit(False, None, "Launch sequence cancelled.")
+                return
+
+            # Prepare launch command
+            launch_step_num = total_steps
+            self.progress_sig.emit(launch_step_num, total_steps, "Launching Game...", 0.0, f"[{launch_step_num}/{total_steps}] Preparing launch command...")
+
+            executor = command_executor.CommandExecutor(self.version)
+            executor.offline = self.is_offline
+            executor.demo = self.is_trial
+            if self.quick_play:
+                executor.quickPlayType = self.quick_play.get('type')
+                executor.quickPlayId = self.quick_play.get('id')
+
+            executor.variables['auth_player_name'] = self.auth_data.get('mc_username', 'OfflinePlayer')
+            executor.variables['auth_uuid'] = self.auth_data.get('mc_uuid', '00000000-0000-0000-0000-000000000000')
+            executor.variables['auth_access_token'] = self.auth_data.get('mc_access_token', 'offline')
+            executor.variables['auth_xuid'] = self.auth_data.get('xbox_xuid', 'offline')
+            executor.variables['clientid'] = self.auth_data.get('launch_client_id', 'PyMcLauncher')
+
+            prepared = executor.prepare_launch_command()
+            if not prepared:
+                self.done_sig.emit(False, None, "Failed to prepare launch command.")
+                return
+
+            filled_command, cwd = prepared
+            self.done_sig.emit(True, (filled_command, cwd), "")
+
+        except Exception as e:
+            self.done_sig.emit(False, None, str(e))
+
+
 class LauncherGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PyMcLauncher")
 
-        import socket
-        try:
-            socket.create_connection(("api.minecraftservices.com", 443), timeout=2)
-            self.is_offline = False
-        except OSError:
-            self.is_offline = True
+        self.is_offline = False
+        self.browser_window = None
+        self.process = None
+        self._step_worker = None
+        self._pipeline_worker = None
+        self.auth_data = get_auth_cache()
+        self.is_just_logging_in = False
+        self.is_pipeline_running = False
+        self.is_authenticating = False
+        self.running_instances = []
+        self._next_instance_id = 1
+        self._raw_log_lines = []
         
         # Removing all custom CSS to let the native Windows 11/10 dll (windowsvista style) 
         # render all the controls (dropdowns, progress bars, buttons) natively.
@@ -1473,6 +1857,7 @@ class LauncherGUI(QMainWindow):
 
         config = load_launcher_config()
         self.show_console = config.get("show_console", False)
+        self.show_access_token = config.get("show_access_token", False)
         self.remember_version = config.get("remember_version", False)
         self.last_played_version = config.get("last_played_version", None)
 
@@ -1510,29 +1895,38 @@ class LauncherGUI(QMainWindow):
         self.warning_label.setVisible(False)
         self.layout.addWidget(self.warning_label)
 
-        # Play Button and Delete Button Layout
+        # Play Button, Stop Button, and Delete Button Layout
         self.action_layout = QHBoxLayout()
         self.play_button = QPushButton("PLAY MINECRAFT")
         self.play_button.clicked.connect(self.start_launch_sequence)
+
+        self.stop_button = QPushButton("Stop Game")
+        self.stop_button.setStyleSheet("color: #cc0000; font-weight: bold;")
+        self.stop_button.clicked.connect(self.stop_running_games)
+        self.stop_button.setVisible(False)
         
         self.delete_button = QPushButton("Delete")
         self.delete_button.clicked.connect(self.delete_selected_version)
         self.delete_button.setVisible(False)
         
         self.setup_quick_play()
-        self.action_layout.addWidget(self.play_button, stretch=4)
+        self.action_layout.addWidget(self.play_button, stretch=3)
+        self.action_layout.addWidget(self.stop_button, stretch=1)
         self.action_layout.addWidget(self.delete_button, stretch=1)
         self.layout.addLayout(self.action_layout)
+
+        # Running Minecraft Instances section (shown when >1 instance is running)
+        self.instances_group = QGroupBox("Running Minecraft Instances")
+        self.instances_layout = QVBoxLayout(self.instances_group)
+        self.instances_layout.setContentsMargins(10, 8, 10, 8)
+        self.instances_layout.setSpacing(6)
+        self.instances_group.setVisible(False)
+        self.layout.addWidget(self.instances_group)
         
         # Dummy widget to enforce minimum layout width of 610 (plus 40 margins = 650 window width)
         self.dummy_width_widget = QWidget()
         self.dummy_width_widget.setFixedSize(610, 0)
         self.layout.addWidget(self.dummy_width_widget)
-
-        self.browser_window = None
-        self.process = None
-        self.auth_data = None
-        self.is_just_logging_in = False
         
         # Pipeline State
         self.pipeline_steps = []
@@ -1542,6 +1936,7 @@ class LauncherGUI(QMainWindow):
         self.version_filters = config.get("version_filters", ["release"])
         self.show_downloaded_only = config.get("show_downloaded_only", False)
         self.skip_verification = config.get("skip_verification", True)
+        self.dev_mode = config.get("dev_mode", False)
         
         self.load_versions()
 
@@ -1549,7 +1944,7 @@ class LauncherGUI(QMainWindow):
         if is_logged_in and not is_expired:
             self.refresh_process = QProcess()
             self.refresh_process.setProgram(sys.executable)
-            self.refresh_process.setArguments(["get_mc_username.py", "--json", "--profile", get_active_profile_id()])
+            self.refresh_process.setArguments([get_script_path("get_mc_username.py"), "--json", "--profile", get_active_profile_id()])
             self.refresh_process.readyReadStandardOutput.connect(self.handle_refresh_stdout)
             self.refresh_process.start()
 
@@ -1557,18 +1952,202 @@ class LauncherGUI(QMainWindow):
         QTimer.singleShot(100, self.run_startup_garbage_collection)
 
     def run_startup_garbage_collection(self):
+        class _GCThread(QtCore.QThread):
+            log_msg = QtCore.pyqtSignal(str)
+            def run(self_thread):
+                try:
+                    from garbage_collect import perform_garbage_collection
+                    perform_garbage_collection(log_callback=self_thread.log_msg.emit)
+                except Exception as e:
+                    self_thread.log_msg.emit(f"Error during startup garbage collection: {e}")
+        self._gc_thread = _GCThread(self)
+        self._gc_thread.log_msg.connect(self.log)
+        self._gc_thread.start()
+
+    def _kill_qprocess_tree(self, proc: QProcess):
+        if not proc or proc.state() == QProcess.ProcessState.NotRunning:
+            return
+        pid = proc.processId()
+        if os.name == 'nt' and pid:
+            import subprocess
+            try:
+                subprocess.run(
+                    ['taskkill', '/F', '/T', '/PID', str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                )
+            except Exception:
+                pass
         try:
-            from garbage_collect import perform_garbage_collection
-            perform_garbage_collection(log_callback=self.log)
-        except Exception as e:
-            self.log(f"Error during startup garbage collection: {e}")
+            proc.kill()
+        except Exception:
+            pass
 
     def closeEvent(self, event):
-        if getattr(self, 'process', None) and self.process.state() != QProcess.ProcessState.NotRunning:
-            self.process.kill()
+        if getattr(self, '_pipeline_worker', None) and self._pipeline_worker.isRunning():
+            self._pipeline_worker.cancel()
+            self._pipeline_worker.wait(1000)
+        self._kill_qprocess_tree(getattr(self, 'process', None))
+        for inst in list(getattr(self, 'running_instances', [])):
+            if inst.get('window_timer'):
+                inst['window_timer'].stop()
+            if inst.get('fallback_timer'):
+                inst['fallback_timer'].stop()
+            if inst.get('startup_timer'):
+                inst['startup_timer'].stop()
+            self._kill_qprocess_tree(inst.get('process'))
         if getattr(self, 'refresh_process', None) and self.refresh_process.state() != QProcess.ProcessState.NotRunning:
             self.refresh_process.kill()
         event.accept()
+
+    def update_ui_state(self):
+        """Enable/disable buttons and update labels accurately based on current launcher & game state."""
+        is_busy = bool(getattr(self, 'is_pipeline_running', False) or getattr(self, 'is_authenticating', False))
+        running_list = getattr(self, 'running_instances', [])
+        started_instances = [inst for inst in running_list if inst.get('started')]
+        running_count = len(started_instances)
+
+        idx = self.version_combo.currentIndex() if hasattr(self, 'version_combo') else -1
+        selected_ver = self.version_combo.currentData() if idx >= 0 else None
+        has_versions = bool(hasattr(self, 'version_combo') and self.version_combo.count() > 0 and selected_ver is not None)
+        is_selected_downloaded = bool(self.version_combo.itemData(idx, Qt.ItemDataRole.UserRole + 1)) if idx >= 0 else False
+        is_selected_ver_running = any(inst.get('version') == selected_ver for inst in running_list)
+
+        # Play / Start Another Instance Button
+        if hasattr(self, 'play_button'):
+            self.play_button.setEnabled(not is_busy and has_versions)
+            if running_count > 0:
+                self.play_button.setText("START ANOTHER INSTANCE")
+            elif getattr(self, 'is_offline', False):
+                self.play_button.setText("PLAY MINECRAFT OFFLINE")
+            elif getattr(self, 'auth_data', None) and self.auth_data.get("owns_minecraft") is False:
+                self.play_button.setText("PLAY MINECRAFT TRIAL")
+            else:
+                self.play_button.setText("PLAY MINECRAFT")
+
+        # Stop Game Button (in main action bar)
+        if hasattr(self, 'stop_button'):
+            if running_count == 1:
+                self.stop_button.setText("Stop Game")
+                self.stop_button.setVisible(True)
+                self.stop_button.setEnabled(True)
+            elif running_count > 1:
+                self.stop_button.setText("Stop All Games")
+                self.stop_button.setVisible(True)
+                self.stop_button.setEnabled(True)
+            else:
+                self.stop_button.setVisible(False)
+
+        # Delete Button
+        if hasattr(self, 'delete_button'):
+            self.delete_button.setVisible(is_selected_downloaded)
+            self.delete_button.setEnabled(not is_busy and is_selected_downloaded and not is_selected_ver_running)
+            if is_selected_ver_running:
+                self.delete_button.setToolTip("Cannot delete this version while it is currently running.")
+            else:
+                self.delete_button.setToolTip("")
+
+        # Dropdowns & Top Bar Buttons
+        if hasattr(self, 'version_combo'):
+            self.version_combo.setEnabled(not is_busy and has_versions)
+        if hasattr(self, 'profile_combo'):
+            self.profile_combo.setEnabled(not is_busy)
+        if hasattr(self, 'quick_play_combo') and self.quick_play_combo:
+            self.quick_play_combo.setEnabled(not is_busy and has_versions)
+        if hasattr(self, 'options_btn'):
+            self.options_btn.setEnabled(not is_busy)
+        if hasattr(self, 'dirs_btn'):
+            self.dirs_btn.setEnabled(not is_busy)
+        if hasattr(self, 'login_btn'):
+            self.login_btn.setEnabled(not is_busy)
+        if hasattr(self, 'switch_account_btn'):
+            self.switch_account_btn.setEnabled(not is_busy)
+        if hasattr(self, 'logout_btn'):
+            self.logout_btn.setEnabled(not is_busy and len(running_list) == 0)
+            if len(running_list) > 0:
+                self.logout_btn.setToolTip("Close running Minecraft instances before logging out.")
+            else:
+                self.logout_btn.setToolTip("")
+
+        if hasattr(self, 'banner_widget') and self.banner_widget:
+            if hasattr(self.banner_widget, 'change_skin_btn'):
+                self.banner_widget.change_skin_btn.setEnabled(not is_busy)
+            if hasattr(self.banner_widget, 'options_btn'):
+                self.banner_widget.options_btn.setEnabled(not is_busy)
+
+    def update_running_instances_ui(self):
+        """Show the running instances list below the main buttons when >1 instance is running."""
+        if not hasattr(self, 'instances_group') or not hasattr(self, 'instances_layout'):
+            return
+
+        while self.instances_layout.count():
+            item = self.instances_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+
+        started_instances = [inst for inst in self.running_instances if inst.get('started')]
+        if len(started_instances) > 1:
+            for inst in started_instances:
+                row_widget = QWidget()
+                row_layout = QHBoxLayout(row_widget)
+                row_layout.setContentsMargins(4, 2, 4, 2)
+                row_layout.setSpacing(10)
+
+                prof_name = inst.get('profile') or 'Default'
+                user_name = inst.get('username') or ''
+                ver_name = inst.get('version') or 'Unknown'
+                if user_name:
+                    info_text = f"Profile: {prof_name} ({user_name})   |   Version: {ver_name}"
+                else:
+                    info_text = f"Profile: {prof_name}   |   Version: {ver_name}"
+
+                info_lbl = QLabel(info_text)
+                info_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+                row_layout.addWidget(info_lbl, stretch=1)
+
+                stop_btn = QPushButton("Stop Game")
+                stop_btn.setStyleSheet("color: #cc0000; font-weight: bold;")
+                stop_btn.setFixedWidth(110)
+                stop_btn.clicked.connect(lambda checked=False, target_inst=inst: self.stop_instance(target_inst))
+                row_layout.addWidget(stop_btn)
+
+                self.instances_layout.addWidget(row_widget)
+
+            self.instances_group.setVisible(True)
+        else:
+            self.instances_group.setVisible(False)
+
+        self.update_ui_state()
+        self.update_window_size()
+
+    def stop_instance(self, inst: dict):
+        """Stop a specific running Minecraft instance."""
+        if not inst:
+            return
+        inst['stopped_by_user'] = True
+        if inst.get('window_timer'):
+            inst['window_timer'].stop()
+            inst['window_timer'] = None
+        if inst.get('fallback_timer'):
+            inst['fallback_timer'].stop()
+            inst['fallback_timer'] = None
+        if inst.get('startup_timer'):
+            inst['startup_timer'].stop()
+            inst['startup_timer'] = None
+        ver = inst.get('version', 'Unknown')
+        prof = inst.get('profile', 'Default')
+        self.log(f"[System] Stopping Minecraft {ver} (Profile: {prof})...")
+        self._kill_qprocess_tree(inst.get('process'))
+
+    def stop_running_games(self):
+        """Stop the currently running game (or all running games if >1 are active)."""
+        started_instances = [inst for inst in list(self.running_instances) if inst.get('started')]
+        targets = started_instances if started_instances else list(self.running_instances)
+        for inst in targets:
+            self.stop_instance(inst)
 
     def handle_refresh_stdout(self):
         try:
@@ -1596,27 +2175,48 @@ class LauncherGUI(QMainWindow):
         if index < 0:
             if hasattr(self, 'warning_label'):
                 self.warning_label.setVisible(False)
+            self.update_ui_state()
             return
-        is_downloaded = self.version_combo.itemData(index, Qt.ItemDataRole.UserRole + 1)
-        self.delete_button.setVisible(bool(is_downloaded))
         if hasattr(self, 'warning_label'):
             self.warning_label.setVisible(self.remember_version)
+        self.update_ui_state()
         
     def delete_selected_version(self):
         version_id = self.version_combo.currentData()
         if not version_id: return
+        if any(inst.get('version') == version_id for inst in getattr(self, 'running_instances', [])):
+            QMessageBox.warning(self, "Version In Use", f"Minecraft {version_id} is currently running. Stop the game before deleting it.")
+            return
         
         reply = QMessageBox.question(self, 'Confirm Delete', 
-                                     f"Are you sure you want to delete Minecraft {version_id}?",
+                                     f"Are you sure you want to delete Minecraft {version_id}?\n\n(This will NOT delete your saves, worlds, or source folder)",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                      QMessageBox.StandardButton.No)
         
         if reply == QMessageBox.StandardButton.Yes:
             self.log(f"[System] Deleting version {version_id}...")
-            if delete_version_files(version_id, log_callback=self.log):
-                self.log(f"[System] Successfully deleted Minecraft {version_id}.")
-                self.load_versions()
-            else:
+
+            def _do_delete_and_gc(prog_cb, log_cb):
+                if not delete_version_files(version_id, log_callback=log_cb, progress_callback=prog_cb):
+                    return False
+                log_cb(f"[System] Successfully deleted Minecraft {version_id}.")
+                try:
+                    from garbage_collect import perform_garbage_collection
+                    log_cb("[System] Running garbage collection to clean up orphaned assets/libraries...")
+                    perform_garbage_collection(log_callback=log_cb, progress_callback=prog_cb)
+                    log_cb("[System] Garbage collection finished.")
+                except Exception as e:
+                    log_cb(f"[Error] Failed to run garbage collection: {e}")
+                return True
+
+            ok = run_deletion_with_progress(
+                self,
+                f"Deleting Minecraft {version_id}...",
+                _do_delete_and_gc,
+                log_callback=self.log
+            )
+            self.load_versions()
+            if not ok:
                 self.log(f"[Error] Failed to delete Minecraft {version_id}.")
 
     def logout(self):
@@ -1626,6 +2226,7 @@ class LauncherGUI(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             self.set_progress_visible(True)
             self.step_progress_bar.setFormat("Logging out...")
+            self.task_progress_bar.setFormat("Current Task: %p%")
             self.task_progress_bar.setValue(25)
             self.status_label.setText("Removing authentication cache...")
             self.log("Removing authentication cache...")
@@ -1651,9 +2252,9 @@ class LauncherGUI(QMainWindow):
             profile.cookieStore().deleteAllCookies()
             
             self.task_progress_bar.setValue(100)
-            self.step_progress_bar.setFormat("")
+            self.step_progress_bar.setFormat("%p%")
             self.step_progress_bar.setValue(0)
-            self.task_progress_bar.setFormat("")
+            self.task_progress_bar.setFormat("Current Task: %p%")
             self.task_progress_bar.setValue(0)
             self.log("[System] Successfully logged out.")
             
@@ -1671,6 +2272,7 @@ class LauncherGUI(QMainWindow):
                 if hasattr(self, 'banner_widget') and self.banner_widget:
                     self.banner_widget.setVisible(False)
             self.set_progress_visible(False)
+            self.update_ui_state()
             QApplication.processEvents()
 
     
@@ -1690,6 +2292,8 @@ class LauncherGUI(QMainWindow):
                 if hasattr(self, 'banner_widget') and self.banner_widget:
                     self.banner_widget.setVisible(False)
             
+            self.update_ui_state()
+
             if dialog.wants_new_account:
                 # Clear banner for new account before logging in
                 while self.banner_container.count():
@@ -1703,12 +2307,11 @@ class LauncherGUI(QMainWindow):
     def do_login(self):
         self.log("Starting Microsoft authentication...")
         self.is_just_logging_in = True
+        self.is_authenticating = True
         self._login_succeeded = False
 
         self.status_label.setText("Authenticating...")
-        self.play_button.setEnabled(False)
-        self.delete_button.setEnabled(False)
-        self.login_btn.setEnabled(False)
+        self.update_ui_state()
         
         self.step_progress_bar.setRange(0, 0)
         self.step_progress_bar.setVisible(True)
@@ -1724,7 +2327,7 @@ class LauncherGUI(QMainWindow):
 
         self.process = QProcess()
         self.process.setProgram(sys.executable)
-        self.process.setArguments(["get_mc_username.py", "--json", "--profile", self._auth_cancelled_profile])
+        self.process.setArguments([get_script_path("get_mc_username.py"), "--json", "--profile", self._auth_cancelled_profile])
         self._force_new_login = False
         self.process.readyReadStandardOutput.connect(self.handle_auth_stdout)
         self.process.readyReadStandardError.connect(self.handle_stderr)
@@ -1758,6 +2361,7 @@ class LauncherGUI(QMainWindow):
             if not getattr(self, 'task_progress_bar', None) or not self.task_progress_bar.isVisible():
                 self.step_progress_bar.setVisible(False)
 
+        self.update_ui_state()
         self.update_window_size()
 
     def update_window_size(self):
@@ -1794,8 +2398,28 @@ class LauncherGUI(QMainWindow):
         self.version_combo.clear()
         QApplication.processEvents()
 
-        versions = get_available_versions()
+        versions = list(get_available_versions() or [])
         downloaded = get_downloaded_versions()
+
+        # Discover any locally downloaded versions/JSONs present in the directory not in Mojang's online manifest
+        existing_version_ids = {v[0] for v in versions}
+        local_extras = []
+        for v_id in sorted(downloaded):
+            if v_id not in existing_version_ids:
+                v_type = "release"
+                v_date = "local"
+                try:
+                    from utils import get_version_json
+                    v_json = get_version_json(v_id)
+                    if v_json:
+                        v_type = v_json.get("type", "release")
+                        rel_time = v_json.get("releaseTime", "")
+                        v_date = rel_time.split("T")[0] if "T" in rel_time else (rel_time or "local")
+                except Exception:
+                    pass
+                local_extras.append((v_id, v_type, v_date))
+
+        all_versions = local_extras + versions
 
         if self.show_downloaded_only and not downloaded:
             self.show_downloaded_only = False
@@ -1804,38 +2428,30 @@ class LauncherGUI(QMainWindow):
             save_launcher_config(config)
 
         count = 0
-        if not versions:
+        if not all_versions:
             self.is_offline = True
-            for v_id in downloaded:
-                self.version_combo.addItem(f"{v_id} (Offline)", v_id)
+            for v_id in sorted(downloaded):
+                self.version_combo.addItem(f"{v_id} (Offline) [Downloaded]", v_id)
                 idx = self.version_combo.count() - 1
                 self.version_combo.setItemData(idx, True, Qt.ItemDataRole.UserRole + 1)
                 count += 1
-            if hasattr(self, 'play_button'):
-                self.play_button.setText("PLAY MINECRAFT OFFLINE")
             if count > 0:
-                self.results_text.append(f"[System] Offline mode. Loaded {count} downloaded versions.")
+                self.results_text.append(f"[System] Offline mode. Loaded {count} downloaded versions from directory.")
             else:
                 self.results_text.append("[System] Offline mode. No downloaded versions available to play.")
         else:
-            self.is_offline = False
-            if hasattr(self, 'play_button'):
-                auth_data = get_auth_cache()
-                if auth_data and auth_data.get("owns_minecraft") is False:
-                    self.play_button.setText("PLAY MINECRAFT TRIAL")
-                else:
-                    self.play_button.setText("PLAY MINECRAFT")
+            self.is_offline = bool(not versions)
             config = load_launcher_config()
             hide_date = config.get("hide_release_date", False)
-            for v_id, v_type, v_date in versions:
-                if v_type not in self.version_filters:
+            for v_id, v_type, v_date in all_versions:
+                if v_type not in self.version_filters and v_type not in ["custom", "modified"]:
                     continue
                 is_downloaded = v_id in downloaded
                 if self.show_downloaded_only and not is_downloaded:
                     continue
 
                 type_display = v_type.replace('_', ' ').title()
-                if hide_date:
+                if hide_date or not v_date:
                     text = f"{v_id} ({type_display})"
                 else:
                     text = f"{v_id} ({type_display} - {v_date})"
@@ -1844,6 +2460,9 @@ class LauncherGUI(QMainWindow):
                     text += " [Downloaded]"
                     
                 self.version_combo.addItem(text, v_id)
+                if is_downloaded:
+                    idx = self.version_combo.count() - 1
+                    self.version_combo.setItemData(idx, True, Qt.ItemDataRole.UserRole + 1)
 
                 count += 1
             self.results_text.append(f"[System] Loaded {count} versions.")
@@ -1852,8 +2471,6 @@ class LauncherGUI(QMainWindow):
             idx_to_select = 0
             if old_selected:
                 for i in range(self.version_combo.count()):
-                    # .itemData(i) actually returns True if role is UserRole+1, wait, data is v_id which is default role (UserRole).
-                    # Actually, version_combo.itemData(i) gets the UserRole data, which is v_id
                     if self.version_combo.itemData(i) == old_selected:
                         idx_to_select = i
                         break
@@ -1861,6 +2478,7 @@ class LauncherGUI(QMainWindow):
 
         # Ensure UI updates to reflect the initially selected version
         self.on_version_changed(self.version_combo.currentIndex())
+        self.update_ui_state()
 
     def reload_profiles_combo(self):
         config = load_launcher_config()
@@ -1892,10 +2510,21 @@ class LauncherGUI(QMainWindow):
     def open_options_dialog(self):
         config = load_launcher_config()
         hide_release_date = config.get("hide_release_date", False)
+        dev_mode = config.get("dev_mode", getattr(self, "dev_mode", False))
+        show_access_token = config.get("show_access_token", getattr(self, "show_access_token", False))
         downloaded = get_downloaded_versions()
-        dialog = VersionOptionsDialog(self.version_filters, self.show_downloaded_only, self.skip_verification, self.show_console, self.remember_version, hide_release_date, self)
+        dialog = VersionOptionsDialog(
+            self.version_filters,
+            self.show_downloaded_only,
+            self.skip_verification,
+            self.show_console,
+            self.remember_version,
+            hide_release_date,
+            dev_mode,
+            show_access_token,
+            self
+        )
 
-        
         # Disable "Show only downloaded" if none exist
         if not downloaded:
             self.show_downloaded_only = False
@@ -1909,8 +2538,11 @@ class LauncherGUI(QMainWindow):
             self.skip_verification = dialog.get_skip_verification()
             self.show_console = dialog.get_show_console()
             
+            old_show_token = getattr(self, 'show_access_token', False)
+            self.show_access_token = dialog.get_show_access_token()
             self.remember_version = dialog.get_remember_version()
             self.hide_release_date = dialog.get_hide_release_date()
+            self.dev_mode = dialog.get_dev_mode()
 
             self.results_text.setVisible(self.show_console)
 
@@ -1920,17 +2552,27 @@ class LauncherGUI(QMainWindow):
             config["show_downloaded_only"] = self.show_downloaded_only
             config["skip_verification"] = self.skip_verification
             config["show_console"] = self.show_console
+            config["show_access_token"] = self.show_access_token
             config["remember_version"] = self.remember_version
             config["hide_release_date"] = self.hide_release_date
+            config["dev_mode"] = self.dev_mode
+            gc_del_logs, gc_log_val, gc_log_unit = dialog.get_log_gc_settings()
+            config["gc_delete_logs"] = gc_del_logs
+            config["gc_log_max_age_value"] = gc_log_val
+            config["gc_log_max_age_unit"] = gc_log_unit
             save_launcher_config(config)
-            
-            self.load_versions()
-
+            if old_show_token != self.show_access_token:
+                self._refresh_console_log()
+            try:
+                from garbage_collect import perform_garbage_collection
+                perform_garbage_collection(log_callback=self.log)
+            except Exception:
+                pass
             
             self.update_profile_banner()
             self.load_versions()
-            
-        self.status_label.setText("Ready to launch.")
+            if not self.running_instances and not self.is_pipeline_running:
+                self.status_label.setText("Ready to launch.")
 
     def setup_quick_play(self):
         if hasattr(self, 'quick_play_combo'):
@@ -1942,29 +2584,92 @@ class LauncherGUI(QMainWindow):
         self.quick_play_combo.addItem("No Quick Play", None)
         try:
             from utils import get_quick_play_options, get_dir
-            for qp in get_quick_play_options(get_dir("base")):
+            for qp in get_quick_play_options(get_dir("base"), include_realms=False):
                 self.quick_play_combo.addItem(qp['display'], qp)
         except Exception as e:
             print("Failed to load quick play options:", e)
             
         # Insert it before the play button
         self.action_layout.insertWidget(0, self.quick_play_combo, stretch=2)
+        self.update_ui_state()
+
+        # Load Realms asynchronously so window startup is instant
+        class _RealmsThread(QtCore.QThread):
+            loaded = QtCore.pyqtSignal(list)
+            def run(self_thread):
+                try:
+                    from utils import fetch_realms_options
+                    self_thread.loaded.emit(fetch_realms_options())
+                except Exception:
+                    pass
+
+        def _on_realms_loaded(realms_list):
+            if not hasattr(self, 'quick_play_combo') or not self.quick_play_combo:
+                return
+            for qp in realms_list:
+                self.quick_play_combo.addItem(qp['display'], qp)
+                if qp.get('expired'):
+                    idx = self.quick_play_combo.count() - 1
+                    item = self.quick_play_combo.model().item(idx)
+                    if item:
+                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+
+        self._realms_thread = _RealmsThread(self)
+        self._realms_thread.loaded.connect(_on_realms_loaded)
+        self._realms_thread.start()
+
+    def _format_log_line(self, line: str) -> str:
+        if getattr(self, 'show_access_token', False):
+            return line
+        cleaned = line
+        if hasattr(self, 'auth_data') and self.auth_data:
+            token = self.auth_data.get('mc_access_token')
+            if token and token != 'offline' and len(token) > 5 and token in cleaned:
+                cleaned = cleaned.replace(token, "[ACCESS_TOKEN_HIDDEN]")
+        cleaned = re.sub(r'(--accessToken\s+)(\S+)', r'\1[ACCESS_TOKEN_HIDDEN]', cleaned)
+        cleaned = re.sub(r'("auth_access_token":\s*")[^"]+(")', r'\1[ACCESS_TOKEN_HIDDEN]\2', cleaned)
+        cleaned = re.sub(r'(\baccessToken=)[^\s&,)]+', r'\1[ACCESS_TOKEN_HIDDEN]', cleaned)
+        return cleaned
+
+    def _refresh_console_log(self):
+        if not hasattr(self, 'results_text'):
+            return
+        self.results_text.clear()
+        for raw_line in getattr(self, '_raw_log_lines', []):
+            self.results_text.append(self._format_log_line(raw_line))
+        scrollbar = self.results_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def log(self, message):
-        self.results_text.append(message.strip())
+        clean_msg = message.strip()
+        if not hasattr(self, '_raw_log_lines'):
+            self._raw_log_lines = []
+        self._raw_log_lines.append(clean_msg)
+        formatted = self._format_log_line(clean_msg)
+        self.results_text.append(formatted)
         scrollbar = self.results_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
     def start_launch_sequence(self):
+        self._is_source_pipeline = False
         self.selected_version = self.version_combo.currentData()
+        if not self.selected_version:
+            return
+        self.selected_profile_name = self.profile_combo.currentText() if hasattr(self, 'profile_combo') else "Default"
         self.selected_quick_play = self.quick_play_combo.currentData() if hasattr(self, 'quick_play_combo') else None
-        self.play_button.setEnabled(False)
-        self.version_combo.setEnabled(False)
-        if hasattr(self, 'quick_play_combo'): self.quick_play_combo.setEnabled(False)
-        self.results_text.clear()
+        self.is_pipeline_running = True
+        self.update_ui_state()
+        if not self.running_instances:
+            self.results_text.clear()
+            self._raw_log_lines = []
+        else:
+            self.log("")
         
         self.log(f"=== Starting Launch Sequence for Minecraft {self.selected_version} ===")
         self.setWindowTitle(f"Minecraft - {self.selected_version} - Downloading...")
+        
+        # Ensure task progress bar format is reset from any previous "Game Running!" state
+        self.task_progress_bar.setFormat("Current Task: %p%")
         
         # Check Auth Cache first
         cached_auth = get_auth_cache()
@@ -2000,7 +2705,7 @@ class LauncherGUI(QMainWindow):
                 self.log(f"[Warning] Failed to load from .cache: {e}")
 
             if not cache_loaded:
-                config_path = utils.get_dir("versions") / self.selected_version / "command_config.json"
+                config_path = get_dir("versions") / self.selected_version / "command_config.json"
                 if config_path.exists():
                     try:
                         with open(config_path, "r") as f:
@@ -2023,17 +2728,19 @@ class LauncherGUI(QMainWindow):
             return
 
         # Step 1: Authentication
+        self.is_authenticating = True
         self.set_progress_visible(True)
         self.status_label.setText("[1/6] Authenticating with Microsoft...")
         self.step_progress_bar.setRange(0, 100)
         self.step_progress_bar.setValue(0)
         self.step_progress_bar.setFormat("Step 1/6 - Authentication")
         self.task_progress_bar.setRange(0, 0)
+        self.task_progress_bar.setFormat("Current Task: %p%")
         
         self.is_just_logging_in = False
         self.process = QProcess()
         self.process.setProgram(sys.executable)
-        self.process.setArguments(["get_mc_username.py", "--json", "--profile", get_active_profile_id(getattr(self, "_force_new_login", False))])
+        self.process.setArguments([get_script_path("get_mc_username.py"), "--json", "--profile", get_active_profile_id(getattr(self, "_force_new_login", False))])
         self._force_new_login = False
         self.process.readyReadStandardOutput.connect(self.handle_auth_stdout)
         self.process.readyReadStandardError.connect(self.handle_stderr)
@@ -2062,11 +2769,11 @@ class LauncherGUI(QMainWindow):
             elif "mc_username" in obj:
                 self.auth_data = obj
                 self._login_succeeded = True
+                save_auth_cache(obj)
                 self._cleanup_browser()
 
-                # Defer the file saving/moving logic so the Qt Event Loop can actually process the deleteLater calls
                 from PyQt6.QtCore import QTimer
-                QTimer.singleShot(1000, lambda auth_obj=obj: self._finalize_auth(auth_obj))
+                QTimer.singleShot(250, lambda auth_obj=obj: self._finalize_auth(auth_obj))
             elif "error" in obj:
                 self.log(f"[Error] {obj.get('error')}: {obj.get('details')}")
 
@@ -2083,22 +2790,17 @@ class LauncherGUI(QMainWindow):
         for line in data.splitlines():
             line = line.strip()
             if line:
-                self.check_game_started(line)
-                # Standard Python logging uses stderr, so we don't want to prefix everything with 'ERROR: '
                 self.log(line)
 
     def auth_finished(self, exitCode, exitStatus):
+        self.is_authenticating = False
         self.step_progress_bar.setVisible(False)
         self.step_progress_bar.setRange(0, 100)
 
         self._cleanup_browser()
 
-        self.play_button.setEnabled(True)
-        self.login_btn.setEnabled(True)
-        if self.version_combo.currentText() != "No versions available":
-            self.delete_button.setEnabled(True)
-            
         if exitCode != 0 or not self.auth_data:
+            self.is_pipeline_running = False
             self.log("[Error] Authentication failed or cancelled.")
             self.status_label.setText("Authentication Failed.")
             
@@ -2125,188 +2827,327 @@ class LauncherGUI(QMainWindow):
             is_logged_in = bool(self.auth_data)
             self.logout_btn.setVisible(is_logged_in)
             self.login_btn.setVisible(not is_logged_in)
+            self.update_ui_state()
             return
             
         if self.is_just_logging_in:
+            self.is_pipeline_running = False
             self.log("[System] Login complete. Ready to play.")
             self.status_label.setText("Ready to launch.")
+            self.update_ui_state()
         else:
             self.start_download_pipeline()
         
     def start_download_pipeline(self):
+        self.is_pipeline_running = True
+        self.task_progress_bar.setFormat("Current Task: %p%")
         self.set_progress_visible(True)
+        self.update_ui_state()
         self.log("")
         self.log("=== Authentication Complete. Proceeding to Downloads ===")
-        
-        is_downloaded = self.selected_version in get_downloaded_versions()
-        if is_downloaded and (getattr(self, 'skip_verification', True) or getattr(self, 'is_offline', False)):
-            self.log("")
-            self.log(f"[System] Minecraft {self.selected_version} is already fully downloaded. Skipping verification.")
-            self.pipeline_steps = []
-        else:
-            self.pipeline_steps = [
-                ("Java", ["download_java.py", "--version", self.selected_version, "--json"]),
-                ("Game Client", ["download_minecraft.py", "--version", self.selected_version, "--json"]),
-                ("Libraries", ["download_libraries.py", "--version", self.selected_version, "--json"]),
-                ("Assets", ["download_assets.py", "--version", self.selected_version, "--json"])
-            ]
-            
-        launch_args = [
-            "command_executor.py",
-            "--version", self.selected_version,
-            "--username", self.auth_data['mc_username'],
-            "--uuid", self.auth_data['mc_uuid'],
-            "--accessToken", self.auth_data['mc_access_token'],
-            "--xuid", self.auth_data['xbox_xuid'],
-            "--clientId", self.auth_data['launch_client_id']
-        ]
-        if getattr(self, "is_offline", False):
-            launch_args.append("--offline")
-            
-        if hasattr(self, 'selected_quick_play') and self.selected_quick_play:
-            launch_args.append("--quickPlayType")
-            launch_args.append(self.selected_quick_play['type'])
-            launch_args.append("--quickPlayId")
-            launch_args.append(self.selected_quick_play['id'])
-            
-        self.pipeline_steps.append(("Launching Game...", launch_args))
-        self.current_step = 0
-        self.run_next_step()
 
-    def run_next_step(self):
-        if self.current_step >= len(self.pipeline_steps):
-            self.log("")
-            self.log("=== Game Closed! ===")
-            self.status_label.setText("Game closed.")
-            self.step_progress_bar.setRange(0, 100)
-            self.step_progress_bar.setValue(100)
-            self.task_progress_bar.setValue(100)
-            self.reset_ui()
+        is_trial = bool(self.auth_data and self.auth_data.get("owns_minecraft") is False)
+        self._pipeline_worker = DownloadPipelineWorker(
+            version=self.selected_version,
+            auth_data=self.auth_data,
+            is_offline=getattr(self, 'is_offline', False),
+            is_trial=is_trial,
+            dev_mode=getattr(self, 'dev_mode', False),
+            quick_play=getattr(self, 'selected_quick_play', None),
+            skip_verification=getattr(self, 'skip_verification', True),
+            parent=self
+        )
+        self._pipeline_worker.progress_sig.connect(self._on_worker_progress)
+        self._pipeline_worker.log_sig.connect(self.log)
+        self._pipeline_worker.done_sig.connect(self._on_worker_done)
+        self._pipeline_worker.start()
+
+    def _on_worker_progress(self, current_step: int, total_steps: int, step_name: str, task_percent: float, status_str: str):
+        if not self.is_pipeline_running:
             return
+        base_percent = ((current_step - 1) / total_steps) * 100
+        added_percent = (task_percent / 100.0) * (100.0 / total_steps)
+        self.step_progress_bar.setValue(int(base_percent + added_percent))
+        self.step_progress_bar.setFormat(f"Step {current_step}/{total_steps} - %p%")
 
-        total_steps = len(self.pipeline_steps) + 1
-        current_display_step = self.current_step + 2
+        self.task_progress_bar.setRange(0, 100)
+        self.task_progress_bar.setValue(int(task_percent))
+        self.task_progress_bar.setFormat("Current Task: %p%")
 
-        percent = int(((current_display_step - 1) / total_steps) * 100)
-        self.step_progress_bar.setValue(percent)
-        self.step_progress_bar.setFormat(f"Step {current_display_step}/{total_steps} - %p%")
-        
-        status_msg, args = self.pipeline_steps[self.current_step]
-        
-        if "command_executor.py" in args:
-            self.task_progress_bar.setRange(0, 0)
-            self.status_label.setText(f"[{current_display_step}/{total_steps}] {status_msg}")
-        else:
-            self.task_progress_bar.setRange(0, 100)
-            self.task_progress_bar.setValue(0)
-            self.status_label.setText(f"[{current_display_step}/{total_steps}] Verifying {status_msg}...")
-        self.log("")
-        self.log(f"> Running: {' '.join(args)}")
-        
-        self.process = QProcess()
-        self.process.setProgram(sys.executable)
-        self.process.setArguments(args)
-        
-        self.process.readyReadStandardOutput.connect(self.handle_pipeline_stdout)
-        self.process.readyReadStandardError.connect(self.handle_stderr)
-        self.process.finished.connect(self.pipeline_step_finished)
-        
-        self.process.start()
+        if status_str:
+            self.status_label.setText(status_str)
 
-    def check_game_started(self, line):
-        if self.current_step >= len(self.pipeline_steps): return
-        
-        status_msg, args = self.pipeline_steps[self.current_step]
-        if "command_executor.py" in args:
-            if "LWJGL" in line or "Setting user" in line or "OpenAL initialized" in line:
-                if self.task_progress_bar.maximum() == 0:
-                    total_steps = len(self.pipeline_steps) + 1
-                    self.step_progress_bar.setValue(100)
-                    self.step_progress_bar.setFormat(f"Step {total_steps}/{total_steps} - 100%")
-                    self.task_progress_bar.setRange(0, 100)
-                    self.task_progress_bar.setValue(100)
-                    self.task_progress_bar.setFormat("Game Running!")
-                    self.setWindowTitle(f"Minecraft - {self.selected_version} - Playing")
-                    
-                    if self.remember_version:
-                        config = load_launcher_config()
-                        config["last_played_version"] = self.selected_version
-                        save_launcher_config(config)
-                        self.last_played_version = self.selected_version
-                    
-                    self.log("[SUCCESS] Minecraft launched successfully!")
-                    self.status_label.setText(f"[{total_steps}/{total_steps}] Minecraft is now running.")
-
-    def handle_pipeline_stdout(self):
-        data = self.process.readAllStandardOutput().data().decode('utf-8')
-        for line in data.splitlines():
-            line = line.strip()
-            if not line: continue
-            
-            self.check_game_started(line)
-            
-            
-            try:
-                obj = json.loads(line)
-                if isinstance(obj, dict) and obj.get("type") == "progress":
-                    task_percent = float(obj["progress"])
-                    self.task_progress_bar.setValue(int(task_percent))
-                    if "status" in obj:
-                        self.status_label.setText(obj["status"])
-                        
-                    # Smoothly update the top step progress bar
-                    total_steps = len(self.pipeline_steps) + 1
-                    current_display_step = self.current_step + 2
-                    base_percent = ((current_display_step - 1) / total_steps) * 100
-                    added_percent = (task_percent / 100.0) * (100.0 / total_steps)
-                    self.step_progress_bar.setValue(int(base_percent + added_percent))
-                else:
-                    self.log(line)
-            except json.JSONDecodeError:
-                self.log(line)
-                
-                # Dynamic status updates based on script text
-                if self.current_step < len(self.pipeline_steps):
-                    status_msg, args = self.pipeline_steps[self.current_step]
-                    if "command_executor.py" not in args:
-                        total_steps = len(self.pipeline_steps) + 1
-                        current_display_step = self.current_step + 1
-                        lower_line = line.lower()
-                        if "verifying" in lower_line:
-                            self.status_label.setText(f"[{current_display_step}/{total_steps}] Verifying {status_msg}...")
-                        elif "downloading" in lower_line or "fetching" in lower_line:
-                            self.status_label.setText(f"[{current_display_step}/{total_steps}] Downloading {status_msg}...")
-                        elif "extracting" in lower_line:
-                            self.status_label.setText(f"[{current_display_step}/{total_steps}] Extracting {status_msg}...")
-                
-    def pipeline_step_finished(self, exitCode, exitStatus):
-        if exitCode != 0:
+    def _on_worker_done(self, success: bool, result, error_msg: str):
+        self._pipeline_worker = None
+        if not success:
+            self.is_pipeline_running = False
             self.log("")
-            self.log(f"[Error] Step failed with code {exitCode}. Aborting launch.")
+            self.log(f"[Error] {error_msg}")
             self.status_label.setText("Launch Failed.")
             self.reset_ui()
             return
-            
-        if self.current_step < len(self.pipeline_steps):
-            status_msg, args = self.pipeline_steps[self.current_step]
-            if "download_assets.py" in args:
-                # Re-load versions so the [Downloaded] tag updates
-                self.load_versions()
-            
-        self.current_step += 1
-        self.run_next_step()
+
+        filled_command, cwd = result
+        self.load_versions()
+
+        self.step_progress_bar.setValue(100)
+        self.step_progress_bar.setFormat("Step Done - 100%")
+        self.task_progress_bar.setRange(0, 0)
+        self.task_progress_bar.setFormat("Launching...")
+        self.status_label.setText(f"Launching Minecraft {self.selected_version}...")
+
+        self.log("")
+        self.log(f"[COMMAND] {' '.join(filled_command)}")
+
+        self._launch_game_instance(filled_command, cwd)
+
+    def _launch_game_instance(self, command: list, cwd: str):
+        """Spawn a dedicated QProcess for a Minecraft game instance so multiple instances can run concurrently."""
+        game_proc = QProcess(self)
+        if cwd:
+            game_proc.setWorkingDirectory(cwd)
+        program = command[0]
+        args = command[1:]
+        game_proc.setProgram(program)
+        game_proc.setArguments(args)
+
+        inst_id = self._next_instance_id
+        self._next_instance_id += 1
+
+        profile_name = getattr(self, 'selected_profile_name', None) or (
+            self.profile_combo.currentText() if hasattr(self, 'profile_combo') else "Default"
+        )
+        mc_username = self.auth_data.get('mc_username', 'Player') if self.auth_data else 'Player'
+
+        inst = {
+            "id": inst_id,
+            "process": game_proc,
+            "version": self.selected_version,
+            "profile": profile_name,
+            "username": mc_username,
+            "started": False,
+            "stopped_by_user": False,
+            "window_timer": None,
+            "fallback_timer": None,
+        }
+        self.running_instances.append(inst)
+        self.update_ui_state()
+
+        game_proc.readyReadStandardOutput.connect(lambda i=inst: self._handle_instance_stdout(i))
+        game_proc.readyReadStandardError.connect(lambda i=inst: self._handle_instance_stderr(i))
+        game_proc.finished.connect(
+            lambda exitCode, exitStatus, i=inst: self._on_instance_finished(i, exitCode, exitStatus)
+        )
+        game_proc.start()
+
+        # Window detection timer: polls every 150ms for the actual game window
+        window_timer = QTimer(self)
+        window_timer.setInterval(150)
+        window_timer.timeout.connect(lambda i=inst: self._poll_instance_window(i))
+        inst["window_timer"] = window_timer
+        window_timer.start()
+
+        # Fallback timer (60s) in case window enumeration doesn't catch it
+        fallback_timer = QTimer(self)
+        fallback_timer.setSingleShot(True)
+        fallback_timer.timeout.connect(lambda i=inst: self._mark_instance_started(i))
+        inst["fallback_timer"] = fallback_timer
+        fallback_timer.start(60000)
+
+    def _poll_instance_window(self, inst: dict):
+        if inst.get("started") or inst not in self.running_instances:
+            if inst.get("window_timer"):
+                inst["window_timer"].stop()
+                inst["window_timer"] = None
+            return
+
+        proc = inst.get("process")
+        if not proc or proc.state() == QProcess.ProcessState.NotRunning:
+            if inst.get("window_timer"):
+                inst["window_timer"].stop()
+                inst["window_timer"] = None
+            return
+
+        pid = proc.processId()
+        if not pid:
+            return
+
+        try:
+            if is_minecraft_window_visible(pid, inst.get("version", "")):
+                self._mark_instance_started(inst)
+        except Exception:
+            pass
+
+    def _mark_instance_started(self, inst: dict):
+        if inst.get("started") or inst not in self.running_instances:
+            return
+        proc = inst.get("process")
+        if not proc or proc.state() == QProcess.ProcessState.NotRunning:
+            return
+
+        if inst.get("window_timer"):
+            inst["window_timer"].stop()
+            inst["window_timer"] = None
+        if inst.get("fallback_timer"):
+            inst["fallback_timer"].stop()
+            inst["fallback_timer"] = None
+        if inst.get("startup_timer"):
+            inst["startup_timer"].stop()
+            inst["startup_timer"] = None
+
+        inst["started"] = True
+        self.is_pipeline_running = False
+
+        self.step_progress_bar.setRange(0, 100)
+        self.step_progress_bar.setValue(100)
+        self.step_progress_bar.setFormat("Step Done - 100%")
+        self.task_progress_bar.setRange(0, 100)
+        self.task_progress_bar.setValue(100)
+
+        started_count = len([x for x in self.running_instances if x.get("started")])
+        if started_count > 1:
+            self.task_progress_bar.setFormat(f"Game Running! ({started_count} instances)")
+            self.setWindowTitle(f"PyMcLauncher - {started_count} Instances Playing")
+            self.status_label.setText(f"Minecraft is running ({started_count} active instances).")
+        else:
+            self.task_progress_bar.setFormat("Game Running!")
+            self.setWindowTitle(f"Minecraft - {inst['version']} - Playing")
+            self.status_label.setText(f"Minecraft {inst['version']} is now running.")
+
+        if self.remember_version:
+            config = load_launcher_config()
+            config["last_played_version"] = inst["version"]
+            save_launcher_config(config)
+            self.last_played_version = inst["version"]
+
+        self.log(f"[SUCCESS] Minecraft {inst['version']} ({inst['profile']}) launched successfully!")
+        self.update_running_instances_ui()
+
+    def _check_instance_output_line(self, inst: dict, line: str):
+        if not inst.get("started"):
+            if (
+                "OpenAL initialized" in line
+                or "Sound engine started" in line
+                or "Created: " in line
+                or "Backend library: LWJGL" in line
+            ):
+                self._mark_instance_started(inst)
+
+    def _handle_instance_stdout(self, inst: dict):
+        proc = inst.get("process")
+        if not proc:
+            return
+        data = proc.readAllStandardOutput().data().decode("utf-8", errors="replace")
+        for line in data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            self._check_instance_output_line(inst, line)
+            self.log(line)
+
+    def _handle_instance_stderr(self, inst: dict):
+        proc = inst.get("process")
+        if not proc:
+            return
+        data = proc.readAllStandardError().data().decode("utf-8", errors="replace")
+        for line in data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            self._check_instance_output_line(inst, line)
+            self.log(line)
+
+    def _on_instance_finished(self, inst: dict, exitCode: int, exitStatus):
+        if inst.get("window_timer"):
+            inst["window_timer"].stop()
+            inst["window_timer"] = None
+        if inst.get("fallback_timer"):
+            inst["fallback_timer"].stop()
+            inst["fallback_timer"] = None
+        if inst.get("startup_timer"):
+            inst["startup_timer"].stop()
+            inst["startup_timer"] = None
+
+        was_started = inst.get("started", False)
+        stopped_by_user = inst.get("stopped_by_user", False)
+        if inst in self.running_instances:
+            self.running_instances.remove(inst)
+
+        ver = inst.get("version", "Unknown")
+        prof = inst.get("profile", "Default")
+
+        if not was_started:
+            # Game exited before completing startup
+            self.is_pipeline_running = False
+            self.log("")
+            if stopped_by_user:
+                self.log(f"=== Minecraft {ver} ({prof}) Stopped! ===")
+                if not self.running_instances:
+                    self.status_label.setText("Game stopped.")
+            elif exitCode != 0:
+                self.log(f"[Error] Minecraft {ver} ({prof}) exited during startup with code {exitCode}.")
+                if not self.running_instances:
+                    self.status_label.setText("Launch Failed.")
+            else:
+                self.log(f"=== Minecraft {ver} ({prof}) Closed! ===")
+                if not self.running_instances:
+                    self.status_label.setText("Game closed.")
+        else:
+            self.log("")
+            if stopped_by_user:
+                self.log(f"=== Minecraft {ver} ({prof}) Stopped! ===")
+            else:
+                self.log(f"=== Minecraft {ver} ({prof}) Closed! ===")
+
+        started_remaining = [x for x in self.running_instances if x.get("started")]
+        if len(started_remaining) > 1:
+            if not self.is_pipeline_running:
+                self.task_progress_bar.setFormat(f"Game Running! ({len(started_remaining)} instances)")
+                self.setWindowTitle(f"PyMcLauncher - {len(started_remaining)} Instances Playing")
+                self.status_label.setText(f"Minecraft is running ({len(started_remaining)} active instances).")
+            self.update_running_instances_ui()
+        elif len(started_remaining) == 1:
+            rem = started_remaining[0]
+            if not self.is_pipeline_running:
+                self.task_progress_bar.setFormat("Game Running!")
+                self.setWindowTitle(f"Minecraft - {rem['version']} - Playing")
+                self.status_label.setText(f"Minecraft {rem['version']} is now running.")
+            self.update_running_instances_ui()
+        else:
+            # 0 running instances left
+            self.update_running_instances_ui()
+            if not self.is_pipeline_running:
+                if was_started:
+                    self.status_label.setText("Game stopped." if stopped_by_user else "Game closed.")
+                self.reset_ui()
 
     def reset_ui(self):
+        self.is_pipeline_running = False
+        self.is_authenticating = False
+        started_remaining = [x for x in getattr(self, 'running_instances', []) if x.get('started')]
+        if started_remaining:
+            if len(started_remaining) > 1:
+                self.setWindowTitle(f"PyMcLauncher - {len(started_remaining)} Instances Playing")
+                self.task_progress_bar.setFormat(f"Game Running! ({len(started_remaining)} instances)")
+            else:
+                self.setWindowTitle(f"Minecraft - {started_remaining[0]['version']} - Playing")
+                self.task_progress_bar.setFormat("Game Running!")
+            self.step_progress_bar.setRange(0, 100)
+            self.step_progress_bar.setValue(100)
+            self.task_progress_bar.setRange(0, 100)
+            self.task_progress_bar.setValue(100)
+            self.update_running_instances_ui()
+            return
+
         self.setWindowTitle("PyMcLauncher")
-        self.play_button.setEnabled(True)
-        self.version_combo.setEnabled(True)
-        if hasattr(self, 'quick_play_combo'): self.quick_play_combo.setEnabled(True)
         self.step_progress_bar.setRange(0, 100)
         self.step_progress_bar.setValue(100)
         self.step_progress_bar.setFormat("%p%")
         self.task_progress_bar.setRange(0, 100)
         self.task_progress_bar.setValue(100)
+        self.task_progress_bar.setFormat("Current Task: %p%")
         self.set_progress_visible(False)
+        self.update_running_instances_ui()
 
     # --- Browser Window Code (from old GUI) ---
     def open_browser(self, url):

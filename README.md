@@ -1,33 +1,53 @@
 # PyMcLauncher (Python Minecraft Launcher)
 
-A custom, lightweight Minecraft launcher built with Python and PyQt6.
+A custom, fast, lightweight Minecraft launcher built with Python and PyQt6.
 
 ## Prerequisites
 
 Before running the launcher, make sure you have the following installed on your system:
 
-- **Python 3.9 or newer** (Make sure to check "Add Python to PATH" during installation)
-- **Node.js** (Required for backend protocol scripts)
+- **Python 3.10 or newer** (Python 3.11 or 3.12 64-bit recommended for best performance).
+- **Important**: Make sure to check **"Add Python to PATH"** during Python installation.
 
-## Installation & Setup
+---
 
-1. **Install Python Dependencies:**
-   Open a terminal in the project folder and run the following command to install the required Python packages:
+Follow the intructions on the latest [release](https://github.com/cloudyhair6/PyMcLauncher/releases/latest) or just download the latest [installer\_and\_updater.py](https://github.com/cloudyhair6/PyMcLauncher/releases/latest/download/installer_and_updater.py)
+
+## Quick Start (Automatic)
+
+You can automatically check for updates, install required dependencies, and launch the application simply by double-clicking:
+
+```bat
+setup-start.bat
+```
+
+This batch script automatically handles dependency checks and starts the launcher for you.
+
+# BUT download the [installer\_and\_updater.py](https://github.com/cloudyhair6/PyMcLauncher/releases/latest/download/installer_and_updater.py) first.
+
+---
+
+## Manual Setup & Launch
+
+If you prefer to install dependencies and run the launcher manually from a terminal:
+
+1. **Install Dependencies:**
+   Open a terminal (Command Prompt or PowerShell) in the project directory and run:
    ```bash
    pip install -r requirements.txt
    ```
 
-2. **Install Node Modules:**
-   node 24.19.0
-   Because the `node_modules` folder isn't copied over when sharing the project, you must install the required Node dependencies manually. Run the following command in the project directory:
+2. **Run the Launcher:**
    ```bash
-   npm install
+   python launcher.py
    ```
 
-## Running the Launcher
+---
 
-Once both Python and Node dependencies are successfully installed, you can start the launcher by running:
+## Project Structure
 
-```bash
-python launcher.py
-```
+- `launcher.py` — Main graphical launcher interface (PyQt6).
+- `backend/` — Core launcher backend modules (downloaders, launch executors, Java runtime management, utilities).
+- `images/` — Launcher graphical assets, logos, and locator bar textures.
+- `.cache/` — User authentication cache, session tokens, and Python bytecode caches.
+- `launcher_config.json` — User preferences, profile configurations, and custom directories.

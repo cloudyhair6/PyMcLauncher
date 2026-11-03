@@ -9,11 +9,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import os
 
-# Enable UTF-8 output on Windows
+# Enable UTF-8 output on Windows without replacing/closing sys.stdout.buffer
 if sys.platform == 'win32':
     os.environ['PYTHONIOENCODING'] = 'utf-8'
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+
+_pkg_dir = Path(__file__).resolve().parent
+_root_dir = _pkg_dir.parent if _pkg_dir.name == "backend" else _pkg_dir
+for _p in [str(_pkg_dir), str(_root_dir)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from utils import (
     get_dir,
@@ -72,21 +78,32 @@ def format_time(seconds):
 
 def download_asset_worker(asset_name, asset_hash, asset_size, assets_dir):
     """Download a single asset file."""
+    import shutil
     asset_url = f"{ASSET_CDN_URL}/{asset_hash[:2]}/{asset_hash}"
-    
+    objects_base = get_dir("assets") / "objects"
+    hash_path = objects_base / asset_hash[:2] / asset_hash
+
     if dev_mode:
         # In dev mode, create proper folder structure (e.g., minecraft/sounds/ambient/weather/)
         asset_path = assets_dir / asset_name
         asset_path.parent.mkdir(parents=True, exist_ok=True)
+        # Fast path: if already downloaded in objects/<hash[:2]>/<hash>, copy locally without network!
+        if hash_path.exists() and verify_sha1(hash_path, asset_hash):
+            try:
+                shutil.copy2(hash_path, asset_path)
+                with progress_lock:
+                    progress_data['completed'] += 1
+                    progress_data['completed_size'] += asset_size
+                    progress_data['current_asset'] = asset_name
+                return True, asset_name, asset_size
+            except Exception:
+                pass
     else:
         # Normal mode: organize by hash (e.g., 00/005ff4be...)
         asset_dir = assets_dir / asset_hash[:2]
         asset_dir.mkdir(parents=True, exist_ok=True)
         asset_path = asset_dir / asset_hash
-    
-    # Verification is now done beforehand
-    # This worker only downloads
-    
+
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -105,6 +122,14 @@ def download_asset_worker(asset_name, asset_hash, asset_size, assets_dir):
                     time.sleep(1)
                     continue
                 return False, asset_name, asset_size
+
+            # In dev mode, also populate objects/<hash[:2]>/<hash> so the game client can use it
+            if dev_mode and not hash_path.exists():
+                try:
+                    hash_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(asset_path, hash_path)
+                except Exception:
+                    pass
 
             with progress_lock:
                 progress_data['completed'] += 1
@@ -159,11 +184,11 @@ def update_progress_display(total_assets):
     
     global json_output
     if globals().get('json_output', False):
-        # We only want to output JSON progress if it changed significantly to avoid spam, 
-        # or we just output it and let the launcher handle it.
-        # But to avoid massive spam, let's just output it. Python's print will add 
-
-        print(json.dumps({"type": "progress", "progress": percent, "status": status_line}))
+        now = time.monotonic()
+        last_json_t = globals().get('_last_json_emit_t', 0.0)
+        if (now - last_json_t) >= 0.035 or completed >= total_assets or percent >= 100.0:
+            globals()['_last_json_emit_t'] = now
+            print(json.dumps({"type": "progress", "progress": percent, "status": status_line}), flush=True)
     else:
         # Write to stdout with carriage return to overwrite the line
         sys.stdout.write(f"\r{status_line:<120}")
@@ -189,9 +214,13 @@ def list_versions_with_assets():
     
     print("-" * 70)
 
-def download_assets(version_id):
+def download_assets(version_id, json_mode=None, is_dev_mode=None):
     """Download all assets for a specific Minecraft version using parallel downloads."""
-    global dev_mode, download_dir_name
+    global dev_mode, download_dir_name, json_output
+    if json_mode is not None:
+        json_output = json_mode
+    if is_dev_mode is not None:
+        dev_mode = is_dev_mode
     
     ensure_download_dir()
     
@@ -211,19 +240,19 @@ def download_assets(version_id):
     asset_index_info = version_json['assetIndex']
     asset_index_url = asset_index_info['url']
     asset_index_id = asset_index_info.get('id', 'unknown')
-    
-    # Download asset index
-    print(f"Downloading asset index for {version_id}...")
+    asset_index_sha1 = asset_index_info.get('sha1', None)
     
     # Store the asset index inside the assets/indexes directory (what the game expects)
     index_dir = get_dir("assets") / "indexes"
     index_dir.mkdir(parents=True, exist_ok=True)
     index_path = index_dir / f"{asset_index_id}.json"
     
-    from utils import download_file
-    if not download_file(asset_index_url, index_path):
-        print(f"Error: Failed to download asset index")
-        return False
+    if not (index_path.exists() and (not asset_index_sha1 or verify_sha1(index_path, asset_index_sha1))):
+        print(f"Downloading asset index for {version_id}...")
+        from utils import download_file
+        if not download_file(asset_index_url, index_path, expected_sha1=asset_index_sha1):
+            print(f"Error: Failed to download asset index")
+            return False
     
     # Parse asset index
     try:
@@ -290,7 +319,8 @@ def download_assets(version_id):
             progress_data['completed'] += 1
             progress_data['completed_size'] += asset_size
             progress_data['current_asset'] = asset_name
-            update_progress_display(total_assets)
+            if not globals().get('json_output', False):
+                update_progress_display(total_assets)
         else:
             missing_assets[asset_name] = asset_info
             
@@ -414,14 +444,12 @@ def main():
     global json_output
     json_output = args.json
     
-    # Handle directory setup
+    # Handle directory setup (respect active profile in launcher_config.json unless --dir is passed)
+    if args.dev_mode:
+        dev_mode = True
     if args.dir:
         set_download_dir(args.dir)
         download_dir_name = args.dir
-    elif args.dev_mode:
-        dev_mode = True
-        download_dir_name = "dev_minecraft_downloads"
-        set_download_dir(download_dir_name)
     
     if args.version.lower() == "list":
         list_versions_with_assets()

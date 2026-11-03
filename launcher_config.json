@@ -1,0 +1,77 @@
+{
+    "version_filters": [
+        "release"
+    ],
+    "show_downloaded_only": false,
+    "skip_verification": false,
+    "show_console": false,
+    "remember_version": false,
+    "downloaded_versions": [
+        "26.3"
+    ],
+    "main_animation": "fly",
+    "main_spin": true,
+    "profiles": {
+        "Default": {
+            "base": "minecraft_downloads",
+            "assets": "minecraft_downloads/assets",
+            "libraries": "minecraft_downloads/libraries",
+            "versions": "minecraft_downloads/versions",
+            "java": "minecraft_downloads/java",
+            "saves": "minecraft_downloads/saves",
+            "indexes": "minecraft_downloads/indexes"
+        },
+        "Test": {
+            "base": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test",
+            "assets": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test/assets",
+            "libraries": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test/libraries",
+            "versions": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test/versions",
+            "java": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test/java",
+            "saves": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test/saves",
+            "indexes": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test/indexes"
+        },
+        "BOB": {
+            "base": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test",
+            "assets": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test/assets",
+            "libraries": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test/libraries",
+            "versions": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test/versions",
+            "java": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test/java",
+            "saves": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test/saves",
+            "indexes": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test/indexes",
+            "source": "C:/Users/Will/OneDrive/github/copilot cli/minecraft/hello/test/source"
+        }
+    },
+    "active_profile": "Default",
+    "accounts": {
+        "active_profile": "f4b29ce3-d69a-4a25-b71b-51d943665e88",
+        "profiles": {
+            "f4b29ce3-d69a-4a25-b71b-51d943665e88": {
+                "xbox_gamertag": "PearlYapper3193",
+                "xbox_gamerpic_url": "https://images-eds-ssl.xboxlive.com/image?url=8Oaj9Ryq1G1_p3lLnXlsaZgGzAie6Mnu24_PawYuDYIoH77pJ.X5Z.MqQPibUVTcS9jr0n8i7LY1tL3U7AiafTmRVYtHDrBf1rzW8eNDEhlmlbMPjYHoJ6XYT5Bsb0sl&format=png",
+                "xbox_gamerscore": "905",
+                "xbox_xuid": "2535457961668153",
+                "mc_username": "PearlYapper3193",
+                "mc_uuid": "5dce3b3d17884740be93bca1d781de99",
+                "mc_access_token": "eyJraWQiOiIwNDkxODEiLCJhbGciOiJSUzI1NiJ9.eyJ4dWlkIjoiMjUzNTQ1Nzk2MTY2ODE1MyIsImFnZyI6IlRlZW4iLCJzdWIiOiI3MThjNjkyOC0wMDI3LTRjZWItYTg5MC0wMzg1NDY5NTYyOGUiLCJhdXRoIjoiWEJPWCIsInBmaWQiOiIyNjYxMzQ4ODA2NUQ3NTlBIiwibnMiOiJkZWZhdWx0IiwicHNuaWQiOiI5MTM0NjM2ODI5NjI2NjIxMTc3Iiwicm9sZXMiOltdLCJpc3MiOiJhdXRoZW50aWNhdGlvbiIsImZsYWdzIjpbIm11bHRpcGxheWVyIl0sInByb2ZpbGVzIjp7Im1jIjoiNWRjZTNiM2QtMTc4OC00NzQwLWJlOTMtYmNhMWQ3ODFkZTk5In0sIm1pZCI6IjI2NjEzNDg4MDY1RDc1OUEiLCJwbWlkIjoiNjc1MTlmN2ItZTI3My01Nzg5LTgzNTAtMTEwNmQ4YThiOTFlIiwicGxhdGZvcm0iOiJQQ19MQVVOQ0hFUiIsInRpZCI6IkU5OUIwIiwicGZkIjpbeyJ0eXBlIjoibWMiLCJpZCI6IjVkY2UzYjNkLTE3ODgtNDc0MC1iZTkzLWJjYTFkNzgxZGU5OSIsIm5hbWUiOiJQZWFybFlhcHBlcjMxOTMifV0sInhpZCI6IjI1MzU0NTc5NjE2NjgxNTMiLCJuYmYiOjE3OTM2OTM1MTksImV4cCI6MTc5Mzc3OTkxOSwiaWF0IjoxNzkzNjkzNTE5LCJhaWQiOiIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwNDQxY2M5NmIifQ.kS1lhmJnt9LUz05CvluA950xdPxskk5CFa5aY7BJ0hHTbLxd9VvEA3EJg4VNmu_htD1g0ULj2cj6vOk0YuxVrjF3weplldgAyOCYsAtPcIIvhZZYVPbbv54WmTo9HfIleraN7kRBMQox3QgIfDXKRcpIYZfBwtissdNvurE_zMnFFMebgqEL4_8NioQmZdXpwcMl2er35HtvEN65kGm5jRhwJAVvoqFW4nx05iOyMHOWTEfA-GgtOvgH34uyKTRSswtzhV92xH2yrLL02QV1tYAMijDjyJXqiQ61qG18iHIXHUwDvV3lHIwxvQzrl4NXNmQrP2npp48BlnXDfFM2gw",
+                "launch_client_id": "b1f6130d-5000-4653-a261-82d4b9a0a272",
+                "azure_client_id": "00000000402b5328",
+                "locator_bar_color": "#541E45",
+                "xbox_presence_state": "Offline",
+                "owns_minecraft": true
+            }
+        }
+    },
+    "player_data_options": {
+        "show_3d_skin": true,
+        "show_change_skin_btn": true,
+        "show_java_profile": true,
+        "show_xbox_profile": true,
+        "show_locator_bar": true
+    },
+    "hide_release_date": false,
+    "dev_mode": false,
+    "gc_delete_logs": true,
+    "gc_log_max_age_value": 7,
+    "gc_log_max_age_unit": "Days",
+    "show_access_token": false
+}

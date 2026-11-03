@@ -9,11 +9,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import os
 
-# Enable UTF-8 output on Windows
+# Enable UTF-8 output on Windows without replacing/closing sys.stdout.buffer
 if sys.platform == 'win32':
     os.environ['PYTHONIOENCODING'] = 'utf-8'
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+
+_pkg_dir = Path(__file__).resolve().parent
+_root_dir = _pkg_dir.parent if _pkg_dir.name == "backend" else _pkg_dir
+for _p in [str(_pkg_dir), str(_root_dir)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from utils import (
     get_dir,
@@ -177,15 +183,27 @@ def list_versions():
     print(f"{'Version':<20} {'Type':<15} {'Release Date':<30}")
     print("-" * 70)
     
-    for version_id, version_type in versions:
+    for version_id, version_type, release_date in versions:
         type_label = version_type.replace("old_", "").upper()
-        print(f"{version_id:<20} {type_label:<15}")
+        print(f"{version_id:<20} {type_label:<15} {release_date:<30}")
     
     print("-" * 70)
 
-def download_libraries(version_id):
+def download_libraries(version_id, json_mode=None, is_dev_mode=None):
     """Download Minecraft libraries for a specific version using parallel downloads."""
-    global dev_mode, download_dir_name
+    global dev_mode, download_dir_name, json_output
+    if json_mode is not None:
+        json_output = json_mode
+    if is_dev_mode is not None:
+        dev_mode = is_dev_mode
+
+    with progress_lock:
+        progress_data['completed_size'] = 0
+        progress_data['total_size'] = 0
+        progress_data['completed'] = 0
+        progress_data['failed'] = 0
+        progress_data['start_time'] = time.time()
+        progress_data['current_lib'] = ''
     
     ensure_download_dir()
     
@@ -202,78 +220,98 @@ def download_libraries(version_id):
         print(f"Error: No libraries found for version {version_id}")
         return False
     
-    libraries = version_json['libraries']
-    print(f"Found {len(libraries)} libraries to download")
+    from garbage_collect import is_allowed_by_rules
+    libraries = [lib for lib in version_json['libraries'] if is_allowed_by_rules(lib.get('rules', []))]
+    print(f"Found {len(libraries)} libraries for current OS")
     
     # Prepare libraries directory
     libraries_dir = get_dir("libraries")
     libraries_dir.mkdir(parents=True, exist_ok=True)
     
-    # Collect all libraries to download
+    # Gather all candidate artifacts & native classifiers for current OS
+    import platform
+    sysname = platform.system().lower()
+    os_key = 'osx' if sysname == 'darwin' else ('windows' if sysname == 'windows' else 'linux')
+    arch_bits = '64' if sys.maxsize > 2**32 else '32'
+
+    candidate_items = []
+    for library in libraries:
+        if 'downloads' not in library:
+            continue
+        downloads = library['downloads']
+        if 'artifact' in downloads:
+            artifact = downloads['artifact']
+            candidate_items.append((
+                artifact['path'].split('/')[-1],
+                artifact['url'],
+                artifact.get('size', 0),
+                artifact.get('sha1', ''),
+                libraries_dir / artifact['path'],
+            ))
+        if 'classifiers' in downloads:
+            classifiers = downloads['classifiers']
+            natives_map = library.get('natives')
+            if isinstance(natives_map, dict):
+                raw_cls_key = natives_map.get(os_key)
+                target_keys = [raw_cls_key.replace('${arch}', arch_bits)] if raw_cls_key else []
+            else:
+                target_keys = [
+                    k for k in classifiers.keys()
+                    if os_key in k.lower() or ('osx' if os_key == 'osx' else os_key) in k.lower()
+                ] or list(classifiers.keys())
+            for classifier_key in target_keys:
+                if classifier_key not in classifiers:
+                    continue
+                classifier = classifiers[classifier_key]
+                candidate_items.append((
+                    classifier['path'].split('/')[-1],
+                    classifier['url'],
+                    classifier.get('size', 0),
+                    classifier.get('sha1', ''),
+                    libraries_dir / classifier['path'],
+                ))
+
     libs_to_download = []
     total_size = 0
-    
     print("Verifying existing libraries (this may take a moment)...")
-    last_verify_percent = -1
-    for idx, library in enumerate(libraries):
-        if globals().get('json_output', False):
-            percent = (idx / len(libraries)) * 100
-            if percent - last_verify_percent >= 2.0 or idx == len(libraries) - 1:
-                print(json.dumps({"type": "progress", "progress": percent, "status": f"Verifying Libraries: {percent:.1f}%"}))
-                sys.stdout.flush()
-                last_verify_percent = percent
 
-        if 'downloads' in library:
-            downloads = library['downloads']
-            
-            # Handle regular artifacts
-            if 'artifact' in downloads:
-                artifact = downloads['artifact']
-                lib_size = artifact.get('size', 0)
-                lib_hash = artifact.get('sha1', '')
-                lib_path = libraries_dir / artifact['path']
-                lib_url = artifact['url']
-                lib_name = artifact['path'].split('/')[-1]
-                
-                # Only add if not already downloaded
-                if not (lib_path.exists() and verify_sha1(lib_path, lib_hash)):
-                    libs_to_download.append((lib_name, lib_url, lib_size, lib_hash, lib_path))
-                    total_size += lib_size
-                else:
-                    # Mark as already completed
-                    with progress_lock:
-                        progress_data['completed'] += 1
-                        progress_data['completed_size'] += lib_size
-            
-            # Handle classifiers (natives, etc.)
-            if 'classifiers' in downloads:
-                classifiers = downloads['classifiers']
-                for classifier_key, classifier in classifiers.items():
-                    lib_size = classifier.get('size', 0)
-                    lib_hash = classifier.get('sha1', '')
-                    lib_path = libraries_dir / classifier['path']
-                    lib_url = classifier['url']
-                    lib_name = classifier['path'].split('/')[-1]
-                    
-                    if not (lib_path.exists() and verify_sha1(lib_path, lib_hash)):
-                        libs_to_download.append((lib_name, lib_url, lib_size, lib_hash, lib_path))
-                        total_size += lib_size
-                    else:
-                        with progress_lock:
-                            progress_data['completed'] += 1
-                            progress_data['completed_size'] += lib_size
+    def _verify_lib_item(item):
+        lib_name, lib_url, lib_size, lib_hash, lib_path = item
+        is_valid = lib_path.exists() and (not lib_hash or verify_sha1(lib_path, lib_hash))
+        return is_valid, item
+
+    total_candidates = max(len(candidate_items), 1)
+    last_verify_percent = -1
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as verify_pool:
+        for idx, (is_valid, item) in enumerate(verify_pool.map(_verify_lib_item, candidate_items)):
+            lib_name, lib_url, lib_size, lib_hash, lib_path = item
+            if globals().get('json_output', False):
+                percent = ((idx + 1) / total_candidates) * 100
+                if percent - last_verify_percent >= 2.0 or idx == total_candidates - 1:
+                    print(json.dumps({"type": "progress", "progress": percent, "status": f"Verifying Libraries: {percent:.1f}%"}))
+                    sys.stdout.flush()
+                    last_verify_percent = percent
+            if not is_valid:
+                libs_to_download.append(item)
+                total_size += lib_size
+            else:
+                with progress_lock:
+                    progress_data['completed'] += 1
+                    progress_data['completed_size'] += lib_size
     
     if not libs_to_download:
         print(f"[OK] All {len(libraries)} libraries already downloaded")
         return True
     
-    total_libraries = len(libraries)
+    total_libraries = len(libs_to_download)
     mode_str = " (dev-mode)" if dev_mode else ""
     print(f"Downloading {len(libs_to_download)} new libraries ({format_size(total_size)} total){mode_str}")
     print(f"Starting parallel download with {MAX_WORKERS} concurrent connections...\n")
     
-    # Initialize progress data
+    # Initialize progress data for the missing libraries to download
     with progress_lock:
+        progress_data['completed'] = 0
+        progress_data['completed_size'] = 0
         progress_data['total_size'] = total_size
         progress_data['start_time'] = time.time()
         progress_data['current_lib'] = ''
@@ -310,7 +348,7 @@ def download_libraries(version_id):
     print(f"Library Download Complete!")
     print(f"{'='*70}")
     print(f"Downloaded: {len(libs_to_download)} new libraries ({format_size(total_size)})")
-    print(f"Already cached: {total_libraries - len(libs_to_download)} libraries")
+    print(f"Already cached: {len(libraries) - len(libs_to_download)} libraries")
     if failed_libraries:
         print(f"Failed: {len(failed_libraries)} libraries")
         for lib in failed_libraries[:5]:
@@ -362,14 +400,12 @@ def main():
     global json_output
     json_output = args.json
     
-    # Handle directory setup
+    # Handle directory setup (respect active profile in launcher_config.json unless --dir is passed)
+    if args.dev_mode:
+        dev_mode = True
     if args.dir:
         set_download_dir(args.dir)
         download_dir_name = args.dir
-    elif args.dev_mode:
-        dev_mode = True
-        download_dir_name = "dev_minecraft_downloads"
-        set_download_dir(download_dir_name)
     
     if args.version.lower() == "list":
         list_versions()

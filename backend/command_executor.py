@@ -19,6 +19,12 @@ import os
 import zipfile
 import platform
 
+_pkg_dir = Path(__file__).resolve().parent
+_root_dir = _pkg_dir.parent if _pkg_dir.name == "backend" else _pkg_dir
+for _p in [str(_pkg_dir), str(_root_dir)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
@@ -30,29 +36,47 @@ TEMPLATE_VAR_PATTERN = re.compile(r'\$\{(\w+)\}')
 def is_allowed_by_rules(rules: List[Dict]) -> bool:
     if not rules:
         return True
-    
+
     sysname = platform.system().lower()
-    if sysname == 'darwin': os_name = 'osx'
-    elif sysname == 'windows': os_name = 'windows'
-    else: os_name = 'linux'
-    
-    allowed = False
+    if sysname == 'darwin':
+        os_name = 'osx'
+    elif sysname == 'windows':
+        os_name = 'windows'
+    else:
+        os_name = 'linux'
+
+    is_64bit = sys.maxsize > 2**32
+    machine = platform.machine().lower()
+    is_arm = 'arm' in machine or 'aarch' in machine
+
+    first_rule = rules[0]
+    if first_rule.get('action') == 'disallow' and ('os' in first_rule or 'features' in first_rule):
+        allowed = True
+    else:
+        allowed = False
+
     for rule in rules:
-        action = rule.get('action')
+        action = rule.get('action', 'allow')
+        if 'features' in rule:
+            continue
         os_rule = rule.get('os')
-        
+
         match = True
-        if os_rule is not None:
+        if isinstance(os_rule, dict):
             if 'name' in os_rule and os_rule['name'] != os_name:
                 match = False
-            # Could also check 'arch' if needed
-            
+            if 'arch' in os_rule:
+                req_arch = os_rule['arch'].lower()
+                if req_arch == 'x86' and (is_64bit or is_arm):
+                    match = False
+                elif req_arch in ('x64', 'x86_64', 'amd64') and (not is_64bit or is_arm):
+                    match = False
+                elif 'arm' in req_arch and not is_arm:
+                    match = False
+
         if match:
-            if action == 'allow':
-                allowed = True
-            elif action == 'disallow':
-                allowed = False
-                
+            allowed = (action == 'allow')
+
     return allowed
 
 
@@ -130,38 +154,22 @@ def fill_variables(command: List[str], variables: Dict[str, str]) -> List[str]:
 
 
 def get_minecraft_versions() -> Dict:
-    """Get Minecraft versions from manifest"""
+    """Get Minecraft versions from manifest (using shared in-memory + disk cache)"""
     try:
-        import requests
-        response = requests.get(
-            'https://launchermeta.mojang.com/mc/game/version_manifest.json',
-            timeout=10
-        )
-        response.raise_for_status()
-        return response.json()
+        manifest = utils.fetch_version_manifest()
+        if manifest:
+            return manifest
     except Exception as e:
         logger.error(f"Failed to get Minecraft versions: {e}")
-        return {}
+    return {}
 
 
 def get_version_info(version_id: str) -> Optional[Dict]:
-    """Get version manifest for specific version"""
-    local_path = utils.get_dir("versions") / version_id / f'{version_id}.json'
-    if local_path.exists():
-        try:
-            with open(local_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            pass
+    """Get version manifest for specific version (using shared in-memory + disk cache)"""
     try:
-        import requests
-        manifest = get_minecraft_versions()
-        
-        for version in manifest.get('versions', []):
-            if version['id'] == version_id:
-                response = requests.get(version['url'], timeout=10)
-                response.raise_for_status()
-                return response.json()
+        cached = utils.get_version_json(version_id)
+        if cached:
+            return cached
     except Exception as e:
         logger.error(f"Failed to get version info: {e}")
     
@@ -226,19 +234,33 @@ def build_java_command(version_id: str, java_path: str = 'java') -> List[str]:
     return command
 
 
-def execute_command(command: List[str], dry_run: bool = False) -> bool:
+def execute_command(command: List[str], dry_run: bool = False, cwd: Optional[str] = None) -> bool:
     """Execute the command"""
     try:
-        # Convert to string for display
-        command_str = ' '.join(command)
+        # Convert to string for display (masking access token if present)
+        display_cmd = []
+        skip_next = False
+        for arg in command:
+            if skip_next:
+                display_cmd.append("[ACCESS_TOKEN_HIDDEN]")
+                skip_next = False
+            elif arg == "--accessToken":
+                display_cmd.append(arg)
+                skip_next = True
+            else:
+                display_cmd.append(arg)
+        command_str = ' '.join(display_cmd)
         logger.info(f"[COMMAND] {command_str}")
         
         if dry_run:
             logger.info("[DRY-RUN] Command not executed")
             return True
         
-        # Execute command
-        result = subprocess.run(command, check=False)
+        if cwd:
+            Path(cwd).mkdir(parents=True, exist_ok=True)
+        
+        # Execute command with the profile's base game directory as cwd so logs/ and crash-reports/ are saved there
+        result = subprocess.run(command, check=False, cwd=cwd)
         
         if result.returncode == 0:
             logger.info("[SUCCESS] Command executed successfully")
@@ -296,8 +318,9 @@ class CommandExecutor:
     def save_config(self) -> bool:
         """Save config to file"""
         try:
+            to_save = {k: v for k, v in self.variables.items() if k != 'auth_access_token'}
             with open(self.config_path, 'w') as f:
-                json.dump(self.variables, f, indent=2)
+                json.dump(to_save, f, indent=2)
             return True
         except Exception as e:
             logger.error(f"Failed to save config: {e}")
@@ -313,81 +336,53 @@ class CommandExecutor:
         logger.error('[FAILURE] Authentication variables are missing. Please run the launcher GUI first to authenticate.')
         return False
     
-    def execute_launch_command(self) -> bool:
-        """Execute the Minecraft launch command"""
+    def prepare_launch_command(self) -> Optional[Tuple[List[str], str]]:
+        """Build the Minecraft launch command and return (filled_command, cwd_path)."""
         # Build base command
-        # Ensure downloads directory variable exists (can be injected via --dir before calling)
+        # Always resolve the game directory from the active profile's base directory unless --dir was explicitly passed
         import utils
-        downloads_str = self.variables.get('minecraft_downloads') or str(utils.get_dir('base').absolute())
+        if getattr(self, 'explicit_dir', False) and self.variables.get('minecraft_downloads'):
+            downloads_str = self.variables['minecraft_downloads']
+        else:
+            downloads_str = str(utils.get_dir('base').absolute())
         downloads = Path(downloads_str)
-        # Normalize and save back into variables so templates can use absolute path
+        downloads.mkdir(parents=True, exist_ok=True)
+        # Normalize and save back into variables so templates use the current profile's absolute path
         self.variables['minecraft_downloads'] = str(downloads.absolute())
 
-        # Note: This constructs a reasonable classpath from the libraries directory if present.
         libs_dir = utils.get_dir("libraries")
-        classpath = []
-
-        # Prefer version jar(s) from versions/ (e.g., versions/1.21.11-client.jar or versions/1.21.11/1.21.11.jar)
-        versions_dir = utils.get_dir("versions")
-        if versions_dir.exists():
-            for jar in versions_dir.rglob('*.jar'):
-                if self.minecraft_version in jar.name:
-                    classpath.append(str(jar))
-        # Also check for the common filename pattern
-        v_client = utils.get_dir("versions") / f'{self.minecraft_version}-client.jar'
-        if v_client.exists() and str(v_client) not in classpath:
-            classpath.insert(0, str(v_client))
-
-        # Add all library jars (append after version jars)
-        if libs_dir.exists():
-            for jar in libs_dir.rglob('*.jar'):
-                classpath.append(str(jar))
-
-        # Remove duplicates while preserving order
-        seen = set()
-        cp = []
-        for p in classpath:
-            if p not in seen:
-                seen.add(p)
-                cp.append(p)
-        classpath = cp
-
-        # Fallback to a placeholder if classpath empty
-        if not classpath:
-            classpath = ['${minecraft_downloads}/client.jar']
-
-        # Use OS-specific path separator
-        cp_str = os.pathsep.join(classpath)
         # Auto-resolve java path for this version if not explicitly provided
         if not getattr(self, 'explicit_java_path', False):
             try:
                 java_info = get_java_version(self.minecraft_version)
                 if java_info and java_info.get('component'):
                     comp = java_info.get('component')
+                    major_ver = java_info.get('major_version', 17)
                     java_home = utils.get_dir("java") / comp
                     exe_name = 'java.exe' if platform.system() == 'Windows' else 'java'
                     potential = java_home / 'bin' / exe_name
                     if potential.exists():
                         self.variables['java_path'] = str(potential.absolute())
                     else:
-                        found = list(java_home.rglob(exe_name))
-                        if found:
-                            self.variables['java_path'] = str(found[0].absolute())
+                        from download_java import find_existing_java_runtime
+                        existing = find_existing_java_runtime(comp, major_ver)
+                        if existing and existing.exists():
+                            self.variables['java_path'] = str(existing.absolute())
+                        else:
+                            found = list(java_home.rglob(exe_name))
+                            if found:
+                                self.variables['java_path'] = str(found[0].absolute())
             except Exception as e:
                 logger.error(f"Failed resolving Java path: {e}")
             
         java_bin = self.variables.get('java_path', 'java')
-
-        # Ensure natives are extracted into libraries/natives for Windows
-        natives_dir = utils.get_dir("libraries") / 'natives'
-        natives_dir.mkdir(parents=True, exist_ok=True)
 
         # Build JVM args and classpath from version JSON when available (or skip in offline mode)
         jvm_args = [f'-Xmx2G', f'-Xms1G', '-XX:+UseG1GC', '-Djava.util.Arrays.useLegacyMergeSort=true']
         main_class = 'net.minecraft.client.main.Main'
         asset_index_arg = self.minecraft_version
         classpath = []
-        natives_dir = utils.get_dir("libraries") / 'natives'
+        natives_dir = utils.get_dir("libraries") / 'natives' / self.minecraft_version
         natives_dir.mkdir(parents=True, exist_ok=True)
 
         version_info = get_version_info(self.minecraft_version)
@@ -480,10 +475,19 @@ class CommandExecutor:
                                 if path:
                                     natives_classifiers.append(str(utils.get_dir("libraries") / path))
 
-            # Append version client jar(s) at the end of classpath (if not already)
-            v_client = utils.get_dir("versions") / f'{self.minecraft_version}-client.jar'
-            if v_client.exists():
-                classpath.append(str(v_client))
+            # Append version client jar(s) at the end of classpath (checking multiple layout formats)
+            v_dir = utils.get_dir("versions")
+            candidate_jars = [
+                v_dir / f'{self.minecraft_version}-client.jar',
+                v_dir / f'{self.minecraft_version}.jar',
+                v_dir / self.minecraft_version / f'{self.minecraft_version}-client.jar',
+                v_dir / self.minecraft_version / f'{self.minecraft_version}.jar',
+                v_dir / self.minecraft_version / 'client.jar',
+            ]
+            for c_jar in candidate_jars:
+                if c_jar.exists():
+                    classpath.append(str(c_jar))
+                    break
 
             # Remove duplicates preserving order
             seen = set(); cp = []
@@ -496,22 +500,30 @@ class CommandExecutor:
             # Fallback for old versions: check if any explicit natives were found in classifiers.
             # We don't blindly extract all classpath jars because modern LWJGL extracts its own natives.
 
-            # Clear old natives before extracting new ones for this version
-            if natives_dir.exists():
-                import shutil
-                try:
-                    shutil.rmtree(natives_dir)
-                except Exception as e:
-                    logger.debug(f"Failed to clear natives_dir: {e}")
+            # Extract natives found in classifiers safely (multi-instance friendly if DLLs are already loaded)
             natives_dir.mkdir(parents=True, exist_ok=True)
-
-            # Extract natives found in classifiers
             for nat in natives_classifiers:
                 try:
                     jar_path = Path(nat)
                     if jar_path.exists():
                         with zipfile.ZipFile(jar_path, 'r') as z:
-                            z.extractall(natives_dir)
+                            for member in z.infolist():
+                                if member.is_dir() or member.filename.startswith('META-INF/'):
+                                    continue
+                                target_file = natives_dir / member.filename
+                                if target_file.exists():
+                                    try:
+                                        if target_file.stat().st_size == member.file_size:
+                                            continue
+                                    except Exception:
+                                        pass
+                                target_file.parent.mkdir(parents=True, exist_ok=True)
+                                try:
+                                    with open(target_file, 'wb') as out_f:
+                                        out_f.write(z.read(member))
+                                except PermissionError:
+                                    # Another running instance already has this native DLL loaded
+                                    pass
                 except Exception as e:
                     logger.debug(f"Failed extracting native classifier {nat}: {e}")
         else:
@@ -548,9 +560,22 @@ class CommandExecutor:
         # Final command
         command = [java_bin] + jvm_args + extra_jvm + [main_class] + game_args
         
+        # If options.txt exists and had an unclean startup with preferredGraphicsBackend:"default",
+        # persist preferredGraphicsBackend:"opengl" so Vulkan 1.2 probing on older GPUs (e.g. GT 750M) doesn't corrupt the OpenGL driver context.
+        try:
+            options_txt = downloads / "options.txt"
+            if options_txt.exists():
+                opt_content = options_txt.read_text(encoding="utf-8", errors="ignore")
+                if 'preferredGraphicsBackend:"default"' in opt_content and "startedCleanly:false" in opt_content:
+                    opt_content = opt_content.replace('preferredGraphicsBackend:"default"', 'preferredGraphicsBackend:"opengl"')
+                    options_txt.write_text(opt_content, encoding="utf-8")
+                    logger.info('[INFO] Switched preferredGraphicsBackend to "opengl" in options.txt after previous unclean startup')
+        except Exception:
+            pass
+
         # Force-update version-specific variables in case they were cached from a previous launch
         self.variables['version_name'] = self.minecraft_version
-        v_info = get_version_info(self.minecraft_version)
+        v_info = version_info or get_version_info(self.minecraft_version)
         if v_info:
             assets_index_name = v_info.get('assetIndex', {}).get('id', 'legacy')
             self.variables['assets_index_name'] = assets_index_name
@@ -566,7 +591,7 @@ class CommandExecutor:
             
         self.variables['game_assets'] = str(assets_dir_path.absolute())
         self.variables['assets_root'] = str(assets_dir_path.absolute())
-        self.variables['natives_directory'] = str((utils.get_dir("libraries") / 'natives').absolute())
+        self.variables['natives_directory'] = str(natives_dir.absolute())
         
         # Extract variables needed
         _, variables_needed = extract_variables(command)
@@ -586,7 +611,7 @@ class CommandExecutor:
                 logger.info('[INFO] Using injected authentication variables')
             else:
                 if not self.fill_auth_variables():
-                    return False
+                    return None
         
         # Check for remaining variables (or ones that are empty strings from old configs)
         remaining_vars = variables_needed - set(self.variables.keys())
@@ -607,7 +632,7 @@ class CommandExecutor:
                     self.variables['clientid'] = self.variables.get('clientid', 'PyMcLauncher')
                     remaining_vars.discard(var)
                 elif var == 'natives_directory':
-                    self.variables['natives_directory'] = str((utils.get_dir("libraries") / 'natives').absolute())
+                    self.variables['natives_directory'] = str(natives_dir.absolute())
                     remaining_vars.discard(var)
                 elif var in ['launcher_name', 'launcher_brand', 'minecraft.launcher.brand']:
                     self.variables[var] = 'PyMcLauncher'
@@ -621,8 +646,11 @@ class CommandExecutor:
                 elif var == 'resolution_height':
                     self.variables['resolution_height'] = '480'
                     remaining_vars.discard(var)
-                elif var == 'game_directory' or var == 'user_properties':
+                elif var == 'game_directory':
                     self.variables[var] = str(downloads.absolute())
+                    remaining_vars.discard(var)
+                elif var == 'user_properties':
+                    self.variables[var] = '{}'
                     remaining_vars.discard(var)
                 elif var == 'game_assets' or var == 'assets_root':
                     self.variables[var] = str((utils.get_dir("assets")).absolute())
@@ -647,8 +675,11 @@ class CommandExecutor:
         # Save config for future use
         self.save_config()
         
-                # Fill variables in command
+        # Fill variables in command
         filled_command = fill_variables(command, self.variables)
+
+        if getattr(self, 'demo', False) and '--demo' not in filled_command:
+            filled_command.append('--demo')
 
         if getattr(self, 'quickPlayType', None) and getattr(self, 'quickPlayId', None):
             qp_path = os.path.join(downloads_str, "quickPlay.json")
@@ -660,9 +691,20 @@ class CommandExecutor:
             elif self.quickPlayType == 'multiplayer':
                 filled_command.append("--quickPlayMultiplayer")
                 filled_command.append(self.quickPlayId)
+            elif self.quickPlayType == 'realms':
+                filled_command.append("--quickPlayRealms")
+                filled_command.append(str(self.quickPlayId))
 
-        # Execute
-        return execute_command(filled_command, self.dry_run)
+        return filled_command, str(downloads.absolute())
+
+    def execute_launch_command(self) -> bool:
+        """Execute the Minecraft launch command"""
+        prepared = self.prepare_launch_command()
+        if not prepared:
+            return False
+        filled_command, cwd = prepared
+        # Execute inside the profile's base game directory so Log4j2 writes logs/ into the profile's folder
+        return execute_command(filled_command, self.dry_run, cwd=cwd)
 
 
 def main():
@@ -762,13 +804,12 @@ Examples:
     executor.offline = args.offline
     executor.quickPlayType = getattr(args, 'quickPlayType', None)
     executor.quickPlayId = getattr(args, 'quickPlayId', None)
-    executor.quickPlayType = getattr(args, 'quickPlayType', None)
-    executor.quickPlayId = getattr(args, 'quickPlayId', None)
     if getattr(args, 'demo', False):
         executor.demo = True
     if args.dir:
         utils.set_download_dir(args.dir)
         executor.variables['minecraft_downloads'] = args.dir
+        executor.explicit_dir = True
     # Inject java path if explicitly provided
     if args.java_path:
         executor.variables['java_path'] = args.java_path
