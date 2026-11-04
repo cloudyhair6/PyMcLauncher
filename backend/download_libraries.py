@@ -103,7 +103,10 @@ def download_library_worker(lib_name, lib_url, lib_size, lib_hash, lib_path):
 
             # Verify SHA-1 if provided
             if lib_hash and not verify_sha1(lib_path, lib_hash):
-                lib_path.unlink()
+                try:
+                    lib_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
                 if attempt < max_retries - 1:
                     import time
                     time.sleep(1)
@@ -118,6 +121,10 @@ def download_library_worker(lib_name, lib_url, lib_size, lib_hash, lib_path):
             return True, lib_name, lib_size
 
         except Exception as e:
+            try:
+                lib_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             if attempt < max_retries - 1:
                 import time
                 time.sleep(1)

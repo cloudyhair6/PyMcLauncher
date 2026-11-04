@@ -117,7 +117,10 @@ def download_asset_worker(asset_name, asset_hash, asset_size, assets_dir):
 
             # Verify SHA-1
             if not verify_sha1(asset_path, asset_hash):
-                asset_path.unlink()
+                try:
+                    asset_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
                 if attempt < max_retries - 1:
                     time.sleep(1)
                     continue
@@ -139,6 +142,10 @@ def download_asset_worker(asset_name, asset_hash, asset_size, assets_dir):
             return True, asset_name, asset_size
 
         except Exception as e:
+            try:
+                asset_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             if attempt < max_retries - 1:
                 time.sleep(1)
                 continue

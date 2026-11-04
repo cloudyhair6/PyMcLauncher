@@ -313,6 +313,8 @@ class CommandExecutor:
         self.config_path = utils.get_dir("versions") / self.minecraft_version / 'command_config.json'
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         self.variables = self.load_or_create_config() or {}
+        if self.auth_vars:
+            self.variables.update(self.auth_vars)
     
     def load_or_create_config(self) -> Dict[str, str]:
         """Load existing config or create new one"""
@@ -455,8 +457,9 @@ class CommandExecutor:
                         parts = name.split(':')
                         if len(parts) >= 3:
                             group, artifact, ver = parts[0], parts[1], parts[2]
-                            path = Path('libraries') / Path(group.replace('.', '/')) / artifact / ver / f"{artifact}-{ver}.jar"
-                            classpath.append(str(downloads / path))
+                            lib_dir = utils.get_dir("libraries")
+                            lib_path = lib_dir / Path(group.replace('.', '/')) / artifact / ver / f"{artifact}-{ver}.jar"
+                            classpath.append(str(lib_path))
 
             # Identify natives classifiers and prepare extraction for the current platform
             natives_classifiers = []
@@ -623,19 +626,30 @@ class CommandExecutor:
         
         # Extract variables needed
         _, variables_needed = extract_variables(command)
-        
+
+        # Handle legacy session aliases if token is available
+        token = self.variables.get('auth_access_token', '')
+        uuid_str = self.variables.get('auth_uuid', '')
+        if token and not self.variables.get('auth_session'):
+            self.variables['auth_session'] = f"token:{token}:{uuid_str}" if uuid_str else token
+        if token and not self.variables.get('session'):
+            self.variables['session'] = self.variables.get('auth_session', token)
+
         # Fill auth variables first
         auth_vars_needed = {
             'auth_player_name',
             'auth_uuid',
             'auth_access_token',
             'clientid',
-            'auth_xuid'
+            'auth_xuid',
+            'auth_session',
+            'session'
         }
         
         if auth_vars_needed & variables_needed:
             # If all required auth vars are already injected (e.g., via CLI), skip interactive login
-            if all(self.variables.get(k) for k in auth_vars_needed):
+            core_auth = ['auth_player_name', 'auth_uuid', 'auth_access_token']
+            if all(self.variables.get(k) for k in core_auth):
                 logger.info('[INFO] Using injected authentication variables')
             else:
                 if not self.fill_auth_variables():
@@ -679,6 +693,19 @@ class CommandExecutor:
                     remaining_vars.discard(var)
                 elif var == 'user_properties':
                     self.variables[var] = '{}'
+                    remaining_vars.discard(var)
+                elif var == 'user_type':
+                    self.variables[var] = self.variables.get('user_type', 'msa')
+                    remaining_vars.discard(var)
+                elif var in ['auth_session', 'session']:
+                    tok = self.variables.get('auth_access_token', '')
+                    u_id = self.variables.get('auth_uuid', '')
+                    if tok and u_id:
+                        self.variables[var] = f"token:{tok}:{u_id}"
+                    elif tok:
+                        self.variables[var] = tok
+                    else:
+                        self.variables[var] = 'offline'
                     remaining_vars.discard(var)
                 elif var == 'game_assets' or var == 'assets_root':
                     self.variables[var] = str((utils.get_dir("assets")).absolute())

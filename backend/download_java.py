@@ -279,8 +279,13 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
                     java_home.symlink_to(existing_home, target_is_directory=True)
             except Exception as e:
                 logger.warning(f"Could not create junction/symlink for runtime re-use: {e}")
-            logger.info(f"[OK] Java runtime {component} (v{major_version}) ready via runtime re-use")
-            return True
+
+            if java_exec.exists():
+                logger.info(f"[OK] Java runtime {component} (v{major_version}) ready via runtime re-use")
+                return True
+            else:
+                logger.warning(f"Runtime re-use failed to link java binary. Falling back to downloading {component}...")
+                safely_remove_path(java_home)
             
         logger.info(f"Downloading Java runtime {component} (Version {major_version}) from Adoptium...")
         

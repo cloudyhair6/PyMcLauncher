@@ -220,6 +220,10 @@ def download_file(url, file_path, expected_sha1=None, show_progress=True, json_o
                         import time
                         time.sleep(1)
                         continue
+                    try:
+                        file_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                     return False
             return True
 
@@ -229,6 +233,10 @@ def download_file(url, file_path, expected_sha1=None, show_progress=True, json_o
                 time.sleep(1)
                 continue
             print(f"Error downloading {url}: {e}")
+            try:
+                file_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             return False
 
 def verify_sha1(file_path, expected_sha1):
@@ -359,15 +367,29 @@ def get_downloaded_versions():
         pass
 
     downloaded = set()
-    ignored_json = {"command_config.json", "launcher_config.json", "directories.json", "quickPlay.json", "verified_java.json"}
+    ignored_version_names = {
+        "assets", "libraries", "versions", "java", "saves", "indexes", "objects",
+        "source", "resources", "logs", "crash-reports", "screenshots", "shaderpacks",
+        "resourcepacks", "mods", "config", ".cache", "bin", "natives", "virtual",
+        "legacy", "pre-1.6", "runtime", "jre-legacy", "java-runtime-alpha",
+        "java-runtime-beta", "java-runtime-gamma", "java-runtime-delta", "java-runtime-epsilon"
+    }
+    ignored_json = {
+        "command_config.json", "launcher_config.json", "directories.json", 
+        "quickPlay.json", "verified_java.json", "version_manifest.json", 
+        "version_manifest_v2.json", "launcher_profiles.json", "profile.json", 
+        "usercache.json", "usernamecache.json"
+    }
 
     for search_dir in candidate_dirs:
         try:
             for item in search_dir.iterdir():
                 if item.is_dir():
                     v_name = item.name
+                    if v_name.lower() in ignored_version_names:
+                        continue
                     has_json = (item / f"{v_name}.json").exists() or any(
-                        p.suffix == '.json' and p.name not in ignored_json
+                        p.suffix == '.json' and p.name not in ignored_json and p.name.lower() not in ignored_version_names
                         for p in item.iterdir() if p.is_file()
                     )
                     has_jar = (
@@ -382,11 +404,17 @@ def get_downloaded_versions():
                 elif item.is_file():
                     name = item.name
                     if name.endswith("-client.jar"):
-                        downloaded.add(name[:-11])
+                        v_name = name[:-11]
+                        if v_name.lower() not in ignored_version_names:
+                            downloaded.add(v_name)
                     elif name.endswith(".jar"):
-                        downloaded.add(name[:-4])
+                        v_name = name[:-4]
+                        if v_name.lower() not in ignored_version_names:
+                            downloaded.add(v_name)
                     elif name.endswith(".json") and name not in ignored_json:
-                        downloaded.add(name[:-5])
+                        v_name = name[:-5]
+                        if v_name.lower() not in ignored_version_names:
+                            downloaded.add(v_name)
         except Exception:
             pass
 

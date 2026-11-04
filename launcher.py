@@ -4,6 +4,7 @@ import os
 import re
 import threading
 import logging
+from typing import Optional, List, Dict
 from pathlib import Path
 
 # Redirect Python bytecode cache (__pycache__) into .cache/pycache to keep workspace root clean
@@ -199,7 +200,11 @@ class DirectoriesDialog(QDialog):
         
     def on_base_changed(self, new_base):
         if self.is_loading: return
-        new_base = new_base.replace('\\\\', '/')
+        new_base = new_base.strip().replace('\\', '/')
+        if not new_base:
+            for key, inp in self.inputs.items():
+                inp.setText("")
+            return
         if not new_base.endswith('/'):
             new_base += '/'
         for key, inp in self.inputs.items():
@@ -1771,6 +1776,128 @@ class DownloadPipelineWorker(QtCore.QThread):
             self.done_sig.emit(False, None, str(e))
 
 
+class InstanceLogWindow(QMainWindow):
+    """Dedicated log window for an individual Minecraft instance."""
+    def __init__(self, launcher, inst: dict, parent=None):
+        super().__init__(parent)
+        self.launcher = launcher
+        self.inst = inst
+
+        ver = inst.get("version", "Unknown")
+        prof = inst.get("profile", "Default")
+        user = inst.get("username", "")
+        user_str = f" ({user})" if user else ""
+
+        self.setWindowTitle(f"Minecraft {ver} - Profile: {prof}{user_str} - Game Log")
+        self.resize(800, 500)
+        if parent:
+            self.setWindowIcon(parent.windowIcon())
+            self.setStyleSheet(parent.styleSheet())
+
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        # Top bar with info and controls
+        top_bar = QHBoxLayout()
+        self.status_lbl = QLabel(f"Instance: Minecraft {ver} | Profile: {prof}{user_str}")
+        self.status_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        top_bar.addWidget(self.status_lbl, stretch=1)
+
+        self.auto_scroll_cb = QCheckBox("Auto-scroll")
+        self.auto_scroll_cb.setChecked(True)
+        top_bar.addWidget(self.auto_scroll_cb)
+
+        self.wrap_cb = QCheckBox("Wrap Lines")
+        self.wrap_cb.setChecked(True)
+        self.wrap_cb.toggled.connect(self._toggle_wrap)
+        top_bar.addWidget(self.wrap_cb)
+
+        copy_btn = QPushButton("Copy All")
+        copy_btn.setFixedWidth(80)
+        copy_btn.clicked.connect(self._copy_all)
+        top_bar.addWidget(copy_btn)
+
+        clear_btn = QPushButton("Clear")
+        clear_btn.setFixedWidth(70)
+        clear_btn.clicked.connect(self._clear_log)
+        top_bar.addWidget(clear_btn)
+
+        layout.addLayout(top_bar)
+
+        # Text area
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setFont(QFont("Consolas", 10))
+        self.text_edit.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #dcdcdc;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+            }
+        """)
+        self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        layout.addWidget(self.text_edit, stretch=1)
+
+        # Bottom status bar
+        self.footer_lbl = QLabel("State: Running")
+        self.footer_lbl.setStyleSheet("color: #44bb44; font-size: 11px;")
+        layout.addWidget(self.footer_lbl)
+
+        # Load existing buffered lines
+        for raw_line in inst.get("log_lines", []):
+            formatted = self.launcher._format_log_line(raw_line)
+            self.text_edit.append(formatted)
+
+        self._scroll_to_bottom()
+
+    def _toggle_wrap(self, checked: bool):
+        if checked:
+            self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        else:
+            self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+
+    def _copy_all(self):
+        text = self.text_edit.toPlainText()
+        if text:
+            clipboard = QApplication.clipboard()
+            if clipboard:
+                clipboard.setText(text)
+
+    def _clear_log(self):
+        self.text_edit.clear()
+
+    def append_log(self, formatted_line: str):
+        self.text_edit.append(formatted_line)
+        if self.auto_scroll_cb.isChecked():
+            self._scroll_to_bottom()
+
+    def _scroll_to_bottom(self):
+        scrollbar = self.text_edit.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def update_instance_state(self, is_running: bool, exit_code: Optional[int] = None):
+        ver = self.inst.get("version", "Unknown")
+        prof = self.inst.get("profile", "Default")
+        if is_running:
+            self.footer_lbl.setText("State: Running")
+            self.footer_lbl.setStyleSheet("color: #44bb44; font-size: 11px;")
+        else:
+            if exit_code == 0:
+                self.footer_lbl.setText("State: Process finished successfully (exit code 0)")
+                self.footer_lbl.setStyleSheet("color: #888888; font-size: 11px;")
+            else:
+                self.footer_lbl.setText(f"State: Process exited with code {exit_code}")
+                self.footer_lbl.setStyleSheet("color: #ff5555; font-size: 11px; font-weight: bold;")
+            self.setWindowTitle(f"Minecraft {ver} ({prof}) - Process Finished (Code {exit_code})")
+
+    def closeEvent(self, event):
+        event.accept()
+
+
 class LauncherGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1996,6 +2123,12 @@ class LauncherGUI(QMainWindow):
                 inst['fallback_timer'].stop()
             if inst.get('startup_timer'):
                 inst['startup_timer'].stop()
+            log_win = inst.get('log_window')
+            if log_win:
+                try:
+                    log_win.close()
+                except Exception:
+                    pass
             self._kill_qprocess_tree(inst.get('process'))
         if getattr(self, 'refresh_process', None) and self.refresh_process.state() != QProcess.ProcessState.NotRunning:
             self.refresh_process.kill()
@@ -2092,29 +2225,37 @@ class LauncherGUI(QMainWindow):
                 w.setParent(None)
                 w.deleteLater()
 
-        started_instances = [inst for inst in self.running_instances if inst.get('started')]
-        if len(started_instances) > 1:
-            for inst in started_instances:
+        running_list = getattr(self, 'running_instances', [])
+        if len(running_list) > 1:
+            for inst in running_list:
                 row_widget = QWidget()
                 row_layout = QHBoxLayout(row_widget)
                 row_layout.setContentsMargins(4, 2, 4, 2)
-                row_layout.setSpacing(10)
+                row_layout.setSpacing(8)
 
                 prof_name = inst.get('profile') or 'Default'
                 user_name = inst.get('username') or ''
                 ver_name = inst.get('version') or 'Unknown'
+                started = inst.get('started', False)
+                status_tag = "" if started else " (Starting...)"
+
                 if user_name:
-                    info_text = f"Profile: {prof_name} ({user_name})   |   Version: {ver_name}"
+                    info_text = f"Profile: {prof_name} ({user_name})   |   Version: {ver_name}{status_tag}"
                 else:
-                    info_text = f"Profile: {prof_name}   |   Version: {ver_name}"
+                    info_text = f"Profile: {prof_name}   |   Version: {ver_name}{status_tag}"
 
                 info_lbl = QLabel(info_text)
                 info_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
                 row_layout.addWidget(info_lbl, stretch=1)
 
+                logs_btn = QPushButton("Show Logs")
+                logs_btn.setFixedWidth(95)
+                logs_btn.clicked.connect(lambda checked=False, target_inst=inst: self.open_instance_log_window(target_inst))
+                row_layout.addWidget(logs_btn)
+
                 stop_btn = QPushButton("Stop Game")
                 stop_btn.setStyleSheet("color: #cc0000; font-weight: bold;")
-                stop_btn.setFixedWidth(110)
+                stop_btn.setFixedWidth(100)
                 stop_btn.clicked.connect(lambda checked=False, target_inst=inst: self.stop_instance(target_inst))
                 row_layout.addWidget(stop_btn)
 
@@ -2126,6 +2267,18 @@ class LauncherGUI(QMainWindow):
 
         self.update_ui_state()
         self.update_window_size()
+
+    def open_instance_log_window(self, inst: dict):
+        """Open or bring to front the dedicated log window for a specific Minecraft instance."""
+        if not inst:
+            return
+        log_win = inst.get("log_window")
+        if not log_win:
+            log_win = InstanceLogWindow(self, inst, parent=self)
+            inst["log_window"] = log_win
+        log_win.show()
+        log_win.raise_()
+        log_win.activateWindow()
 
     def stop_instance(self, inst: dict):
         """Stop a specific running Minecraft instance."""
@@ -2449,7 +2602,7 @@ class LauncherGUI(QMainWindow):
             config = load_launcher_config()
             hide_date = config.get("hide_release_date", False)
             for v_id, v_type, v_date in all_versions:
-                if v_type not in self.version_filters and v_type not in ["custom", "modified"]:
+                if v_type not in self.version_filters and v_type not in ["custom", "modified", "local", "forge", "fabric", "quilt", "neoforge", "optifine"]:
                     continue
                 is_downloaded = v_id in downloaded
                 if self.show_downloaded_only and not is_downloaded:
@@ -2992,8 +3145,12 @@ class LauncherGUI(QMainWindow):
             "stopped_by_user": False,
             "window_timer": None,
             "fallback_timer": None,
+            "log_lines": [],
+            "log_window": None,
         }
         self.running_instances.append(inst)
+        if len(self.running_instances) > 1:
+            self.log(f"[System] Starting instance {inst_id} ({self.selected_version}). Individual game logs are available via 'Show Logs'.")
         self.update_ui_state()
 
         game_proc.readyReadStandardOutput.connect(lambda i=inst: self._handle_instance_stdout(i))
@@ -3097,6 +3254,21 @@ class LauncherGUI(QMainWindow):
             ):
                 self._mark_instance_started(inst)
 
+    def _log_instance_line(self, inst: dict, line: str):
+        if "log_lines" not in inst:
+            inst["log_lines"] = []
+        inst["log_lines"].append(line)
+
+        log_win = inst.get("log_window")
+        if log_win and hasattr(log_win, "append_log"):
+            log_win.append_log(self._format_log_line(line))
+
+        # When only 1 instance is running, mirror to the main console log
+        # When multiple instances are running, main console log displays main python program logs
+        running_count = len(getattr(self, 'running_instances', []))
+        if running_count <= 1:
+            self.log(line)
+
     def _handle_instance_stdout(self, inst: dict):
         proc = inst.get("process")
         if not proc:
@@ -3107,7 +3279,7 @@ class LauncherGUI(QMainWindow):
             if not line:
                 continue
             self._check_instance_output_line(inst, line)
-            self.log(line)
+            self._log_instance_line(inst, line)
 
     def _handle_instance_stderr(self, inst: dict):
         proc = inst.get("process")
@@ -3119,7 +3291,7 @@ class LauncherGUI(QMainWindow):
             if not line:
                 continue
             self._check_instance_output_line(inst, line)
-            self.log(line)
+            self._log_instance_line(inst, line)
 
     def show_progress_error(self, step_title: str, error_detail: str):
         """Display an unmistakable red error state on the progress bars."""
@@ -3173,6 +3345,10 @@ class LauncherGUI(QMainWindow):
 
         ver = inst.get("version", "Unknown")
         prof = inst.get("profile", "Default")
+
+        log_win = inst.get("log_window")
+        if log_win and hasattr(log_win, "update_instance_state"):
+            log_win.update_instance_state(is_running=False, exit_code=exitCode)
 
         self.log("")
         if stopped_by_user:
