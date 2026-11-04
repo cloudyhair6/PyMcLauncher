@@ -12,7 +12,8 @@
         "Update Ignore Files": [
             ".cache/",
             "__pycache__/",
-            "minecraft_downloads/"
+            "minecraft_downloads/",
+            "launcher_config.json"
         ],
         "Message": "Run the setup-start.bat file first, it will tell you what to do next!"
     }
