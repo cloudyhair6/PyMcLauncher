@@ -157,6 +157,77 @@ def get_system_info() -> Dict[str, str]:
         return {'os': 'unknown', 'arch': arch, 'ext': 'tar.gz'}
 
 
+def safely_remove_path(path: Path) -> bool:
+    """Safely remove a file, symlink, junction, or directory without deleting junction target contents."""
+    import stat, shutil
+    path_str = str(path)
+    try:
+        if platform.system() == 'Windows':
+            # In Python on Windows, junctions are directory reparse points.
+            # os.path.islink is True for directory symlinks/junctions in Python 3.8+
+            if os.path.islink(path_str):
+                try:
+                    os.unlink(path_str)
+                    return True
+                except OSError:
+                    pass
+            # Windows junctions can be unlinked with os.rmdir without deleting target directory contents
+            try:
+                os.rmdir(path_str)
+                return True
+            except OSError:
+                pass
+        else:
+            if path.is_symlink():
+                path.unlink()
+                return True
+
+        if path.is_dir():
+            def remove_readonly(func, p, excinfo):
+                try:
+                    os.chmod(p, stat.S_IWRITE)
+                    func(p)
+                except Exception:
+                    pass
+            shutil.rmtree(path_str, onerror=remove_readonly)
+            return True
+        elif os.path.lexists(path_str):
+            try:
+                os.chmod(path_str, stat.S_IWRITE)
+            except Exception:
+                pass
+            os.unlink(path_str)
+            return True
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to safely remove {path}: {e}")
+        return False
+
+
+def is_java_version_compatible(actual_major: int, expected_major: int) -> bool:
+    """
+    Check if an installed Java major version is compatible with the Minecraft expected Java version.
+    - Java 8 (jre-legacy): Strictly requires Java 8. Older versions of Minecraft (<= 1.16.5) rely
+      on URLClassLoader in LaunchClassLoader (ClassCastException on Java 9+).
+    - Java 16 (java-runtime-alpha): Compatible with Java 16 or 17.
+    - Java 17 (java-runtime-beta / gamma): Compatible with Java 17 up to 21.
+    - Java 21 (java-runtime-delta): Compatible with Java 21+.
+    - Java 25 (java-runtime-epsilon): Compatible with Java 25+.
+    """
+    if expected_major <= 8:
+        return actual_major == 8
+    elif expected_major == 16:
+        return 16 <= actual_major <= 17
+    elif expected_major == 17:
+        return 17 <= actual_major <= 21
+    elif expected_major == 21:
+        return actual_major >= 21
+    elif expected_major >= 25:
+        return actual_major >= expected_major
+    else:
+        return actual_major == expected_major
+
+
 def download_java_runtime(major_version: int, component: str, output_dir: Optional[Path] = None) -> bool:
     """Download Java runtime from Adoptium API."""
     import json
@@ -167,46 +238,47 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
         output_dir.mkdir(parents=True, exist_ok=True)
         java_home = output_dir / component
         
-        # Check if already downloaded
+        # Check if already downloaded / exists
         java_exec = java_home / 'bin' / ('java.exe' if platform.system() == 'Windows' else 'java')
 
-        import os, stat, shutil
-        def remove_readonly(func, path, excinfo):
-            try:
-                os.chmod(path, stat.S_IWRITE)
-                func(path)
-            except Exception:
-                pass
-
-        if java_exec.exists():
-            if globals().get('json_output', False):
-                print(json.dumps({"type": "progress", "progress": 100, "status": "Verifying Java installation..."}))
-                sys.stdout.flush()
-            if verify_java_installation(str(java_exec), expected_major_version=major_version):
-                logger.info(f"[OK] Java runtime {component} (v{major_version}) already downloaded")
-                return True
+        if os.path.lexists(str(java_home)):
+            if java_exec.exists():
+                if globals().get('json_output', False):
+                    print(json.dumps({"type": "progress", "progress": 100, "status": "Verifying Java installation..."}))
+                    sys.stdout.flush()
+                if verify_java_installation(str(java_exec), expected_major_version=major_version):
+                    logger.info(f"[OK] Java runtime {component} (v{major_version}) already downloaded")
+                    return True
+                else:
+                    logger.warning(f"Java runtime {component} is corrupt or incompatible. Cleaning up...")
+                    safely_remove_path(java_home)
             else:
-                logger.warning(f"Java runtime {component} is corrupt or incomplete. Re-downloading...")
-                try:
-                    shutil.rmtree(java_home, onerror=remove_readonly)
-                except Exception as e:
-                    logger.warning(f"Failed to clean corrupt Java installation: {e}")
+                logger.warning(f"Java runtime {component} directory is broken. Cleaning up...")
+                safely_remove_path(java_home)
 
         # Java Runtime Re-Use: Check existing runtimes across all directories & system before downloading
         existing_exec = find_existing_java_runtime(component, major_version)
         if existing_exec and existing_exec.exists():
             existing_home = existing_exec.parent.parent
             logger.info(f"[INFO] Re-using existing Java runtime for {component} (v{major_version}) from {existing_home}")
-            if existing_home.resolve() != java_home.resolve():
+            if os.path.lexists(str(java_home)):
                 try:
-                    if platform.system() == 'Windows':
-                        import _winapi
-                        _winapi.CreateJunction(str(existing_home.resolve()), str(java_home.resolve()))
-                        logger.info(f"[OK] Created junction for {component} in {output_dir}")
-                    else:
-                        java_home.symlink_to(existing_home, target_is_directory=True)
+                    if java_home.resolve() == existing_home.resolve():
+                        logger.info(f"[OK] Java runtime {component} (v{major_version}) ready via runtime re-use")
+                        return True
                 except Exception:
                     pass
+                safely_remove_path(java_home)
+
+            try:
+                if platform.system() == 'Windows':
+                    import _winapi
+                    _winapi.CreateJunction(str(existing_home.resolve()), str(java_home))
+                    logger.info(f"[OK] Created junction for {component} in {output_dir}")
+                else:
+                    java_home.symlink_to(existing_home, target_is_directory=True)
+            except Exception as e:
+                logger.warning(f"Could not create junction/symlink for runtime re-use: {e}")
             logger.info(f"[OK] Java runtime {component} (v{major_version}) ready via runtime re-use")
             return True
             
@@ -271,8 +343,8 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
                     root_folder = z.namelist()[0].split('/')[0]
                     extracted_dir = output_dir / root_folder
                     if extracted_dir.exists() and extracted_dir != java_home:
-                        if java_home.exists():
-                            shutil.rmtree(java_home, onerror=remove_readonly)
+                        if os.path.lexists(str(java_home)):
+                            safely_remove_path(java_home)
                         extracted_dir.rename(java_home)
             else:
                 import tarfile
@@ -297,8 +369,8 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
                     root_folder = t.getnames()[0].split('/')[0]
                     extracted_dir = output_dir / root_folder
                     if extracted_dir.exists() and extracted_dir != java_home:
-                        if java_home.exists():
-                            shutil.rmtree(java_home, onerror=remove_readonly)
+                        if os.path.lexists(str(java_home)):
+                            safely_remove_path(java_home)
                         extracted_dir.rename(java_home)
         except Exception as e:
             logger.warning(f"Failed to extract runtime archive: {e}")
@@ -309,7 +381,7 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
             except Exception:
                 pass
                 
-        if java_exec.exists() and verify_java_installation(str(java_exec)):
+        if java_exec.exists() and verify_java_installation(str(java_exec), expected_major_version=major_version):
             logger.info(f"[OK] Java runtime {component} downloaded successfully!")
             return True
         else:
@@ -415,7 +487,7 @@ def verify_java_installation(java_path: Optional[str] = None, expected_major_ver
             details = get_java_version_details(str(p))
             if details and details.get("major_version"):
                 if expected_major_version is not None:
-                    if details["major_version"] < expected_major_version:
+                    if not is_java_version_compatible(details["major_version"], expected_major_version):
                         return False
                 logger.info(f"[OK] Java found: \"{details.get('version_str')}\"")
                 return True
@@ -429,7 +501,18 @@ def verify_java_installation(java_path: Optional[str] = None, expected_major_ver
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
         )
         if result.returncode == 0:
-            ver_str = result.stderr.split()[2].strip('"') if result.stderr and len(result.stderr.split()) >= 3 else 'unknown version'
+            lines = (result.stderr or result.stdout or "").splitlines()
+            ver_str = "unknown"
+            for line in lines:
+                if "version" in line.lower():
+                    spl = line.split()
+                    if len(spl) >= 3:
+                        ver_str = spl[2].strip('"')
+                        break
+            major = parse_java_major_version(ver_str)
+            if expected_major_version is not None:
+                if not major or not is_java_version_compatible(major, expected_major_version):
+                    return False
             logger.info(f"[OK] Java found: \"{ver_str}\"")
             return True
         return False
@@ -506,12 +589,16 @@ def find_existing_java_runtime(component: str, major_version: int) -> Optional[P
 
     # 6. Check common Windows JDK/JRE directories
     if platform.system() == 'Windows':
+        pfiles = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pfiles86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
         common_roots = [
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Java",
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Eclipse Adoptium",
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Microsoft",
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "BellSoft",
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Amazon Corretto",
+            Path(pfiles) / "Java",
+            Path(pfiles) / "Eclipse Adoptium",
+            Path(pfiles) / "Microsoft",
+            Path(pfiles) / "BellSoft",
+            Path(pfiles) / "Amazon Corretto",
+            Path(pfiles86) / "Java",
+            Path(pfiles86) / "Eclipse Adoptium",
         ]
         for c_root in common_roots:
             if c_root.exists():

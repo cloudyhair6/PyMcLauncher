@@ -183,9 +183,19 @@ def get_java_version(version_id: str) -> Optional[Dict]:
         return None
     
     java_version = version_info.get('javaVersion', {})
+    major = java_version.get('majorVersion')
+    comp = java_version.get('component')
+    if not major or not comp:
+        assets = version_info.get('assets', '')
+        if assets in ('legacy', 'pre-1.6'):
+            major = 8
+            comp = 'jre-legacy'
+        else:
+            major = 17
+            comp = 'java-runtime-gamma'
     return {
-        'major_version': java_version.get('majorVersion'),
-        'component': java_version.get('component'),
+        'major_version': major,
+        'component': comp,
         'url': None  # Would be populated from launcher manifest
     }
 
@@ -361,17 +371,19 @@ class CommandExecutor:
                     java_home = utils.get_dir("java") / comp
                     exe_name = 'java.exe' if platform.system() == 'Windows' else 'java'
                     potential = java_home / 'bin' / exe_name
-                    if potential.exists():
+                    from download_java import verify_java_installation, find_existing_java_runtime
+                    if potential.exists() and verify_java_installation(str(potential), expected_major_version=major_ver):
                         self.variables['java_path'] = str(potential.absolute())
                     else:
-                        from download_java import find_existing_java_runtime
                         existing = find_existing_java_runtime(comp, major_ver)
                         if existing and existing.exists():
                             self.variables['java_path'] = str(existing.absolute())
                         else:
                             found = list(java_home.rglob(exe_name))
-                            if found:
-                                self.variables['java_path'] = str(found[0].absolute())
+                            for f in found:
+                                if verify_java_installation(str(f), expected_major_version=major_ver):
+                                    self.variables['java_path'] = str(f.absolute())
+                                    break
             except Exception as e:
                 logger.error(f"Failed resolving Java path: {e}")
             
@@ -561,15 +573,31 @@ class CommandExecutor:
         command = [java_bin] + jvm_args + extra_jvm + [main_class] + game_args
         
         # If options.txt exists and had an unclean startup with preferredGraphicsBackend:"default",
-        # persist preferredGraphicsBackend:"opengl" so Vulkan 1.2 probing on older GPUs (e.g. GT 750M) doesn't corrupt the OpenGL driver context.
+        # prompt the user before changing graphics settings if running interactively from CLI.
         try:
             options_txt = downloads / "options.txt"
             if options_txt.exists():
                 opt_content = options_txt.read_text(encoding="utf-8", errors="ignore")
-                if 'preferredGraphicsBackend:"default"' in opt_content and "startedCleanly:false" in opt_content:
-                    opt_content = opt_content.replace('preferredGraphicsBackend:"default"', 'preferredGraphicsBackend:"opengl"')
-                    options_txt.write_text(opt_content, encoding="utf-8")
-                    logger.info('[INFO] Switched preferredGraphicsBackend to "opengl" in options.txt after previous unclean startup')
+                has_default_backend = bool(re.search(r'preferredGraphicsBackend\s*:\s*["\']?default["\']?', opt_content))
+                has_unclean = bool(re.search(r'startedCleanly\s*:\s*false', opt_content))
+                if has_default_backend and has_unclean:
+                    if getattr(self, 'allow_auto_opengl_switch', False):
+                        opt_content = re.sub(r'preferredGraphicsBackend\s*:\s*["\']?default["\']?', 'preferredGraphicsBackend:"opengl"', opt_content)
+                        options_txt.write_text(opt_content, encoding="utf-8")
+                        logger.info('[INFO] Switched preferredGraphicsBackend to "opengl" in options.txt after previous unclean startup')
+                    elif sys.stdin and sys.stdin.isatty():
+                        try:
+                            ans = input("\n[Warning] Minecraft previously had an unclean startup.\nDo you want to change your settings to prefer OpenGL (preferredGraphicsBackend: 'opengl')? (y/N): ").strip().lower()
+                            if ans in ('y', 'yes'):
+                                opt_content = re.sub(r'preferredGraphicsBackend\s*:\s*["\']?default["\']?', 'preferredGraphicsBackend:"opengl"', opt_content)
+                                options_txt.write_text(opt_content, encoding="utf-8")
+                                logger.info('[INFO] Switched preferredGraphicsBackend to "opengl" in options.txt')
+                            else:
+                                new_content = re.sub(r'startedCleanly\s*:\s*false', 'startedCleanly:true', opt_content)
+                                options_txt.write_text(new_content, encoding="utf-8")
+                                logger.info('[INFO] Kept preferredGraphicsBackend as "default"')
+                        except Exception:
+                            pass
         except Exception:
             pass
 

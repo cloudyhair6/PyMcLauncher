@@ -2036,6 +2036,10 @@ class LauncherGUI(QMainWindow):
                 self.stop_button.setText("Stop All Games")
                 self.stop_button.setVisible(True)
                 self.stop_button.setEnabled(True)
+            elif is_busy and getattr(self, '_pipeline_worker', None) and self._pipeline_worker.isRunning():
+                self.stop_button.setText("Cancel Launch")
+                self.stop_button.setVisible(True)
+                self.stop_button.setEnabled(True)
             else:
                 self.stop_button.setVisible(False)
 
@@ -2143,10 +2147,11 @@ class LauncherGUI(QMainWindow):
         self._kill_qprocess_tree(inst.get('process'))
 
     def stop_running_games(self):
-        """Stop the currently running game (or all running games if >1 are active)."""
-        started_instances = [inst for inst in list(self.running_instances) if inst.get('started')]
-        targets = started_instances if started_instances else list(self.running_instances)
-        for inst in targets:
+        """Stop running game(s) or cancel the active launch pipeline."""
+        if getattr(self, '_pipeline_worker', None) and self._pipeline_worker.isRunning():
+            self.log("[System] Cancelling launch sequence...")
+            self._pipeline_worker.cancel()
+        for inst in list(self.running_instances):
             self.stop_instance(inst)
 
     def handle_refresh_stdout(self):
@@ -2650,11 +2655,53 @@ class LauncherGUI(QMainWindow):
         scrollbar = self.results_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
+    def check_opengl_backend_prompt(self):
+        """Prompt user before changing preferredGraphicsBackend to OpenGL in options.txt."""
+        try:
+            base_dir = get_dir("base")
+            options_txt = base_dir / "options.txt"
+            if not options_txt.exists():
+                return
+            opt_content = options_txt.read_text(encoding="utf-8", errors="ignore")
+            has_default_backend = bool(re.search(r'preferredGraphicsBackend\s*:\s*["\']?default["\']?', opt_content))
+            has_unclean = bool(re.search(r'startedCleanly\s*:\s*false', opt_content))
+            if has_default_backend and has_unclean:
+                reply = QMessageBox.warning(
+                    self,
+                    "Graphics Settings Warning",
+                    "Minecraft previously had an unclean startup (it may have crashed).\n\n"
+                    "Do you want to change your settings to prefer OpenGL (preferredGraphicsBackend: \"opengl\")?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    new_content = re.sub(
+                        r'preferredGraphicsBackend\s*:\s*["\']?default["\']?',
+                        'preferredGraphicsBackend:"opengl"',
+                        opt_content
+                    )
+                    options_txt.write_text(new_content, encoding="utf-8")
+                    self.log('[INFO] User confirmed: Switched preferredGraphicsBackend to "opengl" in options.txt')
+                else:
+                    new_content = re.sub(
+                        r'startedCleanly\s*:\s*false',
+                        'startedCleanly:true',
+                        opt_content
+                    )
+                    options_txt.write_text(new_content, encoding="utf-8")
+                    self.log('[INFO] User declined: Kept preferredGraphicsBackend as "default" in options.txt')
+        except Exception as e:
+            self.log(f"[Warning] Failed checking graphics backend settings: {e}")
+
     def start_launch_sequence(self):
         self._is_source_pipeline = False
         self.selected_version = self.version_combo.currentData()
         if not self.selected_version:
             return
+
+        self.clear_progress_error()
+        self.check_opengl_backend_prompt()
+
         self.selected_profile_name = self.profile_combo.currentText() if hasattr(self, 'profile_combo') else "Default"
         self.selected_quick_play = self.quick_play_combo.currentData() if hasattr(self, 'quick_play_combo') else None
         self.is_pipeline_running = True
@@ -2803,6 +2850,7 @@ class LauncherGUI(QMainWindow):
             self.is_pipeline_running = False
             self.log("[Error] Authentication failed or cancelled.")
             self.status_label.setText("Authentication Failed.")
+            self.show_progress_error("Authentication", "Login Failed or Cancelled")
             
             # Revert profile changes if cancelled
             if getattr(self, 'previous_active_profile', None):
@@ -2822,11 +2870,11 @@ class LauncherGUI(QMainWindow):
                 self._auth_cancelled_profile = None
 
             self.auth_data = get_auth_cache() # Reload the reverted profile's auth data
-            self.reset_ui()
             self.update_profile_banner() # Show previous account's banner
             is_logged_in = bool(self.auth_data)
             self.logout_btn.setVisible(is_logged_in)
             self.login_btn.setVisible(not is_logged_in)
+            self.update_running_instances_ui()
             self.update_ui_state()
             return
             
@@ -2839,6 +2887,7 @@ class LauncherGUI(QMainWindow):
             self.start_download_pipeline()
         
     def start_download_pipeline(self):
+        self.clear_progress_error()
         self.is_pipeline_running = True
         self.task_progress_bar.setFormat("Current Task: %p%")
         self.set_progress_visible(True)
@@ -2883,10 +2932,24 @@ class LauncherGUI(QMainWindow):
             self.is_pipeline_running = False
             self.log("")
             self.log(f"[Error] {error_msg}")
-            self.status_label.setText("Launch Failed.")
-            self.reset_ui()
+            started_remaining = [x for x in getattr(self, 'running_instances', []) if x.get('started')]
+            if started_remaining:
+                # Other instances are already running: inform user without breaking the running games
+                rem_count = len(started_remaining)
+                self.status_label.setText(f"[Error] Launch failed: {error_msg}. {rem_count} instance{'s' if rem_count > 1 else ''} still running.")
+                self.task_progress_bar.setRange(0, 100)
+                self.task_progress_bar.setValue(100)
+                self.task_progress_bar.setFormat(f"Game Running! ({rem_count} instances)" if rem_count > 1 else "Game Running!")
+                self.step_progress_bar.setRange(0, 100)
+                self.step_progress_bar.setValue(100)
+            else:
+                self.status_label.setText(f"Launch Failed: {error_msg}")
+                self.show_progress_error("Launch Pipeline", error_msg)
+            self.update_running_instances_ui()
+            self.update_ui_state()
             return
 
+        self.clear_progress_error()
         filled_command, cwd = result
         self.load_versions()
 
@@ -2997,6 +3060,7 @@ class LauncherGUI(QMainWindow):
 
         inst["started"] = True
         self.is_pipeline_running = False
+        self.clear_progress_error()
 
         self.step_progress_bar.setRange(0, 100)
         self.step_progress_bar.setValue(100)
@@ -3057,6 +3121,38 @@ class LauncherGUI(QMainWindow):
             self._check_instance_output_line(inst, line)
             self.log(line)
 
+    def show_progress_error(self, step_title: str, error_detail: str):
+        """Display an unmistakable red error state on the progress bars."""
+        red_chunk_style = """
+            QProgressBar {
+                border: 1px solid #c9302c;
+                border-radius: 4px;
+                text-align: center;
+                background-color: #2b2b2b;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            QProgressBar::chunk {
+                background-color: #d9534f;
+            }
+        """
+        self.step_progress_bar.setStyleSheet(red_chunk_style)
+        self.task_progress_bar.setStyleSheet(red_chunk_style)
+        self.step_progress_bar.setRange(0, 100)
+        self.step_progress_bar.setValue(100)
+        self.step_progress_bar.setFormat(f"Failed: {step_title}")
+
+        self.task_progress_bar.setRange(0, 100)
+        self.task_progress_bar.setValue(100)
+        self.task_progress_bar.setFormat(f"Error: {error_detail}")
+
+        self.set_progress_visible(True)
+
+    def clear_progress_error(self):
+        """Restore default progress bar styling."""
+        self.step_progress_bar.setStyleSheet("")
+        self.task_progress_bar.setStyleSheet("")
+
     def _on_instance_finished(self, inst: dict, exitCode: int, exitStatus):
         if inst.get("window_timer"):
             inst["window_timer"].stop()
@@ -3070,60 +3166,86 @@ class LauncherGUI(QMainWindow):
 
         was_started = inst.get("started", False)
         stopped_by_user = inst.get("stopped_by_user", False)
+        is_crash = (exitCode != 0 and not stopped_by_user)
+
         if inst in self.running_instances:
             self.running_instances.remove(inst)
 
         ver = inst.get("version", "Unknown")
         prof = inst.get("profile", "Default")
 
-        if not was_started:
-            # Game exited before completing startup
-            self.is_pipeline_running = False
-            self.log("")
-            if stopped_by_user:
-                self.log(f"=== Minecraft {ver} ({prof}) Stopped! ===")
-                if not self.running_instances:
-                    self.status_label.setText("Game stopped.")
-            elif exitCode != 0:
-                self.log(f"[Error] Minecraft {ver} ({prof}) exited during startup with code {exitCode}.")
-                if not self.running_instances:
-                    self.status_label.setText("Launch Failed.")
+        self.log("")
+        if stopped_by_user:
+            self.log(f"=== Minecraft {ver} ({prof}) Stopped! ===")
+        elif is_crash:
+            if not was_started:
+                self.log(f"[Error] Minecraft {ver} ({prof}) crashed during startup with code {exitCode}.")
             else:
-                self.log(f"=== Minecraft {ver} ({prof}) Closed! ===")
-                if not self.running_instances:
-                    self.status_label.setText("Game closed.")
+                self.log(f"[Error] Minecraft {ver} ({prof}) crashed with exit code {exitCode}.")
         else:
-            self.log("")
-            if stopped_by_user:
-                self.log(f"=== Minecraft {ver} ({prof}) Stopped! ===")
-            else:
-                self.log(f"=== Minecraft {ver} ({prof}) Closed! ===")
+            self.log(f"=== Minecraft {ver} ({prof}) Closed! ===")
 
         started_remaining = [x for x in self.running_instances if x.get("started")]
-        if len(started_remaining) > 1:
-            if not self.is_pipeline_running:
-                self.task_progress_bar.setFormat(f"Game Running! ({len(started_remaining)} instances)")
-                self.setWindowTitle(f"PyMcLauncher - {len(started_remaining)} Instances Playing")
-                self.status_label.setText(f"Minecraft is running ({len(started_remaining)} active instances).")
-            self.update_running_instances_ui()
-        elif len(started_remaining) == 1:
-            rem = started_remaining[0]
-            if not self.is_pipeline_running:
+        unstarted_remaining = [x for x in self.running_instances if not x.get("started")]
+
+        # If this instance was still starting, ensure pipeline is marked not running
+        if not was_started and not unstarted_remaining:
+            self.is_pipeline_running = False
+
+        if started_remaining:
+            # Other instances are still running
+            # Reset task progress bar from any indeterminate (0, 0) state
+            self.task_progress_bar.setRange(0, 100)
+            self.task_progress_bar.setValue(100)
+            self.step_progress_bar.setRange(0, 100)
+            self.step_progress_bar.setValue(100)
+
+            rem_count = len(started_remaining)
+            if rem_count > 1:
+                self.task_progress_bar.setFormat(f"Game Running! ({rem_count} instances)")
+                self.setWindowTitle(f"PyMcLauncher - {rem_count} Instances Playing")
+            else:
                 self.task_progress_bar.setFormat("Game Running!")
-                self.setWindowTitle(f"Minecraft - {rem['version']} - Playing")
-                self.status_label.setText(f"Minecraft {rem['version']} is now running.")
+                self.setWindowTitle(f"Minecraft - {started_remaining[0]['version']} - Playing")
+
+            surviving_text = f"{rem_count} instance{'s' if rem_count > 1 else ''} still running"
+            if is_crash:
+                phase = "during startup" if not was_started else "unexpectedly"
+                self.status_label.setText(f"[Crash] Minecraft {ver} ({prof}) crashed {phase} (code {exitCode}). {surviving_text}.")
+            elif stopped_by_user:
+                self.status_label.setText(f"Stopped Minecraft {ver} ({prof}). {surviving_text}.")
+            else:
+                self.status_label.setText(f"Minecraft {ver} ({prof}) closed. {surviving_text}.")
+
             self.update_running_instances_ui()
+            self.update_ui_state()
+
+        elif unstarted_remaining:
+            # Another instance is currently in the middle of launching
+            if is_crash:
+                self.log(f"[Warning] Minecraft {ver} ({prof}) crashed (code {exitCode}) while next instance is starting.")
+            self.update_running_instances_ui()
+            self.update_ui_state()
+
         else:
-            # 0 running instances left
+            # 0 instances left
             self.update_running_instances_ui()
             if not self.is_pipeline_running:
-                if was_started:
+                if is_crash:
+                    self.show_progress_error(
+                        f"Minecraft {ver} Crashed",
+                        f"Process exited with code {exitCode}"
+                    )
+                    self.status_label.setText(f"Launch Failed: Minecraft {ver} ({prof}) exited with code {exitCode}.")
+                    self.update_ui_state()
+                else:
                     self.status_label.setText("Game stopped." if stopped_by_user else "Game closed.")
-                self.reset_ui()
+                    self.reset_ui()
 
     def reset_ui(self):
         self.is_pipeline_running = False
         self.is_authenticating = False
+        self.clear_progress_error()
         started_remaining = [x for x in getattr(self, 'running_instances', []) if x.get('started')]
         if started_remaining:
             if len(started_remaining) > 1:
@@ -3137,6 +3259,7 @@ class LauncherGUI(QMainWindow):
             self.task_progress_bar.setRange(0, 100)
             self.task_progress_bar.setValue(100)
             self.update_running_instances_ui()
+            self.update_ui_state()
             return
 
         self.setWindowTitle("PyMcLauncher")
@@ -3148,6 +3271,7 @@ class LauncherGUI(QMainWindow):
         self.task_progress_bar.setFormat("Current Task: %p%")
         self.set_progress_visible(False)
         self.update_running_instances_ui()
+        self.update_ui_state()
 
     # --- Browser Window Code (from old GUI) ---
     def open_browser(self, url):
