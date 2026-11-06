@@ -17,6 +17,30 @@ try:
 except Exception:
     pass
 
+# Guard sys.stdout and sys.stderr when launched via pythonw.exe (windowless Desktop/Start shortcuts)
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+def get_python_cli_executable() -> str:
+    """Return python.exe (not pythonw.exe) so child QProcesses have working stdout/stderr pipes."""
+    exe = Path(sys.executable)
+    if exe.name.lower() == "pythonw.exe":
+        console_exe = exe.with_name("python.exe")
+        if console_exe.exists():
+            return str(console_exe)
+    return sys.executable
+
+def get_python_gui_executable() -> str:
+    """Return pythonw.exe (if available) so Desktop/Start shortcuts don't spawn a console window."""
+    exe = Path(sys.executable)
+    if exe.name.lower() == "python.exe":
+        gui_exe = exe.with_name("pythonw.exe")
+        if gui_exe.exists():
+            return str(gui_exe)
+    return sys.executable
+
 # Ensure backend directory is in sys.path
 _backend_dir = _root_dir / "backend"
 if str(_backend_dir) not in sys.path:
@@ -67,19 +91,444 @@ from PyQt6.QtGui import QFont, QIcon, QPalette, QColor, QImage, QPainter, QPixma
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineProfile
 from utils import (
-    get_dir, get_available_versions, get_downloaded_versions,  
+    get_dir, get_available_versions, get_downloaded_versions, get_quick_play_options,
     delete_version_files, load_launcher_config, 
     save_launcher_config, get_auth_cache, save_auth_cache, clear_auth_cache, get_active_profile_id, load_accounts, save_accounts, 
     has_any_downloads, delete_all_downloads, has_any_source, delete_source_folder, fetch_player_textures,
-    is_minecraft_window_visible
+    is_minecraft_window_visible, get_desktop_dir, get_start_menu_programs_dir, create_windows_shortcut,
+    calculate_locator_bar_color
 )
 
+import struct
+from PyQt6.QtCore import QByteArray, QBuffer, QIODevice
+from PyQt6.QtWidgets import QFileDialog, QFormLayout, QLineEdit, QInputDialog, QMessageBox
 
 
+def _save_qimage_as_ico(img: QImage, ico_path: Path) -> Optional[Path]:
+    """Encode a 64x64 QImage into a valid Windows .ico file containing PNG data."""
+    try:
+        ico_path.parent.mkdir(parents=True, exist_ok=True)
+        scaled = img.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        scaled.save(buf, "PNG")
+        png_bytes = bytes(ba)
+        w = scaled.width() if scaled.width() < 256 else 0
+        h = scaled.height() if scaled.height() < 256 else 0
+        header = struct.pack("<HHH", 0, 1, 1)
+        entry = struct.pack("<BBBBHHII", w, h, 0, 0, 1, 32, len(png_bytes), 22)
+        ico_path.write_bytes(header + entry + png_bytes)
+        return ico_path
+    except Exception:
+        return None
 
-from PyQt6.QtWidgets import QFileDialog, QFormLayout, QLineEdit
 
-from PyQt6.QtWidgets import QInputDialog, QMessageBox
+def ensure_default_minecraft_ico() -> Optional[Path]:
+    """Generate and return a pixel-art Minecraft Grass Block .ico file in .cache/icons/."""
+    ico_path = _cache_dir / "icons" / "pymclauncher_grass.ico"
+    if ico_path.exists() and ico_path.stat().st_size > 100:
+        return ico_path
+
+    # Draw a 16x16 pixel-art Minecraft grass block and scale to 64x64
+    img = QImage(16, 16, QImage.Format.Format_ARGB32)
+    img.fill(QColor(0, 0, 0, 0))
+    p = QPainter(img)
+
+    # Dirt base
+    p.fillRect(1, 1, 14, 14, QColor("#866043"))
+    # Dirt texture speckles
+    for dx, dy, col in [
+        (2, 6, "#6b4c35"), (5, 8, "#9c7252"), (9, 7, "#6b4c35"), (12, 6, "#593e2b"),
+        (3, 10, "#9c7252"), (7, 11, "#6b4c35"), (11, 10, "#9c7252"), (4, 13, "#593e2b"),
+        (8, 13, "#9c7252"), (13, 12, "#6b4c35"), (2, 12, "#6b4c35"), (10, 13, "#593e2b"),
+    ]:
+        p.fillRect(dx, dy, 1, 1, QColor(col))
+
+    # Grass top and overhanging blades
+    p.fillRect(1, 1, 14, 3, QColor("#5b8731"))
+    for gx, gy, gh, col in [
+        (1, 4, 2, "#5b8731"), (2, 4, 1, "#6da13b"), (4, 4, 2, "#5b8731"), (5, 4, 3, "#4c7228"),
+        (7, 4, 1, "#6da13b"), (8, 4, 2, "#5b8731"), (10, 4, 3, "#5b8731"), (11, 4, 1, "#4c7228"),
+        (13, 4, 2, "#6da13b"), (14, 4, 1, "#5b8731"),
+        (2, 1, 1, "#6da13b"), (6, 2, 1, "#6da13b"), (11, 1, 1, "#6da13b"), (9, 2, 1, "#4c7228"),
+    ]:
+        p.fillRect(gx, gy, 1, gh, QColor(col))
+
+    # Crisp dark border
+    p.setPen(QColor("#2c1e14"))
+    p.drawRect(0, 0, 15, 15)
+    p.end()
+
+    return _save_qimage_as_ico(img, ico_path)
+
+
+def image_to_ico(source_path: str, ico_name: str) -> Optional[Path]:
+    """Convert a PNG/JPG/ICO image file into a Windows .ico file in .cache/icons/."""
+    src = Path(source_path)
+    if not src.exists():
+        return ensure_default_minecraft_ico()
+    if src.suffix.lower() == ".ico":
+        return src
+    img = QImage(str(src))
+    if img.isNull():
+        return ensure_default_minecraft_ico()
+    safe_stem = re.sub(r'[<>:"/\\|?*]', '_', ico_name)
+    out_ico = _cache_dir / "icons" / f"{safe_stem}.ico"
+    return _save_qimage_as_ico(img, out_ico) or ensure_default_minecraft_ico()
+
+
+class CreateShortcutDialog(QDialog):
+    """Dialog to create a Desktop shortcut or pin to Start Menu for a version, world/Quick Play, or profile."""
+    def __init__(self, launcher_gui: 'LauncherGUI'):
+        super().__init__(launcher_gui)
+        self.launcher_gui = launcher_gui
+        self.setWindowTitle("Create Shortcut / Pin to Start")
+        self.setMinimumWidth(480)
+        self._user_edited_name = False
+        self._custom_icon_path = None
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        # 1. Target Selection Group
+        target_group = QGroupBox("Launch Target")
+        target_form = QFormLayout(target_group)
+        target_form.setSpacing(8)
+
+        # Profile selector
+        self.profile_combo = QComboBox()
+        config = load_launcher_config()
+        profiles = list(config.get("profiles", {"Default": {}}).keys())
+        if not profiles:
+            profiles = ["Default"]
+        for p_name in profiles:
+            self.profile_combo.addItem(p_name, p_name)
+        current_prof = launcher_gui.profile_combo.currentText() if hasattr(launcher_gui, "profile_combo") else "Default"
+        p_idx = self.profile_combo.findText(current_prof)
+        if p_idx >= 0:
+            self.profile_combo.setCurrentIndex(p_idx)
+        target_form.addRow("Profile:", self.profile_combo)
+
+        # Version selector
+        self.version_combo = QComboBox()
+        target_form.addRow("Minecraft Version:", self.version_combo)
+
+        # World / Quick Play selector
+        self.qp_combo = QComboBox()
+        target_form.addRow("World / Quick Play:", self.qp_combo)
+
+        layout.addWidget(target_group)
+
+        # 2. Shortcut Details & Location Group
+        details_group = QGroupBox("Shortcut Details & Destination")
+        details_layout = QVBoxLayout(details_group)
+        details_layout.setSpacing(8)
+
+        name_form = QFormLayout()
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Enter shortcut name...")
+        self.name_edit.textEdited.connect(self._on_name_edited_by_user)
+        name_form.addRow("Shortcut Name:", self.name_edit)
+        details_layout.addLayout(name_form)
+
+        # Icon preview row
+        icon_row = QHBoxLayout()
+        icon_row.addWidget(QLabel("Shortcut Icon:"))
+        self.icon_preview_lbl = QLabel()
+        self.icon_preview_lbl.setFixedSize(32, 32)
+        self.icon_preview_lbl.setScaledContents(True)
+        icon_row.addWidget(self.icon_preview_lbl)
+
+        self.icon_source_lbl = QLabel("Default Minecraft Icon")
+        icon_row.addWidget(self.icon_source_lbl, stretch=1)
+
+        self.browse_icon_btn = QPushButton("Browse...")
+        self.browse_icon_btn.clicked.connect(self._browse_custom_icon)
+        icon_row.addWidget(self.browse_icon_btn)
+
+        self.reset_icon_btn = QPushButton("Reset")
+        self.reset_icon_btn.clicked.connect(self._reset_icon)
+        self.reset_icon_btn.setVisible(False)
+        icon_row.addWidget(self.reset_icon_btn)
+        details_layout.addLayout(icon_row)
+
+        # Checkboxes for Desktop & Start Menu
+        self.desktop_cb = QCheckBox("Create shortcut on Desktop")
+        self.desktop_cb.setChecked(True)
+        details_layout.addWidget(self.desktop_cb)
+
+        self.start_menu_cb = QCheckBox("Pin to Start / Add to Start Menu")
+        self.start_menu_cb.setChecked(True)
+        details_layout.addWidget(self.start_menu_cb)
+
+        layout.addWidget(details_group)
+
+        # 3. Bottom Action Buttons
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self.create_btn = QPushButton("Create Shortcut")
+        self.create_btn.setDefault(True)
+        self.create_btn.clicked.connect(self._on_create_clicked)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.create_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        # Populate versions and quick play for the initial profile
+        self._populate_versions_and_qp(initial=True)
+
+        # Connect change signals
+        self.profile_combo.currentIndexChanged.connect(lambda _: self._populate_versions_and_qp(initial=False))
+        self.version_combo.currentIndexChanged.connect(self._on_target_selection_changed)
+        self.qp_combo.currentIndexChanged.connect(self._on_target_selection_changed)
+
+    def _on_name_edited_by_user(self, _text: str):
+        self._user_edited_name = True
+
+    def _populate_versions_and_qp(self, initial: bool = False):
+        prof_name = self.profile_combo.currentText()
+        prev_ver = self.launcher_gui.version_combo.currentData() if initial else self.version_combo.currentData()
+        prev_qp = self.launcher_gui.quick_play_combo.currentData() if (initial and hasattr(self.launcher_gui, "quick_play_combo")) else self.qp_combo.currentData()
+
+        self.version_combo.blockSignals(True)
+        self.version_combo.clear()
+        self.version_combo.addItem("Latest Version (Release)", "latest-release")
+        self.version_combo.addItem("Latest Version (Snapshot)", "latest-snapshot")
+        self.version_combo.addItem("Profile's Default / Last Played Version", None)
+
+        seen_versions = set()
+        # Add versions from the main launcher combo first
+        for i in range(self.launcher_gui.version_combo.count()):
+            v_text = self.launcher_gui.version_combo.itemText(i)
+            v_id = self.launcher_gui.version_combo.itemData(i)
+            if v_id and v_id not in seen_versions:
+                self.version_combo.addItem(v_text, v_id)
+                seen_versions.add(v_id)
+
+        # Also include any downloaded versions specifically in the chosen profile
+        for dl_v in sorted(get_downloaded_versions(profile_name=prof_name)):
+            if dl_v not in seen_versions:
+                self.version_combo.addItem(f"{dl_v} [Downloaded]", dl_v)
+                seen_versions.add(dl_v)
+
+        if prev_ver:
+            v_idx = self.version_combo.findData(prev_ver)
+            if v_idx >= 0:
+                self.version_combo.setCurrentIndex(v_idx)
+        else:
+            self.version_combo.setCurrentIndex(0)
+        self.version_combo.blockSignals(False)
+
+        # Populate Quick Play options for the chosen profile
+        self.qp_combo.blockSignals(True)
+        self.qp_combo.clear()
+        self.qp_combo.addItem("No Quick Play (Launch to Title Screen)", None)
+
+        seen_qp = set()
+        try:
+            for qp in get_quick_play_options(include_realms=False, profile_name=prof_name):
+                key = (qp.get("type"), str(qp.get("id")))
+                if key not in seen_qp:
+                    self.qp_combo.addItem(qp["display"], qp)
+                    seen_qp.add(key)
+        except Exception:
+            pass
+
+        # Also pull any already-loaded Realms from the main window's quick_play_combo
+        if hasattr(self.launcher_gui, "quick_play_combo"):
+            for i in range(self.launcher_gui.quick_play_combo.count()):
+                qp_data = self.launcher_gui.quick_play_combo.itemData(i)
+                if isinstance(qp_data, dict) and qp_data.get("type") == "realms":
+                    key = ("realms", str(qp_data.get("id")))
+                    if key not in seen_qp:
+                        self.qp_combo.addItem(qp_data["display"], qp_data)
+                        seen_qp.add(key)
+
+        if isinstance(prev_qp, dict):
+            target_key = (prev_qp.get("type"), str(prev_qp.get("id")))
+            for i in range(self.qp_combo.count()):
+                d = self.qp_combo.itemData(i)
+                if isinstance(d, dict) and (d.get("type"), str(d.get("id"))) == target_key:
+                    self.qp_combo.setCurrentIndex(i)
+                    break
+        self.qp_combo.blockSignals(False)
+
+        self._on_target_selection_changed()
+
+    def _on_target_selection_changed(self):
+        if not self._user_edited_name or not self.name_edit.text().strip():
+            self.name_edit.setText(self._build_suggested_name())
+        self._update_icon_preview()
+
+    def _build_suggested_name(self) -> str:
+        prof = self.profile_combo.currentText()
+        ver = self.version_combo.currentData()
+        qp = self.qp_combo.currentData()
+
+        if ver in ("latest", "latest-release"):
+            base = "Minecraft (Latest)"
+        elif ver == "latest-snapshot":
+            base = "Minecraft (Latest Snapshot)"
+        elif ver:
+            base = f"Minecraft {ver}"
+        else:
+            base = "Minecraft"
+        if prof and prof != "Default":
+            base += f" ({prof})"
+
+        if isinstance(qp, dict):
+            disp = qp.get("display", "")
+            for prefix in ("World: ", "Server: ", "Realm: "):
+                if disp.startswith(prefix):
+                    disp = disp[len(prefix):]
+                    break
+            disp = re.sub(r"\s*\[Expired\]$", "", disp).strip()
+            if disp:
+                return f"{base} - {disp}"
+        return base
+
+    def _browse_custom_icon(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Shortcut Icon",
+            "",
+            "Icons & Images (*.ico *.png *.jpg *.jpeg *.bmp)"
+        )
+        if path:
+            self._custom_icon_path = path
+            self.reset_icon_btn.setVisible(True)
+            self._update_icon_preview()
+
+    def _reset_icon(self):
+        self._custom_icon_path = None
+        self.reset_icon_btn.setVisible(False)
+        self._update_icon_preview()
+
+    def _get_effective_icon_source(self) -> Optional[str]:
+        if self._custom_icon_path and Path(self._custom_icon_path).exists():
+            return self._custom_icon_path
+        qp = self.qp_combo.currentData()
+        if isinstance(qp, dict) and qp.get("icon_path") and Path(qp["icon_path"]).exists():
+            return qp["icon_path"]
+        default_ico = ensure_default_minecraft_ico()
+        return str(default_ico) if default_ico else None
+
+    def _update_icon_preview(self):
+        src = self._get_effective_icon_source()
+        if self._custom_icon_path and src == self._custom_icon_path:
+            self.icon_source_lbl.setText(f"Custom ({Path(src).name})")
+        elif isinstance(self.qp_combo.currentData(), dict) and self.qp_combo.currentData().get("icon_path") == src and src:
+            self.icon_source_lbl.setText("World Icon (icon.png)")
+        else:
+            self.icon_source_lbl.setText("Default Minecraft Icon")
+
+        if src and Path(src).exists():
+            pix = QPixmap(str(src))
+            if not pix.isNull():
+                self.icon_preview_lbl.setPixmap(
+                    pix.scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+                )
+
+    def _on_create_clicked(self):
+        raw_name = self.name_edit.text().strip()
+        if not raw_name:
+            QMessageBox.warning(self, "Missing Name", "Please enter a name for the shortcut.")
+            return
+
+        to_desktop = self.desktop_cb.isChecked()
+        to_start = self.start_menu_cb.isChecked()
+        if not to_desktop and not to_start:
+            QMessageBox.warning(self, "No Destination Selected", "Please select at least one destination (Desktop or Start Menu).")
+            return
+
+        safe_filename = re.sub(r'[<>:"/\\|?*]', "-", raw_name).strip(". ")
+        if not safe_filename:
+            safe_filename = "Minecraft Shortcut"
+
+        prof = self.profile_combo.currentText()
+        ver = self.version_combo.currentData()
+        qp = self.qp_combo.currentData()
+
+        launcher_script = str(Path(__file__).resolve())
+        arg_parts = [f'"{launcher_script}"', "--shortcut-launch"]
+        if prof:
+            arg_parts.append(f'--profile "{prof}"')
+        if ver:
+            arg_parts.append(f'--version "{ver}"')
+        if isinstance(qp, dict) and qp.get("type") and qp.get("id"):
+            arg_parts.append(f'--quick-play-type "{qp["type"]}"')
+            arg_parts.append(f'--quick-play-id "{qp["id"]}"')
+            if qp.get("display"):
+                clean_disp = str(qp["display"]).replace('"', "'")
+                arg_parts.append(f'--quick-play-display "{clean_disp}"')
+
+        arguments_str = " ".join(arg_parts)
+        target_exe = get_python_gui_executable()
+        working_dir = str(_root_dir)
+
+        icon_src = self._get_effective_icon_source()
+        ico_file = image_to_ico(icon_src, safe_filename) if icon_src else ensure_default_minecraft_ico()
+        ico_str = str(ico_file.resolve()) if ico_file and ico_file.exists() else None
+
+        desc_parts = ["Launch Minecraft"]
+        if ver:
+            desc_parts.append(f"v{ver}")
+        if prof:
+            desc_parts.append(f"(Profile: {prof})")
+        if isinstance(qp, dict) and qp.get("display"):
+            desc_parts.append(f"- {qp['display']}")
+        description = " ".join(desc_parts)
+
+        created_locations = []
+        errors = []
+
+        if to_desktop:
+            desktop_lnk = get_desktop_dir() / f"{safe_filename}.lnk"
+            ok, msg = create_windows_shortcut(
+                lnk_path=desktop_lnk,
+                target_exe=target_exe,
+                arguments=arguments_str,
+                working_dir=working_dir,
+                icon_path=ico_str,
+                description=description,
+                pin_to_start=False
+            )
+            if ok:
+                created_locations.append(f"Desktop: {desktop_lnk}")
+            else:
+                errors.append(f"Desktop shortcut failed: {msg}")
+
+        if to_start:
+            start_lnk = get_start_menu_programs_dir() / f"{safe_filename}.lnk"
+            ok, msg = create_windows_shortcut(
+                lnk_path=start_lnk,
+                target_exe=target_exe,
+                arguments=arguments_str,
+                working_dir=working_dir,
+                icon_path=ico_str,
+                description=description,
+                pin_to_start=True
+            )
+            if ok:
+                created_locations.append(f"Start Menu (Pinned): {start_lnk}")
+            else:
+                errors.append(f"Start Menu shortcut failed: {msg}")
+
+        for loc in created_locations:
+            self.launcher_gui.log(f"[Shortcut] Created {loc}")
+
+        if errors and not created_locations:
+            QMessageBox.critical(self, "Shortcut Error", "\n".join(errors))
+            return
+
+        summary = "Successfully created shortcut(s):\n\n" + "\n".join(f"• {loc}" for loc in created_locations)
+        if errors:
+            summary += "\n\nWarnings:\n" + "\n".join(errors)
+        QMessageBox.information(self, "Shortcut Created", summary)
+        self.accept()
+
 
 class DirectoriesDialog(QDialog):
     def __init__(self, parent=None):
@@ -962,19 +1411,45 @@ class ChangeSkinDialog(QDialog):
             self.accept()
 
 class LocatorBarWidget(QWidget):
-    def __init__(self, color_hex, parent=None):
+    """
+    Interactive Minecraft Locator Bar widget using all vanilla sprites and .mcmeta definitions:
+    - locator_bar_background.png (12x5 nine-slice with 5px left/right border caps)
+    - locator_bar_arrow_up.png & locator_bar_arrow_down.png (animated 7x5 frames)
+    - locator_bar_dot/default_0.png : Square (0-179 blocks)
+    - locator_bar_dot/default_1.png : Circle (179-230 blocks)
+    - locator_bar_dot/default_2.png : Small square (230-281 blocks)
+    - locator_bar_dot/default_3.png : Small circle (>281 blocks)
+    - locator_bar_dot/bowtie.png    : Bowtie (<64 blocks when Bowtie style is used, or pinned)
+    """
+    ICON_MODES = [
+        ("auto", "Auto (Distance from Cursor)"),
+        ("default_0", "Square (0-179 blocks)"),
+        ("default_1", "Circle (179-230 blocks)"),
+        ("default_2", "Small square (230-281 blocks)"),
+        ("default_3", "Small circle (>281 blocks)"),
+        ("bowtie", "Bowtie (Bowtie Style)"),
+    ]
+
+    def __init__(self, color_hex, parent=None, status_callback=None):
         super().__init__(parent)
-        self.setFixedHeight(60)
+        self.setFixedHeight(54)
         self.setMouseTracking(True)
-        self.dot_x = 0
-        self.hovering = False
-        self.mouse_y = 0  # Global mouse Y relative to the bar
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.status_callback = status_callback
+        self.bg_scale = 3
+        self.dot_x = -1
+        self.mouse_y = 0
+        self.pitch_dir = "none"  # "none", "up", "down"
+        self.distance_blocks = 0
+        self.distance_pct = 0
+        self.scroll_distance_offset = 0
+        self.mode_index = 0
         self.color = QColor(color_hex)
-        
+
         self.track_timer = QTimer(self)
         self.track_timer.timeout.connect(self._track_mouse)
         self.track_timer.start(16)
-        
+
         self.anim_timer = QTimer(self)
         self.anim_timer.timeout.connect(self.update)
         self.anim_timer.start(50)
@@ -982,12 +1457,11 @@ class LocatorBarWidget(QWidget):
         import os
         import json
         bg_path = get_image_path("locator_bar/locator_bar_background.png")
-        dot_path = get_image_path("locator_bar/locator_bar_dot/default_0.png")
         arrow_up_path = get_image_path("locator_bar/locator_bar_arrow_up.png")
         arrow_down_path = get_image_path("locator_bar/locator_bar_arrow_down.png")
 
         self.bg_pixmap = QPixmap(bg_path)
-        
+
         self.bg_left = 5
         self.bg_right = 5
         if os.path.exists(bg_path + ".mcmeta"):
@@ -997,7 +1471,8 @@ class LocatorBarWidget(QWidget):
                     border = meta.get("gui", {}).get("scaling", {}).get("border", {})
                     self.bg_left = border.get("left", 5)
                     self.bg_right = border.get("right", 5)
-            except: pass
+            except Exception:
+                pass
 
         def load_arrow_meta(path):
             frames = [{"index": 0, "time": 10}, {"index": 1, "time": 4}]
@@ -1007,9 +1482,12 @@ class LocatorBarWidget(QWidget):
                     with open(path + ".mcmeta", "r") as f:
                         meta = json.load(f)
                         anim = meta.get("animation", {})
-                        if "frames" in anim: frames = anim["frames"]
-                        if "height" in anim: frame_height = anim["height"]
-                except: pass
+                        if "frames" in anim:
+                            frames = anim["frames"]
+                        if "height" in anim:
+                            frame_height = anim["height"]
+                except Exception:
+                    pass
             # time is in ticks, 1 tick = 50ms
             total_duration = sum([f.get("time", 1) * 50 for f in frames])
             return frames, frame_height, total_duration
@@ -1017,7 +1495,7 @@ class LocatorBarWidget(QWidget):
         self.arrow_up_meta = load_arrow_meta(arrow_up_path)
         self.arrow_down_meta = load_arrow_meta(arrow_down_path)
 
-        # Helper to load and tint images
+        # Helper to load and tint images using exact Minecraft multiplicative tinting
         def load_tinted_pixmap(path, is_arrow=False):
             raw_img = QImage(path)
             if raw_img.isNull():
@@ -1030,86 +1508,238 @@ class LocatorBarWidget(QWidget):
                         pixel = raw_img.pixelColor(x, y)
                         if pixel.alpha() > 0:
                             tinted = QColor(
-                                int(pixel.red() * self.color.red() / 255),
-                                int(pixel.green() * self.color.green() / 255),
-                                int(pixel.blue() * self.color.blue() / 255),
+                                (pixel.red() * self.color.red()) // 255,
+                                (pixel.green() * self.color.green()) // 255,
+                                (pixel.blue() * self.color.blue()) // 255,
                                 pixel.alpha()
                             )
                             raw_img.setPixelColor(x, y, tinted)
-            scale_factor = 3
+            scale_factor = self.bg_scale
             return QPixmap.fromImage(raw_img).scaled(
-                raw_img.width() * scale_factor, raw_img.height() * scale_factor,
-                Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
-
-        self.dot_pixmap = load_tinted_pixmap(dot_path)
-        self.arrow_up_pixmap = load_tinted_pixmap(arrow_up_path, is_arrow=True)
-        self.arrow_down_pixmap = load_tinted_pixmap(arrow_down_path, is_arrow=True)
-
-    def _track_mouse(self):
-        global_pos = QCursor.pos()
-        widget = QApplication.widgetAt(global_pos)
-        
-        old_dot_x, old_mouse_y, old_hover = self.dot_x, self.mouse_y, self.hovering
-        
-        if widget and widget.window() == self.window():
-            local_pos = self.mapFromGlobal(global_pos)
-            self.dot_x = local_pos.x()
-            self.mouse_y = local_pos.y()
-            self.hovering = (0 <= self.mouse_y <= self.height()) and (0 <= self.dot_x <= self.width())
-        else:
-            self.dot_x = -100
-            self.mouse_y = -100
-            self.hovering = False
-            
-        if self.dot_x != old_dot_x or self.mouse_y != old_mouse_y or self.hovering != old_hover:
-            self.update()
-        
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        if not self.bg_pixmap.isNull():
-            bg_scale = 3
-            scaled_bg = self.bg_pixmap.scaled(
-                self.bg_pixmap.width() * bg_scale, 
-                self.bg_pixmap.height() * bg_scale,
-                Qt.AspectRatioMode.IgnoreAspectRatio, 
+                raw_img.width() * scale_factor,
+                raw_img.height() * scale_factor,
+                Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.FastTransformation
             )
-            
+
+        # Load all 5 waypoint dot sprites from locator_bar/locator_bar_dot/
+        self.dot_pixmaps = {}
+        for sprite_name in ("default_0", "default_1", "default_2", "default_3", "bowtie"):
+            sprite_path = get_image_path(f"locator_bar/locator_bar_dot/{sprite_name}.png")
+            self.dot_pixmaps[sprite_name] = load_tinted_pixmap(sprite_path)
+
+        self.dot_pixmap = self.dot_pixmaps.get("default_0", QPixmap())
+        self.arrow_up_pixmap = load_tinted_pixmap(arrow_up_path, is_arrow=True)
+        self.arrow_down_pixmap = load_tinted_pixmap(arrow_down_path, is_arrow=True)
+        self._last_status_str = ""
+        self._update_tooltip_and_status()
+
+    def _get_sprite_for_distance(self, dist_blocks: int) -> tuple[str, str]:
+        """
+        Return (sprite_key, description) based on Minecraft's Locator Bar distance thresholds:
+        - Square       (default_0): 0-179 blocks
+        - Circle       (default_1): 179-230 blocks
+        - Small square (default_2): 230-281 blocks
+        - Small circle (default_3): >281 blocks
+        """
+        mode_key, _ = self.ICON_MODES[self.mode_index]
+        if mode_key == "default_0":
+            return "default_0", "Square (0-179 blocks)"
+        elif mode_key == "default_1":
+            return "default_1", "Circle (179-230 blocks)"
+        elif mode_key == "default_2":
+            return "default_2", "Small square (230-281 blocks)"
+        elif mode_key == "default_3":
+            return "default_3", "Small circle (>281 blocks)"
+        elif mode_key == "bowtie":
+            if dist_blocks < 64:
+                return "bowtie", f"Bowtie ({dist_blocks}m, <64 blocks)"
+            elif dist_blocks < 179:
+                return "default_0", f"Square ({dist_blocks}m, 64-179 blocks)"
+            elif dist_blocks < 230:
+                return "default_1", f"Circle ({dist_blocks}m, 179-230 blocks)"
+            elif dist_blocks <= 281:
+                return "default_2", f"Small square ({dist_blocks}m, 230-281 blocks)"
+            else:
+                return "default_3", f"Small circle ({dist_blocks}m, >281 blocks)"
+
+        # Auto distance mode (percentage of distance to the top/bottom edge of the window)
+        pct_str = f"{self.distance_pct}%"
+        if dist_blocks < 179:
+            return "default_0", f"Square ({dist_blocks} blocks, {pct_str} | 0-179)"
+        elif dist_blocks < 230:
+            return "default_1", f"Circle ({dist_blocks} blocks, {pct_str} | 179-230)"
+        elif dist_blocks <= 281:
+            return "default_2", f"Small square ({dist_blocks} blocks, {pct_str} | 230-281)"
+        else:
+            return "default_3", f"Small circle ({dist_blocks} blocks, {pct_str} | >281)"
+
+    def _update_tooltip_and_status(self):
+        _, desc = self._get_sprite_for_distance(self.distance_blocks)
+        mode_key, mode_label = self.ICON_MODES[self.mode_index]
+        if mode_key == "auto":
+            status_str = f"Waypoint: {desc}"
+        else:
+            status_str = f"Waypoint: {desc} [Pinned - Click bar to cycle]"
+        if status_str != self._last_status_str:
+            self._last_status_str = status_str
+            self.setToolTip(
+                f"{status_str}\n"
+                "• Move mouse away from bar or scroll wheel to change distance:\n"
+                "  Square (0-179) | Circle (179-230) | Small square (230-281) | Small circle (>281)\n"
+                "• Click the Locator Bar to cycle / pin icon styles (including Bowtie)"
+            )
+            if self.status_callback:
+                try:
+                    self.status_callback(status_str)
+                except Exception:
+                    pass
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.mode_index = (self.mode_index + 1) % len(self.ICON_MODES)
+            self._update_tooltip_and_status()
+            self.update()
+        elif event.button() == Qt.MouseButton.RightButton:
+            self.mode_index = 0
+            self.scroll_distance_offset = 0
+            self._update_tooltip_and_status()
+            self.update()
+        super().mousePressEvent(event)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta != 0:
+            step = 25 if delta > 0 else -25
+            self.scroll_distance_offset = max(0, min(350, self.scroll_distance_offset + step))
+            self._track_mouse(force_update=True)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def resizeEvent(self, event):
+        if self.dot_x < 0:
+            self.dot_x = self.width() // 2
+        super().resizeEvent(event)
+
+    def _track_mouse(self, force_update: bool = False):
+        global_pos = QCursor.pos()
+        win = self.window()
+        in_window = False
+        if win and win.isVisible():
+            widget = QApplication.widgetAt(global_pos)
+            if widget and widget.window() == win:
+                in_window = True
+            elif win.frameGeometry().contains(global_pos):
+                in_window = True
+
+        old_state = (self.dot_x, self.pitch_dir, self.distance_blocks, self.distance_pct, self.mode_index)
+
+        bar_h = 5 * self.bg_scale
+        bar_top = (self.height() - bar_h) // 2
+        bar_bottom = bar_top + bar_h
+        bar_center_y = self.height() / 2.0
+
+        # Max distance in Minecraft's WaypointStyle is DEFAULT_FAR_DISTANCE = 332 blocks (100% at window edge)
+        max_blocks = 332
+
+        if in_window and win:
+            local_pos = self.mapFromGlobal(global_pos)
+            self.dot_x = max(0, min(self.width(), local_pos.x()))
+            self.mouse_y = local_pos.y()
+
+            win_top_local = self.mapFromGlobal(win.mapToGlobal(QtCore.QPoint(0, 0))).y()
+            win_bottom_local = self.mapFromGlobal(win.mapToGlobal(QtCore.QPoint(0, win.height()))).y()
+
+            # Pitch direction: show Up/Down arrows only when cursor is vertically outside the waypoint dot area
+            dot_margin = 2 * self.bg_scale
+            up_start_y = bar_top - dot_margin
+            down_start_y = bar_bottom + dot_margin
+
+            if self.mouse_y < up_start_y:
+                self.pitch_dir = "up"
+                outside_px = float(up_start_y - self.mouse_y)
+                max_up_px = max(1.0, float(up_start_y - win_top_local))
+                pct = max(0.0, min(1.0, outside_px / max_up_px))
+            elif self.mouse_y > down_start_y:
+                self.pitch_dir = "down"
+                outside_px = float(self.mouse_y - down_start_y)
+                max_down_px = max(1.0, float(win_bottom_local - down_start_y))
+                pct = max(0.0, min(1.0, outside_px / max_down_px))
+            else:
+                self.pitch_dir = "none"
+                pct = 0.0
+
+            self.distance_blocks = int(round(pct * max_blocks)) + self.scroll_distance_offset
+            self.distance_pct = min(100, int(round((self.distance_blocks / max_blocks) * 100)))
+        else:
+            # Keep waypoint dot centered on the bar when cursor is outside the launcher window
+            self.dot_x = self.width() // 2 if self.width() > 0 else 0
+            self.mouse_y = int(bar_center_y)
+            self.pitch_dir = "none"
+            self.distance_blocks = self.scroll_distance_offset
+            self.distance_pct = min(100, int(round((self.distance_blocks / max_blocks) * 100)))
+
+        if force_update or (self.dot_x, self.pitch_dir, self.distance_blocks, self.distance_pct, self.mode_index) != old_state:
+            self._update_tooltip_and_status()
+            self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        bg_scale = self.bg_scale
+        h = 5 * bg_scale
+        y_offset = (self.height() - h) // 2
+
+        if not self.bg_pixmap.isNull():
+            scaled_bg = self.bg_pixmap.scaled(
+                self.bg_pixmap.width() * bg_scale,
+                self.bg_pixmap.height() * bg_scale,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.FastTransformation
+            )
+
             h = scaled_bg.height()
             y_offset = (self.height() - h) // 2
-            
-            left_cap_w = 2 * bg_scale
-            right_cap_w = 2 * bg_scale
-            
-            # Left cap
-            painter.drawPixmap(0, y_offset, scaled_bg.copy(0, 0, left_cap_w, h))
-            
-            # Center (stretch just a single 1-pixel wide column to create a perfectly smooth, uniform bar)
-            center_src_x = 5 * bg_scale
-            center_src_w = 1 * bg_scale
-            center_rect = QRect(left_cap_w, y_offset, self.width() - left_cap_w - right_cap_w, h)
-            center_pixmap = scaled_bg.copy(center_src_x, 0, center_src_w, h)
-            # Stretch the 1-pixel column across the center to eliminate tiling patterns
-            painter.drawPixmap(center_rect, center_pixmap)
-            
-            # Right cap
-            painter.drawPixmap(self.width() - right_cap_w, y_offset, scaled_bg.copy(scaled_bg.width() - right_cap_w, 0, right_cap_w, h))
-            
-        dot_center_x = self.dot_x
-        if (0 <= self.dot_x <= self.width()):
-            # Always draw dot if mouse X is within bounds
-            if not self.dot_pixmap.isNull():
-                dot_w = self.dot_pixmap.width()
-                dot_h = self.dot_pixmap.height()
-                draw_x = max(0, min(self.width() - dot_w, int(self.dot_x - dot_w / 2)))
-                draw_y = (self.height() - dot_h) // 2
-                painter.drawPixmap(draw_x, draw_y, self.dot_pixmap)
-                dot_center_x = draw_x + dot_w / 2.0
 
-            # Draw animated arrow if mouse is outside vertically
-            if not self.hovering:
+            # Use the full 5-pixel nine-slice border caps defined in locator_bar_background.png.mcmeta
+            left_cap_w = self.bg_left * bg_scale
+            right_cap_w = self.bg_right * bg_scale
+
+            # Left cap (x = 0..4 in 12x5 sprite, including the green gradient fade)
+            painter.drawPixmap(0, y_offset, scaled_bg.copy(0, 0, left_cap_w, h))
+
+            # Center slice (x = 5..6 in 12x5 sprite)
+            center_src_x = self.bg_left * bg_scale
+            center_src_w = max(1, (self.bg_pixmap.width() - self.bg_left - self.bg_right)) * bg_scale
+            center_rect = QRect(left_cap_w, y_offset, max(0, self.width() - left_cap_w - right_cap_w), h)
+            center_pixmap = scaled_bg.copy(center_src_x, 0, center_src_w, h)
+            painter.drawPixmap(center_rect, center_pixmap)
+
+            # Right cap (x = 7..11 in 12x5 sprite, including the green gradient fade)
+            painter.drawPixmap(
+                self.width() - right_cap_w,
+                y_offset,
+                scaled_bg.copy(scaled_bg.width() - right_cap_w, 0, right_cap_w, h)
+            )
+
+        sprite_key, _ = self._get_sprite_for_distance(self.distance_blocks)
+        active_dot_pixmap = self.dot_pixmaps.get(sprite_key, self.dot_pixmap)
+
+        dot_x = self.dot_x if self.dot_x >= 0 else (self.width() // 2)
+        if not active_dot_pixmap.isNull() and self.width() > 0:
+            dot_w = active_dot_pixmap.width()
+            dot_h = active_dot_pixmap.height()
+            # In Minecraft LocatorBar.class, the 9x9 dot is clamped within the 182px bar (182 - 9 = 173 range)
+            # and drawn at y = top - 2 (which centers the 9px dot over the 5px bar)
+            draw_x = max(0, min(self.width() - dot_w, int(dot_x - dot_w / 2)))
+            draw_y = y_offset - 2 * bg_scale
+            painter.drawPixmap(draw_x, draw_y, active_dot_pixmap)
+
+            # Draw animated up/down pitch arrow if cursor is above or below the bar
+            # In Minecraft LocatorBar.class: arrow is 7x5, drawn at x = dot_x + 1, y = top - 6 (up) or top + 6 (down)
+            if self.pitch_dir != "none":
                 t = QTime.currentTime().msecsSinceStartOfDay()
-                
+
                 def get_arrow_frame(meta, current_time_ms):
                     frames, frame_height, total_duration = meta
                     mod_t = current_time_ms % total_duration if total_duration > 0 else 0
@@ -1121,21 +1751,20 @@ class LocatorBarWidget(QWidget):
                             frame_idx = f.get("index", 0)
                             break
                         current_t += f_time
-                    return frame_idx, frame_height * 3
+                    return frame_idx, frame_height * bg_scale
 
-                if self.mouse_y < 0 and hasattr(self, 'arrow_up_pixmap') and not self.arrow_up_pixmap.isNull():
+                arrow_draw_x = draw_x + 1 * bg_scale
+                if self.pitch_dir == "up" and hasattr(self, 'arrow_up_pixmap') and not self.arrow_up_pixmap.isNull():
                     frame_idx, arr_h = get_arrow_frame(self.arrow_up_meta, t)
                     arr_w = self.arrow_up_pixmap.width()
                     src_rect = QRect(0, frame_idx * arr_h, arr_w, arr_h)
-                    arrow_draw_x = int(dot_center_x - arr_w / 2.0)
-                    arrow_draw_y = y_offset - arr_h - 2
+                    arrow_draw_y = y_offset - 6 * bg_scale
                     painter.drawPixmap(arrow_draw_x, arrow_draw_y, self.arrow_up_pixmap, src_rect.x(), src_rect.y(), src_rect.width(), src_rect.height())
-                elif self.mouse_y > self.height() and hasattr(self, 'arrow_down_pixmap') and not self.arrow_down_pixmap.isNull():
+                elif self.pitch_dir == "down" and hasattr(self, 'arrow_down_pixmap') and not self.arrow_down_pixmap.isNull():
                     frame_idx, arr_h = get_arrow_frame(self.arrow_down_meta, t)
                     arr_w = self.arrow_down_pixmap.width()
                     src_rect = QRect(0, frame_idx * arr_h, arr_w, arr_h)
-                    arrow_draw_x = int(dot_center_x - arr_w / 2.0)
-                    arrow_draw_y = y_offset + h + 2
+                    arrow_draw_y = y_offset + 6 * bg_scale
                     painter.drawPixmap(arrow_draw_x, arrow_draw_y, self.arrow_down_pixmap, src_rect.x(), src_rect.y(), src_rect.width(), src_rect.height())
 
 class PlayerDataOptionsDialog(QDialog):
@@ -1296,10 +1925,17 @@ class ProfileBannerWidget(QWidget):
 
         java_layout.addLayout(mc_name_layout)
 
-        locator_color = auth_data.get('locator_bar_color', '#FFFFFF')
+        mc_uuid = auth_data.get('mc_uuid', '')
+        locator_color = calculate_locator_bar_color(mc_uuid) if mc_uuid else auth_data.get('locator_bar_color', '#FFFFFF')
         color_label = QLabel(f"Your locator bar color is: {locator_color}")
         color_label.setFont(QFont("Segoe UI", 9))
         java_layout.addWidget(color_label, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.waypoint_status_label = QLabel("Waypoint: Square (0 blocks | 0-179)")
+        self.waypoint_status_label.setFont(QFont("Segoe UI", 8))
+        self.waypoint_status_label.setStyleSheet("color: #666666;")
+        self.waypoint_status_label.setVisible(self.options.get("show_locator_bar", True))
+        java_layout.addWidget(self.waypoint_status_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.java_info_widget.setVisible(self.options.get("show_java_profile", True))
         center_layout.addWidget(self.java_info_widget)
@@ -1388,7 +2024,10 @@ class ProfileBannerWidget(QWidget):
         main_layout.addLayout(top_layout)
         
         # 5. Bottom: Interactive Locator Bar spanning full width
-        self.locator_bar = LocatorBarWidget(locator_color)
+        self.locator_bar = LocatorBarWidget(
+            locator_color,
+            status_callback=self.waypoint_status_label.setText if hasattr(self, 'waypoint_status_label') else None
+        )
         self.locator_bar.setVisible(self.options.get("show_locator_bar", True))
         main_layout.addWidget(self.locator_bar)
 
@@ -1414,6 +2053,8 @@ class ProfileBannerWidget(QWidget):
         self.java_info_widget.setVisible(self.options.get("show_java_profile", True))
         self.right_widget.setVisible(self.options.get("show_xbox_profile", True))
         self.locator_bar.setVisible(self.options.get("show_locator_bar", True))
+        if hasattr(self, 'waypoint_status_label') and self.waypoint_status_label:
+            self.waypoint_status_label.setVisible(self.options.get("show_locator_bar", True))
         
         window = self.window()
         if hasattr(window, 'update_window_size'):
@@ -1899,9 +2540,16 @@ class InstanceLogWindow(QMainWindow):
 
 
 class LauncherGUI(QMainWindow):
-    def __init__(self):
+    def __init__(self, startup_args=None):
         super().__init__()
         self.setWindowTitle("PyMcLauncher")
+        self._startup_args = startup_args
+        try:
+            default_ico = ensure_default_minecraft_ico()
+            if default_ico and default_ico.exists():
+                self.setWindowIcon(QIcon(str(default_ico)))
+        except Exception:
+            pass
 
         self.is_offline = False
         self.browser_window = None
@@ -1935,8 +2583,12 @@ class LauncherGUI(QMainWindow):
         prof_layout = QHBoxLayout()
         self.profile_combo = QComboBox()
         self.profile_combo.currentIndexChanged.connect(self.on_profile_changed)
+        self.shortcut_btn = QPushButton("Create Shortcut")
+        self.shortcut_btn.setToolTip("Create a Desktop shortcut or pin to Start Menu for a version, world/Quick Play, or profile")
+        self.shortcut_btn.clicked.connect(self.open_create_shortcut_dialog)
         prof_layout.addWidget(QLabel("Profile:"))
         prof_layout.addWidget(self.profile_combo, stretch=1)
+        prof_layout.addWidget(self.shortcut_btn)
         self.layout.addLayout(prof_layout)
         
         # Load profiles
@@ -2067,16 +2719,90 @@ class LauncherGUI(QMainWindow):
         
         self.load_versions()
 
+        if self._startup_args:
+            self.apply_startup_args(self._startup_args)
+
         # Start a silent background refresh to update skin/presence
         if is_logged_in and not is_expired:
             self.refresh_process = QProcess()
-            self.refresh_process.setProgram(sys.executable)
+            self.refresh_process.setProgram(get_python_cli_executable())
             self.refresh_process.setArguments([get_script_path("get_mc_username.py"), "--json", "--profile", get_active_profile_id()])
             self.refresh_process.readyReadStandardOutput.connect(self.handle_refresh_stdout)
             self.refresh_process.start()
 
         # Run startup garbage collection after UI is shown
         QTimer.singleShot(100, self.run_startup_garbage_collection)
+
+    def open_create_shortcut_dialog(self):
+        dlg = CreateShortcutDialog(self)
+        dlg.exec()
+
+    def apply_startup_args(self, args):
+        """Apply CLI arguments passed from a Desktop or Start Menu shortcut and trigger auto-launch if requested."""
+        try:
+            # 1. Select Profile if specified
+            if getattr(args, "profile", None):
+                p_idx = self.profile_combo.findText(args.profile)
+                if p_idx >= 0 and self.profile_combo.currentIndex() != p_idx:
+                    self.profile_combo.setCurrentIndex(p_idx)
+
+            # 2. Select Version if specified
+            if getattr(args, "version", None):
+                target_ver = args.version
+                if target_ver in ("latest", "latest-release", "latest-snapshot"):
+                    resolved_ver = None
+                    try:
+                        avail = list(get_available_versions() or [])
+                        if target_ver == "latest-snapshot":
+                            for v_id, v_type, _ in avail:
+                                if v_type in ("snapshot", "release"):
+                                    resolved_ver = v_id
+                                    break
+                        else:
+                            for v_id, v_type, _ in avail:
+                                if v_type == "release":
+                                    resolved_ver = v_id
+                                    break
+                    except Exception:
+                        pass
+                    if not resolved_ver and self.version_combo.count() > 0:
+                        resolved_ver = self.version_combo.itemData(0)
+                    if resolved_ver:
+                        target_ver = resolved_ver
+
+                v_idx = self.version_combo.findData(target_ver)
+                if v_idx < 0:
+                    is_dl = target_ver in get_downloaded_versions()
+                    label = f"{target_ver} [Downloaded]" if is_dl else target_ver
+                    self.version_combo.insertItem(0, label, target_ver)
+                    if is_dl:
+                        self.version_combo.setItemData(0, True, Qt.ItemDataRole.UserRole + 1)
+                    v_idx = 0
+                self.version_combo.setCurrentIndex(v_idx)
+
+            # 3. Select Quick Play World / Server / Realm if specified
+            qp_type = getattr(args, "quick_play_type", None)
+            qp_id = getattr(args, "quick_play_id", None)
+            if qp_type and qp_id and hasattr(self, "quick_play_combo"):
+                matched_idx = -1
+                for i in range(self.quick_play_combo.count()):
+                    d = self.quick_play_combo.itemData(i)
+                    if isinstance(d, dict) and d.get("type") == qp_type and str(d.get("id")) == str(qp_id):
+                        matched_idx = i
+                        break
+                if matched_idx < 0:
+                    disp = getattr(args, "quick_play_display", None) or f"{qp_type.title()}: {qp_id}"
+                    qp_obj = {"type": qp_type, "id": qp_id, "display": disp}
+                    self.quick_play_combo.addItem(disp, qp_obj)
+                    matched_idx = self.quick_play_combo.count() - 1
+                self.quick_play_combo.setCurrentIndex(matched_idx)
+
+            # 4. Trigger launch sequence automatically when launched via shortcut
+            if getattr(args, "shortcut_launch", False):
+                self.log("[Shortcut] Auto-launching from shortcut...")
+                QTimer.singleShot(250, self.start_launch_sequence)
+        except Exception as e:
+            self.log(f"[Warning] Failed to apply shortcut arguments: {e}")
 
     def run_startup_garbage_collection(self):
         class _GCThread(QtCore.QThread):
@@ -2208,10 +2934,13 @@ class LauncherGUI(QMainWindow):
                 self.logout_btn.setToolTip("")
 
         if hasattr(self, 'banner_widget') and self.banner_widget:
-            if hasattr(self.banner_widget, 'change_skin_btn'):
-                self.banner_widget.change_skin_btn.setEnabled(not is_busy)
-            if hasattr(self.banner_widget, 'options_btn'):
-                self.banner_widget.options_btn.setEnabled(not is_busy)
+            try:
+                if hasattr(self.banner_widget, 'change_skin_btn') and self.banner_widget.change_skin_btn:
+                    self.banner_widget.change_skin_btn.setEnabled(not is_busy)
+                if hasattr(self.banner_widget, 'options_btn') and self.banner_widget.options_btn:
+                    self.banner_widget.options_btn.setEnabled(not is_busy)
+            except RuntimeError:
+                self.banner_widget = None
 
     def update_running_instances_ui(self):
         """Show the running instances list below the main buttons when >1 instance is running."""
@@ -2428,7 +3157,10 @@ class LauncherGUI(QMainWindow):
             else:
                 self.status_label.setText("Logout complete.")
                 if hasattr(self, 'banner_widget') and self.banner_widget:
-                    self.banner_widget.setVisible(False)
+                    try:
+                        self.banner_widget.setVisible(False)
+                    except RuntimeError:
+                        self.banner_widget = None
             self.set_progress_visible(False)
             self.update_ui_state()
             QApplication.processEvents()
@@ -2448,17 +3180,24 @@ class LauncherGUI(QMainWindow):
                 self.update_profile_banner()
             else:
                 if hasattr(self, 'banner_widget') and self.banner_widget:
-                    self.banner_widget.setVisible(False)
+                    try:
+                        self.banner_widget.setVisible(False)
+                    except RuntimeError:
+                        self.banner_widget = None
             
             self.update_ui_state()
 
             if dialog.wants_new_account:
                 # Clear banner for new account before logging in
+                self.banner_widget = None
                 while self.banner_container.count():
                     item = self.banner_container.takeAt(0)
-                    if item.widget():
-                        item.widget().setParent(None)
-                        item.widget().deleteLater()
+                    widget = item.widget() if item else None
+                    if widget:
+                        if hasattr(widget, 'cleanup'):
+                            widget.cleanup()
+                        widget.setParent(None)
+                        widget.deleteLater()
                 self._force_new_login = True
                 self.do_login()
 
@@ -2484,7 +3223,7 @@ class LauncherGUI(QMainWindow):
             self._auth_cancelled_profile = current_profile
 
         self.process = QProcess()
-        self.process.setProgram(sys.executable)
+        self.process.setProgram(get_python_cli_executable())
         self.process.setArguments([get_script_path("get_mc_username.py"), "--json", "--profile", self._auth_cancelled_profile])
         self._force_new_login = False
         self.process.readyReadStandardOutput.connect(self.handle_auth_stdout)
@@ -2493,7 +3232,9 @@ class LauncherGUI(QMainWindow):
         self.process.start()
 
     def update_profile_banner(self):
-        # Clear existing banner
+        # Clear existing banner and immediately clear self.banner_widget reference
+        # so QApplication.processEvents() inside banner_progress cannot touch a deleted C++ widget
+        self.banner_widget = None
         while self.banner_container.count():
             item = self.banner_container.takeAt(0)
             widget = item.widget()
@@ -2515,8 +3256,12 @@ class LauncherGUI(QMainWindow):
             self.banner_widget = ProfileBannerWidget(auth_data, self, progress_callback=banner_progress)
             self.banner_container.addWidget(self.banner_widget)
             
-            # Hide the progress bar after it's done loading, unless a download pipeline started
-            if not getattr(self, 'task_progress_bar', None) or not self.task_progress_bar.isVisible():
+            # Hide the progress bar after it's done loading, unless a launch pipeline or authentication is active
+            if (
+                not getattr(self, 'is_pipeline_running', False)
+                and not getattr(self, 'is_authenticating', False)
+                and (not getattr(self, 'task_progress_bar', None) or not self.task_progress_bar.isVisible())
+            ):
                 self.step_progress_bar.setVisible(False)
 
         self.update_ui_state()
@@ -2559,26 +3304,6 @@ class LauncherGUI(QMainWindow):
         versions = list(get_available_versions() or [])
         downloaded = get_downloaded_versions()
 
-        # Discover any locally downloaded versions/JSONs present in the directory not in Mojang's online manifest
-        existing_version_ids = {v[0] for v in versions}
-        local_extras = []
-        for v_id in sorted(downloaded):
-            if v_id not in existing_version_ids:
-                v_type = "release"
-                v_date = "local"
-                try:
-                    from utils import get_version_json
-                    v_json = get_version_json(v_id)
-                    if v_json:
-                        v_type = v_json.get("type", "release")
-                        rel_time = v_json.get("releaseTime", "")
-                        v_date = rel_time.split("T")[0] if "T" in rel_time else (rel_time or "local")
-                except Exception:
-                    pass
-                local_extras.append((v_id, v_type, v_date))
-
-        all_versions = local_extras + versions
-
         if self.show_downloaded_only and not downloaded:
             self.show_downloaded_only = False
             config = load_launcher_config()
@@ -2586,7 +3311,7 @@ class LauncherGUI(QMainWindow):
             save_launcher_config(config)
 
         count = 0
-        if not all_versions:
+        if not versions:
             self.is_offline = True
             for v_id in sorted(downloaded):
                 self.version_combo.addItem(f"{v_id} (Offline) [Downloaded]", v_id)
@@ -2598,11 +3323,11 @@ class LauncherGUI(QMainWindow):
             else:
                 self.results_text.append("[System] Offline mode. No downloaded versions available to play.")
         else:
-            self.is_offline = bool(not versions)
+            self.is_offline = False
             config = load_launcher_config()
             hide_date = config.get("hide_release_date", False)
-            for v_id, v_type, v_date in all_versions:
-                if v_type not in self.version_filters and v_type not in ["custom", "modified", "local", "forge", "fabric", "quilt", "neoforge", "optifine"]:
+            for v_id, v_type, v_date in versions:
+                if v_type not in self.version_filters:
                     continue
                 is_downloaded = v_id in downloaded
                 if self.show_downloaded_only and not is_downloaded:
@@ -2764,7 +3489,14 @@ class LauncherGUI(QMainWindow):
         def _on_realms_loaded(realms_list):
             if not hasattr(self, 'quick_play_combo') or not self.quick_play_combo:
                 return
+            existing_keys = set()
+            for i in range(self.quick_play_combo.count()):
+                d = self.quick_play_combo.itemData(i)
+                if isinstance(d, dict):
+                    existing_keys.add((d.get("type"), str(d.get("id"))))
             for qp in realms_list:
+                if (qp.get("type"), str(qp.get("id"))) in existing_keys:
+                    continue
                 self.quick_play_combo.addItem(qp['display'], qp)
                 if qp.get('expired'):
                     idx = self.quick_play_combo.count() - 1
@@ -2939,7 +3671,7 @@ class LauncherGUI(QMainWindow):
         
         self.is_just_logging_in = False
         self.process = QProcess()
-        self.process.setProgram(sys.executable)
+        self.process.setProgram(get_python_cli_executable())
         self.process.setArguments([get_script_path("get_mc_username.py"), "--json", "--profile", get_active_profile_id(getattr(self, "_force_new_login", False))])
         self._force_new_login = False
         self.process.readyReadStandardOutput.connect(self.handle_auth_stdout)
@@ -2971,9 +3703,10 @@ class LauncherGUI(QMainWindow):
                 self._login_succeeded = True
                 save_auth_cache(obj)
                 self._cleanup_browser()
-
-                from PyQt6.QtCore import QTimer
-                QTimer.singleShot(250, lambda auth_obj=obj: self._finalize_auth(auth_obj))
+                self.step_progress_bar.setVisible(True)
+                self.step_progress_bar.setRange(0, 0)
+                self.status_label.setText("Loading profile and textures...")
+                QApplication.processEvents()
             elif "error" in obj:
                 self.log(f"[Error] {obj.get('error')}: {obj.get('details')}")
 
@@ -2994,12 +3727,11 @@ class LauncherGUI(QMainWindow):
 
     def auth_finished(self, exitCode, exitStatus):
         self.is_authenticating = False
-        self.step_progress_bar.setVisible(False)
-        self.step_progress_bar.setRange(0, 100)
-
         self._cleanup_browser()
 
         if exitCode != 0 or not self.auth_data:
+            self.step_progress_bar.setVisible(False)
+            self.step_progress_bar.setRange(0, 100)
             self.is_pipeline_running = False
             self.log("[Error] Authentication failed or cancelled.")
             self.status_label.setText("Authentication Failed.")
@@ -3030,12 +3762,19 @@ class LauncherGUI(QMainWindow):
             self.update_running_instances_ui()
             self.update_ui_state()
             return
-            
+
+        # Keep the loading bar visible while finalizing authentication & loading profile textures
+        self.step_progress_bar.setVisible(True)
+        self._finalize_auth(self.auth_data)
+
         if self.is_just_logging_in:
             self.is_pipeline_running = False
+            self.step_progress_bar.setRange(0, 100)
+            self.step_progress_bar.setVisible(False)
             self.log("[System] Login complete. Ready to play.")
             self.status_label.setText("Ready to launch.")
             self.update_ui_state()
+            self.update_window_size()
         else:
             self.start_download_pipeline()
         
@@ -3477,13 +4216,22 @@ class LauncherGUI(QMainWindow):
         self.browser_layout = QGridLayout(self.browser_central)
         self.browser_layout.setContentsMargins(0, 0, 0, 0)
 
+        self._webauthn_js_active = False
+        self._webauthn_os_active = False
+
         self.loading_widget = QWidget()
-        self.loading_widget.setStyleSheet("background-color: rgba(43, 43, 43, 180);")
+        self.loading_widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.loading_widget.setAutoFillBackground(True)
+        self.loading_widget.setStyleSheet("background-color: rgba(32, 32, 32, 220);")
         loading_layout = QVBoxLayout(self.loading_widget)
-        loading_label = QLabel("Loading Secure Login...")
-        loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        loading_label.setStyleSheet("color: white; font-size: 18px; font-weight: bold;")
-        loading_layout.addWidget(loading_label)
+        loading_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.loading_label = QLabel("Loading Secure Login...")
+        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.loading_label.setStyleSheet(
+            "color: white; font-size: 18px; font-weight: bold; "
+            "background-color: rgba(20, 20, 20, 210); padding: 18px 28px; border-radius: 8px;"
+        )
+        loading_layout.addWidget(self.loading_label)
         
         from utils import get_active_profile_id
         import os
@@ -3504,29 +4252,73 @@ class LauncherGUI(QMainWindow):
         script = QWebEngineScript()
         script.setSourceCode("""
         (function() {
-            if (!navigator.credentials) return;
-            if (navigator.credentials.is_hooked) return;
-            navigator.credentials.is_hooked = true;
-            const originalGet = navigator.credentials.get;
-            navigator.credentials.get = function(options) {
-                console.log("AGY_WEBAUTHN_START");
-                return originalGet.call(this, options).then(res => {
-                    console.log("AGY_WEBAUTHN_END");
-                    return res;
-                }).catch(err => {
-                    console.log("AGY_WEBAUTHN_END");
-                    throw err;
-                });
-            };
+            if (window.__agy_webauthn_hooked) return;
+            window.__agy_webauthn_hooked = true;
+
+            const rawLog = (window.console && window.console.log) ? window.console.log.bind(window.console) : function() {};
+            const rawWarn = (window.console && window.console.warn) ? window.console.warn.bind(window.console) : rawLog;
+            function notify(tag) {
+                try { rawLog(tag); } catch (e) {}
+                try { rawWarn(tag); } catch (e) {}
+            }
+
+            function wrapWebAuthn(origFn) {
+                if (!origFn || origFn.__agy_wrapped) return origFn;
+                const wrapped = function(options) {
+                    const isConditional = Boolean(options && options.mediation === "conditional");
+                    if (!isConditional) {
+                        notify("AGY_WEBAUTHN_START");
+                    }
+                    try {
+                        const resPromise = origFn.apply(this, arguments);
+                        if (resPromise && typeof resPromise.then === "function") {
+                            return resPromise.then(function(res) {
+                                if (!isConditional) notify("AGY_WEBAUTHN_SUCCESS");
+                                return res;
+                            }).catch(function(err) {
+                                if (!isConditional) notify("AGY_WEBAUTHN_CANCEL");
+                                throw err;
+                            });
+                        }
+                        if (!isConditional) notify("AGY_WEBAUTHN_CANCEL");
+                        return resPromise;
+                    } catch (err) {
+                        if (!isConditional) notify("AGY_WEBAUTHN_CANCEL");
+                        throw err;
+                    }
+                };
+                wrapped.__agy_wrapped = true;
+                return wrapped;
+            }
+
+            if (typeof CredentialsContainer !== "undefined" && CredentialsContainer.prototype) {
+                if (CredentialsContainer.prototype.get) {
+                    CredentialsContainer.prototype.get = wrapWebAuthn(CredentialsContainer.prototype.get);
+                }
+                if (CredentialsContainer.prototype.create) {
+                    CredentialsContainer.prototype.create = wrapWebAuthn(CredentialsContainer.prototype.create);
+                }
+            }
+            if (navigator.credentials) {
+                if (navigator.credentials.get) {
+                    navigator.credentials.get = wrapWebAuthn(navigator.credentials.get);
+                }
+                if (navigator.credentials.create) {
+                    navigator.credentials.create = wrapWebAuthn(navigator.credentials.create);
+                }
+            }
         })();
         """)
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
         script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
-        script.setName("webauthn_hook")
+        script.setRunsOnSubFrames(True)
+        script.setName("webauthn_hook_v2")
         
-        # Only insert if it doesn't exist
-        if not any(s.name() == "webauthn_hook" for s in self.web_profile.scripts().toList()):
-            self.web_profile.scripts().insert(script)
+        # Remove old hook if present and insert updated hook
+        for existing_s in list(self.web_profile.scripts().toList()):
+            if existing_s.name() in ("webauthn_hook", "webauthn_hook_v2"):
+                self.web_profile.scripts().remove(existing_s)
+        self.web_profile.scripts().insert(script)
             
         class LoginWebPage(QWebEnginePage):
             def __init__(self, profile, parent_gui):
@@ -3535,12 +4327,15 @@ class LauncherGUI(QMainWindow):
                 
             def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
                 if message == "AGY_WEBAUTHN_START":
-                    if hasattr(self.parent_gui, 'loading_widget') and self.parent_gui.loading_widget:
-                        self.parent_gui.loading_widget.show()
+                    self.parent_gui._set_webauthn_loading(js_active=True)
                     return
-                if message == "AGY_WEBAUTHN_END":
-                    if hasattr(self.parent_gui, 'loading_widget') and self.parent_gui.loading_widget:
-                        self.parent_gui.loading_widget.hide()
+                if message == "AGY_WEBAUTHN_SUCCESS":
+                    self.parent_gui._webauthn_completed = True
+                    self.parent_gui._set_webauthn_loading(js_active=True)
+                    return
+                if message in ("AGY_WEBAUTHN_END", "AGY_WEBAUTHN_CANCEL"):
+                    self.parent_gui._webauthn_completed = False
+                    self.parent_gui._set_webauthn_loading(js_active=False)
                     return
                 super().javaScriptConsoleMessage(level, message, lineNumber, sourceID)
                 
@@ -3552,17 +4347,85 @@ class LauncherGUI(QMainWindow):
         self.browser_layout.addWidget(self.browser, 0, 0)
         self.browser_layout.addWidget(self.loading_widget, 0, 0)
 
-        self.browser.loadStarted.connect(self.loading_widget.show)
+        self._browser_page_loading = True
+        self._webauthn_completed = False
+        self.browser.loadStarted.connect(self._on_browser_load_started)
         self.browser.load(QUrl(url))
         self.browser.loadFinished.connect(self.on_browser_load_finished)
         self.browser.urlChanged.connect(self.on_browser_url_changed)
 
+        # Poll for native Windows Security (WebAuthn / Passkey / Security Key) modal dialog
+        self._webauthn_poll_timer = QTimer(self.browser_window)
+        self._webauthn_poll_timer.setInterval(120)
+        self._webauthn_poll_timer.timeout.connect(self._poll_windows_webauthn_dialog)
+        self._webauthn_poll_timer.start()
+
         self.browser_window.setCentralWidget(self.browser_central)
+        self.loading_widget.show()
+        self.loading_widget.raise_()
         self.browser_window.show()
+
+    def _on_browser_load_started(self):
+        self._browser_page_loading = True
+        if hasattr(self, 'loading_widget') and self.loading_widget:
+            self.loading_widget.show()
+            self.loading_widget.raise_()
+
+    def _set_webauthn_loading(self, js_active: Optional[bool] = None, os_active: Optional[bool] = None):
+        if js_active is not None:
+            self._webauthn_js_active = js_active
+        if os_active is not None:
+            self._webauthn_os_active = os_active
+
+        if not hasattr(self, 'loading_widget') or not self.loading_widget:
+            return
+
+        if (
+            self._webauthn_js_active
+            or self._webauthn_os_active
+            or getattr(self, '_webauthn_completed', False)
+            or getattr(self, '_browser_page_loading', False)
+        ):
+            self.loading_widget.show()
+            self.loading_widget.raise_()
+        else:
+            self.loading_widget.hide()
+
+    def _poll_windows_webauthn_dialog(self):
+        """Detect if the native Windows Security (Passkey / Security Key / Hello) dialog is active."""
+        if os.name != "nt" or not getattr(self, "browser_window", None):
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            is_open = False
+            for cls_name in ("Credential Dialog Xaml Host", "AuthUXWnd"):
+                hwnd = user32.FindWindowW(cls_name, None)
+                if hwnd and user32.IsWindowVisible(hwnd):
+                    is_open = True
+                    break
+            if not is_open:
+                hwnd = user32.FindWindowW(None, "Windows Security")
+                if hwnd and user32.IsWindowVisible(hwnd):
+                    is_open = True
+            if is_open != getattr(self, "_webauthn_os_active", False):
+                self._set_webauthn_loading(os_active=is_open)
+        except Exception:
+            pass
     def _cleanup_browser(self):
         if getattr(self, '_is_cleaning_up', False):
             return
         self._is_cleaning_up = True
+        self._webauthn_js_active = False
+        self._webauthn_os_active = False
+        self._webauthn_completed = False
+        self._browser_page_loading = False
+        if getattr(self, '_webauthn_poll_timer', None):
+            try:
+                self._webauthn_poll_timer.stop()
+            except Exception:
+                pass
+            self._webauthn_poll_timer = None
         if getattr(self, 'browser_window', None):
             try:
                 self.browser_window.close()
@@ -3603,9 +4466,15 @@ class LauncherGUI(QMainWindow):
         self._is_cleaning_up = False
 
     def on_browser_load_finished(self, ok):
+        self._browser_page_loading = False
         if hasattr(self, 'loading_widget') and self.loading_widget:
-            self.loading_widget.hide()
-        if ok:
+            if (
+                not getattr(self, '_webauthn_js_active', False)
+                and not getattr(self, '_webauthn_os_active', False)
+                and not getattr(self, '_webauthn_completed', False)
+            ):
+                self.loading_widget.hide()
+        if ok and getattr(self, 'browser', None):
             self.browser.page().runJavaScript("""
                 setTimeout(function() {
                     var btn = document.querySelector('#idSIButton9, input[type=submit], button[type=submit]');
@@ -3616,17 +4485,43 @@ class LauncherGUI(QMainWindow):
             """)
 
     def on_browser_url_changed(self, url):
-        if "login.live.com/undefined" in url.toString() or "oauth20_desktop.srf" in url.toString():
+        url_str = url.toString()
+        if "login.live.com/undefined" in url_str or "oauth20_desktop.srf" in url_str:
             if self.browser_window:
                 self.browser_window.hide()
+            self.step_progress_bar.setVisible(True)
+            self.step_progress_bar.setRange(0, 0)
+            self.step_progress_bar.setFormat("Completing Microsoft Sign-In...")
+            self.status_label.setText("Completing sign-in and fetching Minecraft profile...")
+            QApplication.processEvents()
 
 if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--shortcut-launch", "--auto-launch", action="store_true", dest="shortcut_launch")
+    parser.add_argument("--profile", type=str, default=None)
+    parser.add_argument("--version", type=str, default=None)
+    parser.add_argument("--quick-play-type", type=str, default=None)
+    parser.add_argument("--quick-play-id", type=str, default=None)
+    parser.add_argument("--quick-play-display", type=str, default=None)
+    cli_args, _ = parser.parse_known_args()
+
+    # If launched from a shortcut specifying a profile, set it active before initializing GUI
+    if getattr(cli_args, "profile", None):
+        try:
+            cfg = load_launcher_config()
+            if cli_args.profile in cfg.get("profiles", {}):
+                cfg["active_profile"] = cli_args.profile
+                save_launcher_config(cfg)
+        except Exception:
+            pass
+
     os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
     app = QApplication(sys.argv)
     
     # Force the use of the native Windows UX theme engine (comctl32.dll)
     app.setStyle("windowsvista")
     
-    window = LauncherGUI()
+    window = LauncherGUI(startup_args=cli_args)
     window.show()
     sys.exit(app.exec())

@@ -523,15 +523,25 @@ class PurePythonAuthFlow:
 
 
 def _calculate_locator_bar_color(mc_uuid_hex: str) -> str:
-    clean_hex = mc_uuid_hex.replace("-", "")
+    """
+    Calculate the vanilla Minecraft Locator Bar color for a player UUID:
+    ARGB.setBrightness(ARGB.color(255, uuid.hashCode()), 0.9F)
+    """
+    import colorsys
+    clean_hex = mc_uuid_hex.replace("-", "").strip()
+    if len(clean_hex) < 32:
+        return "#FFFFFF"
     most = int(clean_hex[:16], 16)
     least = int(clean_hex[16:32], 16)
     hilo = most ^ least
     hash_val = ((hilo >> 32) ^ hilo) & 0xFFFFFFFF
-    if hash_val & 0x80000000:
-        hash_val -= 0x100000000
     raw_color = hash_val & 0xFFFFFF
-    return f"#{raw_color:06X}"
+    r = ((raw_color >> 16) & 0xFF) / 255.0
+    g = ((raw_color >> 8) & 0xFF) / 255.0
+    b = (raw_color & 0xFF) / 255.0
+    h, s, _ = colorsys.rgb_to_hsv(r, g, b)
+    nr, ng, nb = colorsys.hsv_to_rgb(h, s, 0.9)
+    return f"#{int(round(nr * 255)):02X}{int(round(ng * 255)):02X}{int(round(nb * 255)):02X}"
 
 
 def main():

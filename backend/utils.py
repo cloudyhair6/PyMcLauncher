@@ -58,16 +58,16 @@ def get_download_dir():
         return _custom_download_dir
     return DOWNLOAD_DIR
 
-def get_dir(name: str) -> Path:
+def get_dir(name: str, profile_name: str = None) -> Path:
     """Get the path for a specific directory type from config or defaults."""
-    if _custom_download_dir:
+    if _custom_download_dir and not profile_name:
         base = _custom_download_dir
         if name == 'base': return base
         return base / name
         
     config = load_launcher_config()
     
-    active = config.get("active_profile", "Default")
+    active = profile_name or config.get("active_profile", "Default")
     profiles = config.get("profiles", {})
     
     if active in profiles:
@@ -267,20 +267,29 @@ def get_version_json(version_id):
     import json
     from pathlib import Path
     
-    local_path = get_dir("versions") / version_id / f'{version_id}.json'
+    v_dir = get_dir("versions")
+    b_dir = get_dir("base")
+    local_path = v_dir / version_id / f'{version_id}.json'
     cache_key = (str(local_path), version_id)
     if cache_key in _version_json_memory_cache:
         return _version_json_memory_cache[cache_key]
 
-    # Try to load from local disk cache first
-    if local_path.exists():
-        try:
-            with open(local_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                _version_json_memory_cache[cache_key] = data
-                return data
-        except Exception:
-            pass
+    # Try to load from local disk cache first across standard candidate locations
+    for candidate_path in [
+        local_path,
+        v_dir / f'{version_id}.json',
+        b_dir / 'versions' / version_id / f'{version_id}.json',
+        b_dir / f'{version_id}.json',
+    ]:
+        if candidate_path.exists():
+            try:
+                with open(candidate_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        _version_json_memory_cache[cache_key] = data
+                        return data
+            except Exception:
+                pass
 
     version_info = get_version_info(version_id)
     if not version_info or 'url' not in version_info:
@@ -338,31 +347,100 @@ def save_launcher_config(config):
         _launcher_config_cache = None
         _launcher_config_mtime = -1.0
 
-def get_downloaded_versions():
+def sync_existing_version_configs(profile_name: str = None, downloaded_versions=None):
     """
-    Get the set of downloaded version IDs dynamically by scanning:
+    Update existing versions/<version>/command_config.json and launcher_config.json
+    when loading or switching to a directory that already has downloaded versions.
+    """
+    try:
+        v_dir = get_dir("versions", profile_name=profile_name)
+        b_dir = get_dir("base", profile_name=profile_name)
+        a_dir = get_dir("assets", profile_name=profile_name)
+        l_dir = get_dir("libraries", profile_name=profile_name)
+        j_dir = get_dir("java", profile_name=profile_name)
+
+        if downloaded_versions is not None and v_dir.exists():
+            base_str = str(b_dir.resolve())
+            assets_str = str(a_dir.resolve())
+            libs_str = str(l_dir.resolve())
+            java_str = str(j_dir.resolve())
+
+            for v_id in downloaded_versions:
+                cfg_path = v_dir / v_id / "command_config.json"
+                if not cfg_path.exists():
+                    continue
+                try:
+                    with open(cfg_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    if not isinstance(cfg, dict):
+                        continue
+
+                    changed = False
+                    old_base = cfg.get("minecraft_downloads") or cfg.get("game_directory")
+
+                    for k, new_val in (
+                        ("minecraft_downloads", base_str),
+                        ("game_directory", base_str),
+                        ("game_assets", assets_str),
+                        ("assets_root", assets_str),
+                        ("natives_directory", str((l_dir / "natives" / v_id).resolve())),
+                    ):
+                        if cfg.get(k) != new_val:
+                            cfg[k] = new_val
+                            changed = True
+
+                    if old_base and isinstance(old_base, str) and old_base != base_str:
+                        if isinstance(cfg.get("java_path"), str) and old_base in cfg["java_path"]:
+                            cfg["java_path"] = cfg["java_path"].replace(old_base, base_str)
+                            changed = True
+                        if isinstance(cfg.get("classpath"), str) and old_base in cfg["classpath"]:
+                            cfg["classpath"] = cfg["classpath"].replace(old_base, base_str)
+                            changed = True
+
+                    # Remove any legacy raw tokens from command_config.json if present
+                    for secret_key in ("auth_access_token", "auth_session", "session"):
+                        if secret_key in cfg:
+                            del cfg[secret_key]
+                            changed = True
+
+                    if changed:
+                        with open(cfg_path, "w", encoding="utf-8") as f:
+                            json.dump(cfg, f, indent=2)
+                except Exception:
+                    pass
+
+        if downloaded_versions is not None:
+            config = load_launcher_config()
+            dl_list = sorted(downloaded_versions)
+            if config.get("downloaded_versions") != dl_list:
+                config["downloaded_versions"] = dl_list
+                save_launcher_config(config)
+    except Exception:
+        pass
+
+
+def get_downloaded_versions(profile_name: str = None):
+    """
+    Get the set of downloaded version IDs dynamically by scanning only the versions directory:
     - Configured versions directory
     - Base / 'versions' directory
-    - Base directory
     Detects both standard Minecraft formats (<version>/<version>.jar, <version>/<version>.json)
     and PyMcLauncher formats (<version>-client.jar, <version>.json).
     """
     candidate_dirs = []
     try:
-        v_dir = get_dir('versions')
+        v_dir = get_dir('versions', profile_name=profile_name)
         if v_dir.exists():
             candidate_dirs.append(v_dir)
     except Exception:
         pass
 
     try:
-        b_dir = get_dir('base')
+        b_dir = get_dir('base', profile_name=profile_name)
         if b_dir.exists():
             sub_v = b_dir / 'versions'
             if sub_v.exists() and sub_v not in candidate_dirs:
                 candidate_dirs.append(sub_v)
-            if b_dir not in candidate_dirs:
-                candidate_dirs.append(b_dir)
     except Exception:
         pass
 
@@ -372,14 +450,40 @@ def get_downloaded_versions():
         "source", "resources", "logs", "crash-reports", "screenshots", "shaderpacks",
         "resourcepacks", "mods", "config", ".cache", "bin", "natives", "virtual",
         "legacy", "pre-1.6", "runtime", "jre-legacy", "java-runtime-alpha",
-        "java-runtime-beta", "java-runtime-gamma", "java-runtime-delta", "java-runtime-epsilon"
+        "java-runtime-beta", "java-runtime-gamma", "java-runtime-delta", "java-runtime-epsilon",
+        "downloads", "telemetry", "server-resource-packs", "debug", "backups",
+        "datapacks", "schematics", "custom_skins", "capes", "realms_persistence"
     }
     ignored_json = {
         "command_config.json", "launcher_config.json", "directories.json", 
         "quickPlay.json", "verified_java.json", "version_manifest.json", 
         "version_manifest_v2.json", "launcher_profiles.json", "profile.json", 
-        "usercache.json", "usernamecache.json"
+        "usercache.json", "usernamecache.json", "realms_persistence.json",
+        "treatment_tags.json", "telemetry_info.json", "launcher_accounts.json",
+        "whitelist.json", "ops.json", "banned-players.json", "banned-ips.json", "log.json"
     }
+
+    def _is_valid_version_json(json_path: Path, expected_id: str = None) -> bool:
+        """Verify that a .json file is actually a Minecraft version manifest and not game/launcher data."""
+        try:
+            if not json_path.is_file() or json_path.stat().st_size == 0 or json_path.stat().st_size > 5_000_000:
+                return False
+            with open(json_path, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return False
+            if expected_id and data.get("id") and str(data.get("id")) != expected_id:
+                return False
+            version_keys = {"mainClass", "libraries", "inheritsFrom", "arguments", "minecraftArguments", "assetIndex"}
+            return bool(version_keys & data.keys())
+        except Exception:
+            return False
+
+    def _is_nonempty_file(p: Path) -> bool:
+        try:
+            return p.is_file() and p.stat().st_size > 0
+        except Exception:
+            return False
 
     for search_dir in candidate_dirs:
         try:
@@ -388,36 +492,34 @@ def get_downloaded_versions():
                     v_name = item.name
                     if v_name.lower() in ignored_version_names:
                         continue
-                    has_json = (item / f"{v_name}.json").exists() or any(
-                        p.suffix == '.json' and p.name not in ignored_json and p.name.lower() not in ignored_version_names
-                        for p in item.iterdir() if p.is_file()
-                    )
+                    has_json = _is_valid_version_json(item / f"{v_name}.json", expected_id=v_name)
                     has_jar = (
-                        (item / f"{v_name}.jar").exists()
-                        or (item / f"{v_name}-client.jar").exists()
-                        or (item / "client.jar").exists()
-                        or (search_dir / f"{v_name}-client.jar").exists()
-                        or (search_dir / f"{v_name}.jar").exists()
+                        _is_nonempty_file(item / f"{v_name}.jar")
+                        or _is_nonempty_file(item / f"{v_name}-client.jar")
+                        or _is_nonempty_file(item / "client.jar")
+                        or _is_nonempty_file(search_dir / f"{v_name}-client.jar")
+                        or _is_nonempty_file(search_dir / f"{v_name}.jar")
                     )
-                    if has_json or has_jar:
+                    if has_jar or has_json:
                         downloaded.add(v_name)
                 elif item.is_file():
                     name = item.name
-                    if name.endswith("-client.jar"):
+                    if name.endswith("-client.jar") and _is_nonempty_file(item):
                         v_name = name[:-11]
                         if v_name.lower() not in ignored_version_names:
                             downloaded.add(v_name)
-                    elif name.endswith(".jar"):
+                    elif name.endswith(".jar") and _is_nonempty_file(item):
                         v_name = name[:-4]
                         if v_name.lower() not in ignored_version_names:
                             downloaded.add(v_name)
                     elif name.endswith(".json") and name not in ignored_json:
                         v_name = name[:-5]
-                        if v_name.lower() not in ignored_version_names:
+                        if v_name.lower() not in ignored_version_names and _is_valid_version_json(item, expected_id=v_name):
                             downloaded.add(v_name)
         except Exception:
             pass
 
+    sync_existing_version_configs(profile_name=profile_name, downloaded_versions=downloaded)
     return downloaded
 
 
@@ -689,34 +791,165 @@ def clear_texture_cache():
                         except Exception:
                             pass
 
-def load_accounts():
-    config_file = ROOT_DIR / "launcher_config.json"
-    if config_file.exists():
+def calculate_locator_bar_color(mc_uuid_hex: str) -> str:
+    """
+    Calculate the vanilla Minecraft Locator Bar waypoint color from a player's UUID:
+    ARGB.setBrightness(ARGB.color(255, uuid.hashCode()), 0.9F)
+    """
+    import colorsys
+    try:
+        clean_hex = str(mc_uuid_hex or "").replace("-", "").strip()
+        if len(clean_hex) < 32 or clean_hex.startswith("00000000"):
+            return "#FFFFFF"
+        most = int(clean_hex[:16], 16)
+        least = int(clean_hex[16:32], 16)
+        hilo = most ^ least
+        hash_val = ((hilo >> 32) ^ hilo) & 0xFFFFFFFF
+        raw_color = hash_val & 0xFFFFFF
+        r = ((raw_color >> 16) & 0xFF) / 255.0
+        g = ((raw_color >> 8) & 0xFF) / 255.0
+        b = (raw_color & 0xFF) / 255.0
+        h, s, _ = colorsys.rgb_to_hsv(r, g, b)
+        nr, ng, nb = colorsys.hsv_to_rgb(h, s, 0.9)
+        return f"#{int(round(nr * 255)):02X}{int(round(ng * 255)):02X}{int(round(nb * 255)):02X}"
+    except Exception:
+        return "#FFFFFF"
+
+
+def _deduplicate_accounts(accounts: dict, prefer_pid: str = None) -> tuple[dict, bool]:
+    """
+    Ensure accounts['profiles'] has at most one entry per Minecraft/Xbox account
+    (matched by mc_uuid, xbox_xuid, or case-insensitive mc_username).
+    Returns (accounts, was_modified).
+    """
+    if not isinstance(accounts, dict):
+        return {}, False
+    profiles = accounts.get("profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        return accounts, False
+
+    modified = False
+    for pid, pdata in profiles.items():
+        if isinstance(pdata, dict) and pdata.get("mc_uuid"):
+            expected_color = calculate_locator_bar_color(pdata.get("mc_uuid"))
+            if expected_color != "#FFFFFF" and pdata.get("locator_bar_color") != expected_color:
+                pdata["locator_bar_color"] = expected_color
+                modified = True
+
+    if len(profiles) <= 1:
+        return accounts, modified
+
+    import shutil
+    import stat
+
+    def _on_rm_error(func, path, exc_info):
         try:
-            with open(config_file, "r") as f:
-                config = json.load(f)
-                return config.get("accounts", {})
-        except:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except Exception:
             pass
-    return {}
+
+    def _account_keys(pdata: dict):
+        if not isinstance(pdata, dict):
+            return []
+        keys = []
+        mc_uuid = str(pdata.get("mc_uuid") or "").strip().replace("-", "").lower()
+        if mc_uuid and mc_uuid != "0" and not mc_uuid.startswith("00000000"):
+            keys.append(("uuid", mc_uuid))
+        xuid = str(pdata.get("xbox_xuid") or "").strip().lower()
+        if xuid and xuid not in ("0", "offline"):
+            keys.append(("xuid", xuid))
+        uname = str(pdata.get("mc_username") or "").strip().lower()
+        if uname and uname not in ("unknown", "offlineplayer", "player"):
+            keys.append(("uname", uname))
+        return keys
+
+    active_id = prefer_pid or accounts.get("active_profile")
+
+    # Group profile IDs that represent the same account (preserving insertion order so newest is last)
+    groups = []  # list of [pids_list, latest_pdata, key_set]
+    for pid, pdata in list(profiles.items()):
+        akeys = set(_account_keys(pdata))
+        matched_group = None
+        if akeys:
+            for grp in groups:
+                if akeys & grp[2]:
+                    matched_group = grp
+                    break
+        if matched_group is not None:
+            matched_group[0].append(pid)
+            matched_group[1] = pdata  # Later entry has fresher auth data/tokens
+            matched_group[2].update(akeys)
+            modified = True
+        else:
+            groups.append([[pid], pdata, set(akeys)])
+
+    if not modified:
+        return accounts, False
+
+    new_profiles = {}
+    for pid_list, latest_data, _ in groups:
+        if len(pid_list) == 1:
+            new_profiles[pid_list[0]] = latest_data
+            continue
+
+        # Prefer the newly-authenticated prefer_pid, otherwise the newest pid (last in pid_list)
+        if prefer_pid and prefer_pid in pid_list:
+            kept_pid = prefer_pid
+        else:
+            kept_pid = pid_list[-1]
+
+        new_profiles[kept_pid] = latest_data
+        kept_cache = ROOT_DIR / ".cache" / kept_pid
+
+        for dup_pid in pid_list:
+            if dup_pid == kept_pid:
+                continue
+            if active_id == dup_pid:
+                active_id = kept_pid
+            dup_cache = ROOT_DIR / ".cache" / dup_pid
+            if dup_cache.exists():
+                try:
+                    kept_cache.mkdir(parents=True, exist_ok=True)
+                    for item in dup_cache.iterdir():
+                        dest = kept_cache / item.name
+                        if not dest.exists():
+                            if item.is_dir():
+                                shutil.copytree(item, dest, dirs_exist_ok=True)
+                            else:
+                                shutil.copy2(item, dest)
+                    shutil.rmtree(dup_cache, onerror=_on_rm_error)
+                except Exception:
+                    pass
+
+    accounts["profiles"] = new_profiles
+    if active_id and active_id in new_profiles:
+        accounts["active_profile"] = active_id
+    elif new_profiles:
+        accounts["active_profile"] = next(iter(new_profiles.keys()))
+    else:
+        accounts["active_profile"] = None
+
+    return accounts, True
+
+
+def load_accounts():
+    config = load_launcher_config()
+    accounts = config.get("accounts", {})
+    if not isinstance(accounts, dict):
+        return {}
+    accounts, modified = _deduplicate_accounts(accounts)
+    if modified:
+        config["accounts"] = accounts
+        save_launcher_config(config)
+    return accounts
+
 
 def save_accounts(accounts):
-    config_file = ROOT_DIR / "launcher_config.json"
-    config = {}
-    if config_file.exists():
-        try:
-            with open(config_file, "r") as f:
-                config = json.load(f)
-        except Exception:
-            config = {}
+    accounts, _ = _deduplicate_accounts(accounts)
+    config = load_launcher_config()
     config["accounts"] = accounts
-    with open(config_file, "w") as f:
-        json.dump(config, f, indent=4)
-
-
-
-
-
+    save_launcher_config(config)
 
 
 def get_active_profile_id(force_new=False):
@@ -728,8 +961,6 @@ def get_active_profile_id(force_new=False):
         save_accounts(accounts)
         return new_id
     return accounts.get("active_profile")
-
-
 
 
 import time
@@ -780,6 +1011,8 @@ def save_auth_cache(auth_data):
     if "profiles" not in accounts:
         accounts["profiles"] = {}
     accounts["profiles"][active_id] = auth_data
+    accounts["active_profile"] = active_id
+    accounts, _ = _deduplicate_accounts(accounts, prefer_pid=active_id)
     save_accounts(accounts)
 
 def fetch_realms_options():
@@ -819,22 +1052,25 @@ def fetch_realms_options():
         pass
     return realms
 
-def get_quick_play_options(minecraft_dir, include_realms=True):
+def get_quick_play_options(minecraft_dir=None, include_realms=True, profile_name: str = None):
     options = []
     
     # 1. Singleplayer Worlds
-    saves_dir = get_dir("saves")
+    saves_dir = get_dir("saves", profile_name=profile_name)
     if saves_dir.exists():
         for d in saves_dir.iterdir():
             if d.is_dir() and (d / "level.dat").exists():
+                icon_file = d / "icon.png"
                 options.append({
                     "type": "singleplayer",
                     "id": d.name,
-                    "display": f"World: {d.name}"
+                    "display": f"World: {d.name}",
+                    "icon_path": str(icon_file) if icon_file.exists() else None
                 })
 
     # 2. Multiplayer Servers
-    servers_dat = get_dir("base") / "servers.dat"
+    base_dir = Path(minecraft_dir) if minecraft_dir and not profile_name else get_dir("base", profile_name=profile_name)
+    servers_dat = base_dir / "servers.dat"
     if servers_dat.exists():
         try:
             import nbtlib
@@ -1105,3 +1341,126 @@ def is_minecraft_window_visible(pid: int = None, version: str = None) -> bool:
         return found[0]
     except Exception:
         return False
+
+
+def get_desktop_dir() -> Path:
+    """Resolve the user's Windows Desktop directory (including OneDrive redirection)."""
+    if os.name == 'nt':
+        try:
+            import ctypes
+            import ctypes.wintypes
+            buf = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
+            # CSIDL_DESKTOPDIRECTORY = 0x0010
+            ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buf)
+            if buf.value:
+                return Path(buf.value)
+        except Exception:
+            pass
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders') as key:
+                val = os.path.expandvars(winreg.QueryValueEx(key, 'Desktop')[0])
+                if val:
+                    return Path(val)
+        except Exception:
+            pass
+    onedrive_desktop = Path.home() / "OneDrive" / "Desktop"
+    if onedrive_desktop.exists():
+        return onedrive_desktop
+    return Path.home() / "Desktop"
+
+
+def get_start_menu_programs_dir() -> Path:
+    """Resolve the user's Windows Start Menu Programs directory."""
+    if os.name == 'nt':
+        try:
+            import ctypes
+            import ctypes.wintypes
+            buf = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
+            # CSIDL_PROGRAMS = 0x0002
+            ctypes.windll.shell32.SHGetFolderPathW(None, 0x0002, None, 0, buf)
+            if buf.value:
+                return Path(buf.value)
+        except Exception:
+            pass
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders') as key:
+                val = os.path.expandvars(winreg.QueryValueEx(key, 'Programs')[0])
+                if val:
+                    return Path(val)
+        except Exception:
+            pass
+    appdata = os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+
+
+def create_windows_shortcut(
+    lnk_path: Path,
+    target_exe: str,
+    arguments: str,
+    working_dir: str,
+    icon_path: str = None,
+    description: str = "",
+    pin_to_start: bool = False
+) -> tuple:
+    """
+    Create a Windows .lnk shortcut using WScript.Shell COM object via PowerShell
+    and optionally invoke the 'Pin to Start' shell verb.
+    Returns (success: bool, message: str).
+    """
+    import subprocess
+    try:
+        lnk_path = Path(lnk_path).resolve()
+        lnk_path.parent.mkdir(parents=True, exist_ok=True)
+
+        env = os.environ.copy()
+        env["SC_LNK_PATH"] = str(lnk_path)
+        env["SC_TARGET"] = str(target_exe)
+        env["SC_ARGS"] = str(arguments)
+        env["SC_WORKDIR"] = str(working_dir)
+        env["SC_ICON"] = str(icon_path) if icon_path else ""
+        env["SC_DESC"] = str(description)
+        env["SC_PIN"] = "1" if pin_to_start else "0"
+        env["SC_PARENT"] = str(lnk_path.parent)
+        env["SC_NAME"] = str(lnk_path.name)
+
+        ps_cmd = (
+            "$ws = New-Object -ComObject WScript.Shell; "
+            "$s = $ws.CreateShortcut($env:SC_LNK_PATH); "
+            "$s.TargetPath = $env:SC_TARGET; "
+            "$s.Arguments = $env:SC_ARGS; "
+            "$s.WorkingDirectory = $env:SC_WORKDIR; "
+            "if ($env:SC_ICON) { $s.IconLocation = $env:SC_ICON }; "
+            "if ($env:SC_DESC) { $s.Description = $env:SC_DESC }; "
+            "$s.Save(); "
+            "if ($env:SC_PIN -eq '1') { "
+            "  try { "
+            "    $sh = New-Object -ComObject Shell.Application; "
+            "    $folder = $sh.Namespace($env:SC_PARENT); "
+            "    if ($folder) { "
+            "      $item = $folder.ParseName($env:SC_NAME); "
+            "      if ($item) { "
+            "        $verb = $item.Verbs() | Where-Object { ($_.Name -replace '&','') -match 'Pin to Start' } | Select-Object -First 1; "
+            "        if ($verb) { $verb.DoIt() } "
+            "      } "
+            "    } "
+            "  } catch {} "
+            "}"
+        )
+
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=creationflags
+        )
+        if res.returncode == 0 and lnk_path.exists():
+            return True, str(lnk_path)
+        return False, (res.stderr.strip() or f"PowerShell exited with code {res.returncode}")
+    except Exception as e:
+        return False, str(e)
+
