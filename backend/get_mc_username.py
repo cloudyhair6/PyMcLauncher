@@ -41,11 +41,13 @@ XBL_DEVICE_AUTH_URL = "https://device.auth.xboxlive.com/device/authenticate"
 XBL_TITLE_AUTH_URL = "https://title.auth.xboxlive.com/title/authenticate"
 XBL_USER_AUTH_URL = "https://user.auth.xboxlive.com/user/authenticate"
 XBL_XSTS_AUTH_URL = "https://xsts.auth.xboxlive.com/xsts/authorize"
+XBL_SISU_AUTHORIZE_URL = "https://sisu.xboxlive.com/authorize"
 
 MC_XSTS_RELYING_PARTY = "rp://api.minecraftservices.com/"
 XBL_RELYING_PARTY = "http://xboxlive.com"
 
 MC_LOGIN_WITH_XBOX_URL = "https://api.minecraftservices.com/authentication/login_with_xbox"
+MC_LAUNCHER_LOGIN_URL = "https://api.minecraftservices.com/launcher/login"
 MC_PROFILE_URL = "https://api.minecraftservices.com/minecraft/profile"
 MC_ENTITLEMENTS_URL = "https://api.minecraftservices.com/entitlements/mcstore"
 
@@ -202,10 +204,25 @@ def _check_iso_valid(iso_str: str) -> bool:
 # Token Managers (Live, Xbox, Minecraft Java)
 # ---------------------------------------------------------------------------
 class PurePythonAuthFlow:
-    def __init__(self, profile_name: str, cache_dir: Path, is_json: bool = False):
+    def __init__(
+        self,
+        profile_name: str,
+        cache_dir: Path,
+        is_json: bool = False,
+        login_hint: str = None,
+        use_wam: bool = False,
+        wam_id: str = None,
+        hwnd: int = 0,
+    ):
         self.profile_name = profile_name
         self.cache_dir = cache_dir
         self.is_json = is_json
+        self.login_hint = (login_hint or "").strip() or None
+        self.use_wam = bool(use_wam and os.name == "nt")
+        self.wam_id = (wam_id or "").strip() or None
+        self.hwnd = int(hwnd or 0)
+        self.obtained_wam_account_id = None
+        self.obtained_msa_email = self.login_hint
         self.signer = P256Signer()
         self.session = requests.Session()
 
@@ -279,15 +296,16 @@ class PurePythonAuthFlow:
         msg = f"To sign in, use a web browser to open the page {ver_uri} and use the code {code} or visit {direct_url}"
 
         if self.is_json:
+            pending_payload = {
+                "status": "pending_login",
+                "verification_uri": direct_url,
+                "user_code": code,
+                "message": msg,
+            }
+            if self.login_hint:
+                pending_payload["login_hint"] = self.login_hint
             print(
-                json.dumps(
-                    {
-                        "status": "pending_login",
-                        "verification_uri": direct_url,
-                        "user_code": code,
-                        "message": msg,
-                    }
-                ),
+                json.dumps(pending_payload),
                 flush=True,
             )
         else:
@@ -302,7 +320,7 @@ class PurePythonAuthFlow:
                 except Exception:
                     pass
 
-        interval = int(res.get("interval", 5))
+        interval = min(int(res.get("interval", 5)), 2)
         expires_in = int(res.get("expires_in", 900))
         deadline = time.time() + expires_in - 2
 
@@ -322,6 +340,8 @@ class PurePythonAuthFlow:
             poll_data = poll_resp.json()
             if "error" in poll_data:
                 if poll_data["error"] in ("authorization_pending", "slow_down"):
+                    if poll_data["error"] == "slow_down":
+                        interval = min(interval + 2, 5)
                     continue
                 raise RuntimeError(
                     f"Failed to acquire authorization code ({poll_data.get('error')}): {poll_data.get('error_description')}"
@@ -332,16 +352,86 @@ class PurePythonAuthFlow:
 
         raise RuntimeError("Authentication timed out waiting for user login.")
 
+    def _msal_broker_token(self) -> str:
+        """
+        Sign in through the Windows account broker (WAM) using MSAL with the official
+        Minecraft Launcher client ID. Returns an XboxLive.signin access token.
+        """
+        import msal
+        import ctypes
+
+        cache_file = self.cache_dir.parent.parent / "msal_cache.bin"
+        token_cache = msal.SerializableTokenCache()
+        try:
+            if cache_file.exists():
+                token_cache.deserialize(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+        def _persist():
+            try:
+                if token_cache.has_state_changed:
+                    cache_file.parent.mkdir(parents=True, exist_ok=True)
+                    cache_file.write_text(token_cache.serialize(), encoding="utf-8")
+            except Exception:
+                pass
+
+        app = msal.PublicClientApplication(
+            "00000000402b5328",
+            authority="https://login.microsoftonline.com/consumers",
+            enable_broker_on_windows=True,
+            token_cache=token_cache,
+        )
+        scopes = ["XboxLive.signin"]
+        hint = (self.login_hint or "").strip().lower()
+        res = None
+        try:
+            for acct in app.get_accounts():
+                if not hint or str(acct.get("username", "")).lower() == hint:
+                    res = app.acquire_token_silent(scopes, account=acct)
+                    if res and "access_token" in res:
+                        break
+                    res = None
+        except Exception:
+            res = None
+        if not res:
+            hwnd = self.hwnd or 0
+            if not hwnd:
+                try:
+                    hwnd = ctypes.windll.kernel32.GetConsoleWindow() or ctypes.windll.user32.GetForegroundWindow()
+                except Exception:
+                    hwnd = 0
+            self._last_msa_was_interactive = True
+            res = app.acquire_token_interactive(
+                scopes,
+                parent_window_handle=hwnd or app.CONSOLE_WINDOW_HANDLE,
+                login_hint=self.login_hint or None,
+            )
+        _persist()
+        if not res or "access_token" not in res:
+            raise RuntimeError(
+                f"Windows sign-in failed: {(res or {}).get('error_description') or (res or {}).get('error') or 'cancelled'}"
+            )
+        claims = res.get("id_token_claims") or {}
+        email = claims.get("preferred_username") or claims.get("email") or self.login_hint
+        if email:
+            self.obtained_msa_email = email
+        return res["access_token"]
+
     def get_msa_token(self, force_refresh: bool = False) -> str:
+        self._last_msa_was_interactive = False
         cached = self._get_live_cached_tokens()
         if cached:
-            if cached["valid"] and cached["access_token"] and not force_refresh:
+            raw_tok_entry = self.live_cache.get_cached().get("token") or {}
+            has_extra = bool(raw_tok_entry.get("extra_tokens"))
+            if cached["valid"] and cached["access_token"] and not force_refresh and (not self.use_wam or has_extra):
                 return cached["access_token"]
             if cached["refresh_token"]:
                 try:
                     return self._refresh_live_token(cached["refresh_token"])
                 except Exception:
                     pass
+        self._last_msa_was_interactive = True
         return self._device_code_live_auth()
 
     # --- Xbox Live Tokens ---
@@ -354,27 +444,40 @@ class PurePythonAuthFlow:
             "Accept": "application/json",
         }
 
-    def _get_xbl_user_token(self, msa_token: str) -> str:
-        payload = {
-            "RelyingParty": "http://auth.xboxlive.com",
-            "TokenType": "JWT",
-            "Properties": {
-                "AuthMethod": "RPS",
-                "SiteName": "user.auth.xboxlive.com",
-                "RpsTicket": f"t={msa_token}",
-            },
-        }
-        body = json.dumps(payload, separators=(",", ":"))
-        sig = self.signer.sign_xbox_request(XBL_USER_AUTH_URL, "", body)
-        headers = self._xbl_base_headers(sig, contract_version="2")
-        headers["signature"] = sig
-        resp = self.session.post(XBL_USER_AUTH_URL, headers=headers, data=body, timeout=15)
-        resp.raise_for_status()
-        ret = resp.json()
-        self.xbl_cache.set_cached_partial({"userToken": ret})
-        return ret["Token"]
+    @staticmethod
+    def _rps_ticket_candidates(msa_token: str) -> list[str]:
+        raw = msa_token[2:] if msa_token.startswith(("t=", "d=")) else msa_token
+        cands = []
+        for c in (msa_token, f"t={raw}", f"d={raw}", raw):
+            if c and c not in cands:
+                cands.append(c)
+        return cands
 
-    def _get_xbl_device_token(self) -> str:
+    def _get_xbl_user_token(self, msa_token: str) -> str:
+        last_resp = None
+        for rps_ticket in self._rps_ticket_candidates(msa_token):
+            payload = {
+                "RelyingParty": "http://auth.xboxlive.com",
+                "TokenType": "JWT",
+                "Properties": {
+                    "AuthMethod": "RPS",
+                    "SiteName": "user.auth.xboxlive.com",
+                    "RpsTicket": rps_ticket,
+                },
+            }
+            body = json.dumps(payload, separators=(",", ":"))
+            sig = self.signer.sign_xbox_request(XBL_USER_AUTH_URL, "", body)
+            headers = self._xbl_base_headers(sig, contract_version="2")
+            headers["signature"] = sig
+            resp = self.session.post(XBL_USER_AUTH_URL, headers=headers, data=body, timeout=15)
+            last_resp = resp
+            if resp.ok:
+                ret = resp.json()
+                self.xbl_cache.set_cached_partial({"userToken": ret})
+                return ret["Token"]
+        last_resp.raise_for_status()
+
+    def _get_xbl_device_token(self, device_type: str = "Nintendo") -> str:
         ns = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
         dev_id = str(uuid.uuid3(ns, str(int(time.time() * 1000))))
         ser_id = str(uuid.uuid3(ns, str(int(time.time() * 1000) + 1)))
@@ -382,7 +485,7 @@ class PurePythonAuthFlow:
             "Properties": {
                 "AuthMethod": "ProofOfPossession",
                 "Id": f"{{{dev_id}}}",
-                "DeviceType": "Nintendo",
+                "DeviceType": device_type,
                 "SerialNumber": f"{{{ser_id}}}",
                 "Version": "0.0.0",
                 "ProofKey": self.signer.jwk,
@@ -399,38 +502,162 @@ class PurePythonAuthFlow:
         self.xbl_cache.set_cached_partial({"deviceToken": ret})
         return ret["Token"]
 
-    def _get_xbl_title_token(self, msa_token: str, device_token: str) -> str:
-        payload = {
-            "Properties": {
-                "AuthMethod": "RPS",
-                "DeviceToken": device_token,
-                "RpsTicket": f"t={msa_token}",
-                "SiteName": "user.auth.xboxlive.com",
-                "ProofKey": self.signer.jwk,
-            },
-            "RelyingParty": "http://auth.xboxlive.com",
-            "TokenType": "JWT",
-        }
-        body = json.dumps(payload, separators=(",", ":"))
-        sig = self.signer.sign_xbox_request(XBL_TITLE_AUTH_URL, "", body)
-        headers = self._xbl_base_headers(sig, contract_version="1")
-        resp = self.session.post(XBL_TITLE_AUTH_URL, headers=headers, data=body, timeout=15)
-        resp.raise_for_status()
-        ret = resp.json()
-        self.xbl_cache.set_cached_partial({"titleToken": ret})
-        return ret["Token"]
+    def _all_msa_token_candidates(self, msa_token: str) -> list[str]:
+        cached_live = self.live_cache.get_cached().get("token") or {}
+        extra = cached_live.get("extra_tokens") if isinstance(cached_live.get("extra_tokens"), dict) else {}
+        raw_list = []
+        for k in (
+            "ns_del_jwt",
+            "ns_del_mbi",
+            "ns_del_raw",
+            "ns_del_svc",
+            "ns_oauth",
+            "ns_mbi",
+            "az_del_jwt",
+            "az_del_mbi",
+            "az_del_svc",
+            "az_oauth",
+            "ux2_ns",
+        ):
+            v = extra.get(k)
+            if isinstance(v, str) and v and not k.endswith("_err") and v not in raw_list:
+                raw_list.append(v)
+        if msa_token and msa_token not in raw_list:
+            raw_list.append(msa_token)
+        return raw_list
 
-    def _get_xsts_token(self, user_token: str, device_token: str, title_token: str, relying_party: str) -> dict:
+    def _sisu_authorize(self, msa_token: str, relying_party: str = MC_XSTS_RELYING_PARTY) -> dict:
+        """
+        Authorize via Xbox Live SISU (https://sisu.xboxlive.com/authorize).
+        """
+        app_configs = [
+            (NINTENDO_SWITCH_TITLE_ID, "Nintendo"),
+            (AZURE_APP_CLIENT_ID, "Win32"),
+        ]
+        last_err = None
+        dt_by_type: dict[str, str] = {}
+
+        for tok_val in self._all_msa_token_candidates(msa_token):
+            raw = tok_val[2:] if tok_val.startswith(("t=", "d=")) else tok_val
+            ticket_cands = [f"t={raw}", f"d={raw}", raw]
+            for app_id, dev_type in app_configs:
+                try:
+                    if dev_type not in dt_by_type:
+                        dt_by_type[dev_type] = self._get_xbl_device_token(dev_type)
+                    dt = dt_by_type[dev_type]
+                except Exception as e:
+                    last_err = e
+                    continue
+
+                for rps_ticket in ticket_cands:
+                    payload = {
+                        "AccessToken": rps_ticket,
+                        "AppId": app_id,
+                        "DeviceToken": dt,
+                        "Sandbox": "RETAIL",
+                        "UseModernGamertag": True,
+                        "SiteName": "user.auth.xboxlive.com",
+                        "RelyingParty": relying_party,
+                        "ProofKey": self.signer.jwk,
+                    }
+                    body = json.dumps(payload, separators=(",", ":"))
+                    sig = self.signer.sign_xbox_request(XBL_SISU_AUTHORIZE_URL, "", body)
+                    headers = self._xbl_base_headers(sig, contract_version="1")
+                    resp = self.session.post(XBL_SISU_AUTHORIZE_URL, headers=headers, data=body, timeout=15)
+                    if not resp.ok:
+                        try:
+                            err_json = resp.json()
+                            xerr = int(err_json.get("XErr", 0) or 0)
+                            if xerr in XBOX_LIVE_ERRORS:
+                                raise RuntimeError(XBOX_LIVE_ERRORS[xerr])
+                        except RuntimeError:
+                            raise
+                        except Exception:
+                            pass
+                        last_err = RuntimeError(
+                            f"SISU authorize failed ({resp.status_code}) for AppId {app_id}: {resp.text[:200]}"
+                        )
+                        continue
+
+                    ret = resp.json()
+                    cache_updates = {}
+                    if isinstance(ret.get("UserToken"), dict):
+                        cache_updates["userToken"] = ret["UserToken"]
+                    if isinstance(ret.get("TitleToken"), dict):
+                        cache_updates["titleToken"] = ret["TitleToken"]
+                    if cache_updates:
+                        self.xbl_cache.set_cached_partial(cache_updates)
+
+                    auth_tok = ret.get("AuthorizationToken")
+                    if isinstance(auth_tok, dict) and auth_tok.get("Token"):
+                        xui = auth_tok["DisplayClaims"]["xui"][0]
+                        xsts = {
+                            "userXUID": xui.get("xid") or None,
+                            "userHash": xui["uhs"],
+                            "XSTSToken": auth_tok["Token"],
+                            "expiresOn": auth_tok["NotAfter"],
+                        }
+                        self.xbl_cache.set_cached_partial({_create_hash(relying_party): xsts})
+                        return xsts
+
+                    ut_tok = (ret.get("UserToken") or {}).get("Token")
+                    tt_tok = (ret.get("TitleToken") or {}).get("Token")
+                    if ut_tok and tt_tok:
+                        return self._get_xsts_token(ut_tok, dt, tt_tok, relying_party)
+
+        if last_err:
+            raise last_err
+        raise RuntimeError("Xbox Live SISU authorization failed.")
+
+    def _get_xbl_title_token(self, msa_token: str, device_token: str) -> str:
+        last_resp = None
+        for tok_val in self._all_msa_token_candidates(msa_token):
+            raw = tok_val[2:] if tok_val.startswith(("t=", "d=")) else tok_val
+            for rps_ticket in (f"d={raw}", f"t={raw}", raw):
+                payload = {
+                    "Properties": {
+                        "AuthMethod": "RPS",
+                        "DeviceToken": device_token,
+                        "RpsTicket": rps_ticket,
+                        "SiteName": "user.auth.xboxlive.com",
+                        "ProofKey": self.signer.jwk,
+                    },
+                    "RelyingParty": "http://auth.xboxlive.com",
+                    "TokenType": "JWT",
+                }
+                body = json.dumps(payload, separators=(",", ":"))
+                sig = self.signer.sign_xbox_request(XBL_TITLE_AUTH_URL, "", body)
+                headers = self._xbl_base_headers(sig, contract_version="1")
+                resp = self.session.post(XBL_TITLE_AUTH_URL, headers=headers, data=body, timeout=15)
+                last_resp = resp
+                if resp.ok:
+                    ret = resp.json()
+                    self.xbl_cache.set_cached_partial({"titleToken": ret})
+                    return ret["Token"]
+        last_resp.raise_for_status()
+
+    def _get_xsts_token(
+        self,
+        user_token: str,
+        device_token: str | None,
+        title_token: str | None,
+        relying_party: str,
+    ) -> dict:
+        props = {
+            "UserTokens": [user_token],
+            "SandboxId": "RETAIL",
+        }
+        if device_token:
+            props["DeviceToken"] = device_token
+        if title_token:
+            props["TitleToken"] = title_token
+        if device_token or title_token:
+            props["ProofKey"] = self.signer.jwk
+
         payload = {
             "RelyingParty": relying_party,
             "TokenType": "JWT",
-            "Properties": {
-                "UserTokens": [user_token],
-                "DeviceToken": device_token,
-                "TitleToken": title_token,
-                "ProofKey": self.signer.jwk,
-                "SandboxId": "RETAIL",
-            },
+            "Properties": props,
         }
         body = json.dumps(payload, separators=(",", ":"))
         sig = self.signer.sign_xbox_request(XBL_XSTS_AUTH_URL, "", body)
@@ -463,15 +690,54 @@ class PurePythonAuthFlow:
                 return cached_xsts
 
         # Obtain fresh tokens signed with our current P-256 session key
+        if self.use_wam:
+            msal_tok = self._msal_broker_token()
+            ut = self._get_xbl_user_token("d=" + msal_tok)
+            return self._get_xsts_token(ut, None, None, relying_party)
+
         for attempt in range(2):
             try:
                 msa_token = self.get_msa_token(force_refresh=(attempt > 0 or force_refresh))
-                ut = self._get_xbl_user_token(msa_token)
-                dt = self._get_xbl_device_token()
-                tt = self._get_xbl_title_token(msa_token, dt)
-                return self._get_xsts_token(ut, dt, tt, relying_party)
+
+                cached_live = self.live_cache.get_cached().get("token") or {}
+                is_wam_token = bool(self.use_wam or cached_live.get("wam_account_id"))
+
+                if is_wam_token:
+                    # For Minecraft Services (rp://api.minecraftservices.com/), an embedded TitleToken
+                    # claim in the XSTSToken is mandatory (otherwise login_with_xbox returns 403 Forbidden).
+                    # Windows WAM (RST2.srf) tickets obtain TitleToken + XSTSToken via SISU authorize.
+                    if relying_party == MC_XSTS_RELYING_PARTY:
+                        ut = self._get_xbl_user_token(msa_token)
+                        for dev_type in ("Nintendo", "Win32"):
+                            try:
+                                dt = self._get_xbl_device_token(dev_type)
+                                tt = self._get_xbl_title_token(msa_token, dt)
+                                return self._get_xsts_token(ut, dt, tt, relying_party)
+                            except Exception as title_err:
+                                if any(msg in str(title_err) for msg in XBOX_LIVE_ERRORS.values()):
+                                    raise
+                        return self._sisu_authorize(msa_token, relying_party)
+                    else:
+                        ut = self._get_xbl_user_token(msa_token)
+                        try:
+                            return self._get_xsts_token(ut, None, None, relying_party)
+                        except Exception as xsts_err:
+                            if any(msg in str(xsts_err) for msg in XBOX_LIVE_ERRORS.values()):
+                                raise
+                            return self._sisu_authorize(msa_token, relying_party)
+                else:
+                    ut = self._get_xbl_user_token(msa_token)
+                    dt = self._get_xbl_device_token()
+                    try:
+                        tt = self._get_xbl_title_token(msa_token, dt)
+                        return self._get_xsts_token(ut, dt, tt, relying_party)
+                    except Exception:
+                        try:
+                            return self._sisu_authorize(msa_token, relying_party)
+                        except Exception:
+                            return self._get_xsts_token(ut, None, None, relying_party)
             except Exception:
-                if attempt == 1:
+                if attempt == 1 or getattr(self, "_last_msa_was_interactive", False):
                     raise
 
     # --- Minecraft Java Token & Profile ---
@@ -488,15 +754,27 @@ class PurePythonAuthFlow:
             for attempt in range(2):
                 try:
                     xsts = self.get_xbox_token(MC_XSTS_RELYING_PARTY, force_refresh=(attempt > 0))
+                    xbl_auth_str = f"XBL3.0 x={xsts['userHash']};{xsts['XSTSToken']}"
+                    req_headers = {
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "User-Agent": "MinecraftLauncher/2.2.10675",
+                    }
                     resp = self.session.post(
                         MC_LOGIN_WITH_XBOX_URL,
-                        headers={
-                            "Content-Type": "application/json",
-                            "User-Agent": "MinecraftLauncher/2.2.10675",
-                        },
-                        json={"identityToken": f"XBL3.0 x={xsts['userHash']};{xsts['XSTSToken']}"},
+                        headers=req_headers,
+                        json={"identityToken": xbl_auth_str},
                         timeout=15,
                     )
+                    if not resp.ok:
+                        alt_resp = self.session.post(
+                            MC_LAUNCHER_LOGIN_URL,
+                            headers=req_headers,
+                            json={"xtoken": xbl_auth_str, "platform": "PC_LAUNCHER"},
+                            timeout=15,
+                        )
+                        if alt_resp.ok:
+                            resp = alt_resp
                     resp.raise_for_status()
                     mc_data = resp.json()
                     mc_data_to_save = dict(mc_data)
@@ -505,7 +783,7 @@ class PurePythonAuthFlow:
                     mc_token = mc_data["access_token"]
                     break
                 except Exception:
-                    if attempt == 1:
+                    if attempt == 1 or getattr(self, "_last_msa_was_interactive", False):
                         raise
 
         # Fetch Minecraft Java profile
@@ -549,6 +827,10 @@ def main():
     parser.add_argument("--logout", action="store_true", help="Log out by clearing the authentication cache.")
     parser.add_argument("--json", action="store_true", help="Output the result in JSON format.")
     parser.add_argument("--profile", default="default_account", help="The profile name to authenticate as.")
+    parser.add_argument("--login-hint", default=None, help="Optional Microsoft account email to pre-select during login.")
+    parser.add_argument("--wam", action="store_true", help="Authenticate using Windows WebAccountManager (Windows Security popup).")
+    parser.add_argument("--wam-id", default=None, help="Optional Windows WebAccount ID or CID.")
+    parser.add_argument("--hwnd", type=int, default=0, help="Optional parent window handle for Windows Security dialog.")
     args = parser.parse_args()
 
     _pkg_dir = Path(__file__).resolve().parent
@@ -586,7 +868,15 @@ def main():
         print("Initializing Microsoft Authentication...")
 
     try:
-        authflow = PurePythonAuthFlow(args.profile, cache_dir, is_json=args.json)
+        authflow = PurePythonAuthFlow(
+            args.profile,
+            cache_dir,
+            is_json=args.json,
+            login_hint=args.login_hint,
+            use_wam=args.wam,
+            wam_id=args.wam_id,
+            hwnd=args.hwnd,
+        )
         mc_token, mc_profile = authflow.get_minecraft_java_token()
 
         # Fetch Xbox Gamertag, Gamerpic, and Gamerscore
@@ -659,23 +949,26 @@ def main():
         hex_color = _calculate_locator_bar_color(mc_profile["id"])
 
         if args.json:
+            out_payload = {
+                "xbox_gamertag": gamertag,
+                "xbox_gamerpic_url": gamerpic,
+                "xbox_gamerscore": gamerscore,
+                "xbox_xuid": xsts.get("userXUID"),
+                "mc_username": mc_profile["name"],
+                "mc_uuid": mc_profile["id"],
+                "mc_access_token": mc_token,
+                "launch_client_id": launch_client_id,
+                "azure_client_id": AZURE_APP_CLIENT_ID,
+                "locator_bar_color": hex_color,
+                "xbox_presence_state": presence_state,
+                "owns_minecraft": owns_minecraft,
+            }
+            if authflow.obtained_msa_email:
+                out_payload["msa_email"] = authflow.obtained_msa_email
+            if authflow.obtained_wam_account_id:
+                out_payload["wam_account_id"] = authflow.obtained_wam_account_id
             print(
-                json.dumps(
-                    {
-                        "xbox_gamertag": gamertag,
-                        "xbox_gamerpic_url": gamerpic,
-                        "xbox_gamerscore": gamerscore,
-                        "xbox_xuid": xsts.get("userXUID"),
-                        "mc_username": mc_profile["name"],
-                        "mc_uuid": mc_profile["id"],
-                        "mc_access_token": mc_token,
-                        "launch_client_id": launch_client_id,
-                        "azure_client_id": AZURE_APP_CLIENT_ID,
-                        "locator_bar_color": hex_color,
-                        "xbox_presence_state": presence_state,
-                        "owns_minecraft": owns_minecraft,
-                    }
-                ),
+                json.dumps(out_payload),
                 flush=True,
             )
         else:

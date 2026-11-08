@@ -96,7 +96,7 @@ from utils import (
     save_launcher_config, get_auth_cache, save_auth_cache, clear_auth_cache, get_active_profile_id, load_accounts, save_accounts, 
     has_any_downloads, delete_all_downloads, has_any_source, delete_source_folder, fetch_player_textures,
     is_minecraft_window_visible, get_desktop_dir, get_start_menu_programs_dir, create_windows_shortcut,
-    calculate_locator_bar_color
+    calculate_locator_bar_color, get_windows_linked_microsoft_accounts
 )
 
 import struct
@@ -2278,6 +2278,114 @@ class AccountSwitchDialog(QDialog):
         self.accept()
 
 
+class WindowsLinkedAccountsDialog(QDialog):
+    """
+    Dialog presented before login that displays all Microsoft accounts currently linked
+    with Windows and asks whether the user wants to log in with one of them or proceed
+    to the other login method.
+    """
+    def __init__(self, linked_accounts: List[Dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Microsoft Accounts Linked with Windows")
+        self.setFixedSize(440, 360)
+
+        self.linked_accounts = linked_accounts or []
+        self.selected_account: Optional[Dict] = None
+        self.use_other_method: bool = False
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        header_lbl = QLabel(
+            "The following Microsoft account(s) are currently linked with Windows.\n"
+            "Would you like to log in with one of these accounts?"
+        )
+        header_lbl.setWordWrap(True)
+        header_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        layout.addWidget(header_lbl)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setStyleSheet(
+            "QListWidget::item { padding: 10px; border-bottom: 1px solid #ccc; } "
+            "QListWidget::item:selected { background-color: #0078D7; color: white; }"
+        )
+        self.list_widget.setIconSize(QtCore.QSize(32, 32))
+        self.list_widget.itemDoubleClicked.connect(lambda _: self.login_with_selected())
+        layout.addWidget(self.list_widget, stretch=1)
+
+        ms_icon_path = get_image_path("icons8-xbox-24.svg")
+        default_icon = QIcon(ms_icon_path) if os.path.exists(ms_icon_path) else QIcon()
+
+        for acc in self.linked_accounts:
+            email = acc.get("email", "")
+            disp = acc.get("display_name", "")
+            source = acc.get("source", "Windows Account")
+            mc_name = acc.get("mc_username", "")
+            gt = acc.get("xbox_gamertag", "")
+
+            if disp and disp.lower() != email.lower():
+                line1 = f"{disp} ({email})"
+            else:
+                line1 = email
+
+            details = [source]
+            if mc_name:
+                details.append(f"Minecraft: {mc_name}")
+            elif gt and gt.lower() != disp.lower():
+                details.append(f"Xbox: {gt}")
+            text = f"{line1}\n   [{' | '.join(details)}]"
+
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, acc)
+
+            pid = acc.get("cached_profile_id")
+            pic_path = f".cache/{pid}/gamerpic.png" if pid else ""
+            if pic_path and os.path.exists(pic_path):
+                item.setIcon(QIcon(pic_path))
+            elif not default_icon.isNull():
+                item.setIcon(default_icon)
+
+            self.list_widget.addItem(item)
+
+        if self.list_widget.count() > 0:
+            self.list_widget.setCurrentRow(0)
+
+        self.login_selected_btn = QPushButton("Yes, Login with Selected Account")
+        self.login_selected_btn.setDefault(True)
+        self.login_selected_btn.setFixedHeight(32)
+        self.login_selected_btn.setStyleSheet("font-weight: bold;")
+        self.login_selected_btn.clicked.connect(self.login_with_selected)
+        layout.addWidget(self.login_selected_btn)
+
+        bottom_row = QHBoxLayout()
+        self.other_method_btn = QPushButton("No, Use Other Login Method")
+        self.other_method_btn.setFixedHeight(30)
+        self.other_method_btn.clicked.connect(self.proceed_other_method)
+        bottom_row.addWidget(self.other_method_btn, stretch=1)
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setFixedHeight(30)
+        self.cancel_btn.clicked.connect(self.reject)
+        bottom_row.addWidget(self.cancel_btn)
+
+        layout.addLayout(bottom_row)
+
+    def login_with_selected(self):
+        item = self.list_widget.currentItem()
+        if not item and self.list_widget.count() > 0:
+            item = self.list_widget.item(0)
+        if not item:
+            return
+        self.selected_account = item.data(Qt.ItemDataRole.UserRole)
+        self.use_other_method = False
+        self.accept()
+
+    def proceed_other_method(self):
+        self.selected_account = None
+        self.use_other_method = True
+        self.accept()
+
+
 class DownloadPipelineWorker(QtCore.QThread):
     progress_sig = QtCore.pyqtSignal(int, int, str, float, str)
     log_sig = QtCore.pyqtSignal(str)
@@ -3201,30 +3309,91 @@ class LauncherGUI(QMainWindow):
                 self._force_new_login = True
                 self.do_login()
 
+    def _prompt_windows_linked_accounts(self) -> tuple:
+        """
+        Check for Microsoft accounts currently linked with Windows and ask the user
+        if they want to log in with one of those accounts before proceeding to the
+        other login method.
+        Returns (should_proceed: bool, selected_account: Optional[dict]).
+        """
+        try:
+            linked_accounts = get_windows_linked_microsoft_accounts()
+        except Exception as e:
+            self.log(f"[Warning] Could not query Windows-linked Microsoft accounts: {e}")
+            linked_accounts = []
+
+        if not linked_accounts:
+            return True, None
+
+        dialog = WindowsLinkedAccountsDialog(linked_accounts, parent=self)
+        result = dialog.exec()
+        if result != QDialog.DialogCode.Accepted:
+            self.log("[System] Login cancelled by user.")
+            return False, None
+
+        if dialog.use_other_method or not dialog.selected_account:
+            self.log("[System] Proceeding with standard login method...")
+            return True, None
+
+        selected = dialog.selected_account
+        self.log(f"[System] Selected Windows-linked Microsoft account: {selected.get('email')}")
+        return True, selected
+
     def do_login(self):
+        self.clear_progress_error()
+        self.task_progress_bar.setVisible(False)
+        self.step_progress_bar.setVisible(False)
+
+        proceed, selected_win_acc = self._prompt_windows_linked_accounts()
+        if not proceed:
+            self._force_new_login = False
+            self.update_profile_banner()
+            self.update_ui_state()
+            return
+
+        self.clear_progress_error()
         self.log("Starting Microsoft authentication...")
         self.is_just_logging_in = True
         self.is_authenticating = True
         self._login_succeeded = False
+        self._browser_auth_done = False
+        self._pending_login_hint = selected_win_acc.get("email") if isinstance(selected_win_acc, dict) else None
 
-        self.status_label.setText("Authenticating...")
+        self.status_label.setText("Authenticating with Microsoft...")
         self.update_ui_state()
         
         self.step_progress_bar.setRange(0, 0)
+        self.step_progress_bar.setFormat("Authenticating with Microsoft...")
         self.step_progress_bar.setVisible(True)
 
         current_profile = get_active_profile_id()
         force = getattr(self, "_force_new_login", False)
-        if force:
+        cached_pid = selected_win_acc.get("cached_profile_id") if isinstance(selected_win_acc, dict) else None
+
+        if cached_pid:
+            # Reuse the existing profile associated with this Windows-linked Microsoft account
+            self.previous_active_profile = current_profile
+            accounts = load_accounts()
+            accounts["active_profile"] = cached_pid
+            save_accounts(accounts)
+            self._auth_cancelled_profile = cached_pid
+        elif force or self._pending_login_hint:
             self.previous_active_profile = current_profile
             self._auth_cancelled_profile = get_active_profile_id(True)
         else:
             self.previous_active_profile = None
             self._auth_cancelled_profile = current_profile
 
+        cmd_args = [get_script_path("get_mc_username.py"), "--json", "--profile", self._auth_cancelled_profile]
+        if isinstance(selected_win_acc, dict) and self._pending_login_hint:
+            cmd_args.extend(["--wam", "--login-hint", self._pending_login_hint, "--hwnd", str(int(self.winId()))])
+            wam_id = selected_win_acc.get("wam_account_id") or selected_win_acc.get("cid")
+            if wam_id:
+                cmd_args.extend(["--wam-id", str(wam_id)])
+
         self.process = QProcess()
         self.process.setProgram(get_python_cli_executable())
-        self.process.setArguments([get_script_path("get_mc_username.py"), "--json", "--profile", self._auth_cancelled_profile])
+        self.process.setArguments(cmd_args)
         self._force_new_login = False
         self.process.readyReadStandardOutput.connect(self.handle_auth_stdout)
         self.process.readyReadStandardError.connect(self.handle_stderr)
@@ -3660,6 +3829,25 @@ class LauncherGUI(QMainWindow):
             return
 
         # Step 1: Authentication
+        proceed, selected_win_acc = self._prompt_windows_linked_accounts()
+        if not proceed:
+            self._force_new_login = False
+            self.is_pipeline_running = False
+            self.setWindowTitle("PyMcLauncher")
+            self.status_label.setText("Launch cancelled.")
+            self.update_ui_state()
+            return
+
+        self._pending_login_hint = selected_win_acc.get("email") if isinstance(selected_win_acc, dict) else None
+        cached_pid = selected_win_acc.get("cached_profile_id") if isinstance(selected_win_acc, dict) else None
+        if cached_pid:
+            accounts = load_accounts()
+            accounts["active_profile"] = cached_pid
+            save_accounts(accounts)
+            target_profile_id = cached_pid
+        else:
+            target_profile_id = get_active_profile_id(getattr(self, "_force_new_login", False))
+
         self.is_authenticating = True
         self.set_progress_visible(True)
         self.status_label.setText("[1/6] Authenticating with Microsoft...")
@@ -3670,9 +3858,17 @@ class LauncherGUI(QMainWindow):
         self.task_progress_bar.setFormat("Current Task: %p%")
         
         self.is_just_logging_in = False
+        self._browser_auth_done = False
+        cmd_args = [get_script_path("get_mc_username.py"), "--json", "--profile", target_profile_id]
+        if isinstance(selected_win_acc, dict) and self._pending_login_hint:
+            cmd_args.extend(["--wam", "--login-hint", self._pending_login_hint, "--hwnd", str(int(self.winId()))])
+            wam_id = selected_win_acc.get("wam_account_id") or selected_win_acc.get("cid")
+            if wam_id:
+                cmd_args.extend(["--wam-id", str(wam_id)])
+
         self.process = QProcess()
         self.process.setProgram(get_python_cli_executable())
-        self.process.setArguments([get_script_path("get_mc_username.py"), "--json", "--profile", get_active_profile_id(getattr(self, "_force_new_login", False))])
+        self.process.setArguments(cmd_args)
         self._force_new_login = False
         self.process.readyReadStandardOutput.connect(self.handle_auth_stdout)
         self.process.readyReadStandardError.connect(self.handle_stderr)
@@ -3697,8 +3893,11 @@ class LauncherGUI(QMainWindow):
             if obj.get("status") == "pending_login":
                 self.log("[System] Waiting for user to complete Microsoft login in browser...")
                 url = obj.get("verification_uri")
-                self.open_browser(url)
+                hint = obj.get("login_hint") or getattr(self, "_pending_login_hint", None)
+                self.open_browser(url, login_hint=hint)
             elif "mc_username" in obj:
+                if getattr(self, "_pending_login_hint", None) and not obj.get("msa_email"):
+                    obj["msa_email"] = self._pending_login_hint
                 self.auth_data = obj
                 self._login_succeeded = True
                 save_auth_cache(obj)
@@ -4189,7 +4388,7 @@ class LauncherGUI(QMainWindow):
         self.update_ui_state()
 
     # --- Browser Window Code (from old GUI) ---
-    def open_browser(self, url):
+    def open_browser(self, url, login_hint: Optional[str] = None):
         class LoginBrowserWindow(QMainWindow):
             def __init__(self, parent_launcher):
                 super().__init__()
@@ -4203,11 +4402,17 @@ class LauncherGUI(QMainWindow):
                 # Immediately destroy the browser to violently abort any active Passkey/WebAuthn prompts
                 self.parent_launcher._cleanup_browser()
                 
-                if getattr(self.parent_launcher, 'is_just_logging_in', False) and not getattr(self.parent_launcher, '_login_succeeded', False):
+                if (
+                    getattr(self.parent_launcher, 'is_just_logging_in', False)
+                    and not getattr(self.parent_launcher, '_login_succeeded', False)
+                    and not getattr(self.parent_launcher, '_browser_auth_done', False)
+                ):
                     if getattr(self.parent_launcher, 'process', None):
                         self.parent_launcher.process.kill()
                 super().closeEvent(event)
 
+        self._browser_login_hint = (login_hint or "").strip() or None
+        self._browser_auth_done = False
         self.browser_window = LoginBrowserWindow(self)
         self.browser_window.setWindowTitle("Microsoft Login - Minecraft Launcher")
         self.browser_window.setFixedSize(600, 750)
@@ -4326,6 +4531,16 @@ class LauncherGUI(QMainWindow):
                 self.parent_gui = parent_gui
                 
             def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
+                if message == "AGY_LOGIN_PAGE_COMPLETE":
+                    self.parent_gui._browser_auth_done = True
+                    if getattr(self.parent_gui, "browser_window", None):
+                        self.parent_gui.browser_window.hide()
+                    self.parent_gui.step_progress_bar.setVisible(True)
+                    self.parent_gui.step_progress_bar.setRange(0, 0)
+                    self.parent_gui.step_progress_bar.setFormat("Completing Microsoft Sign-In...")
+                    self.parent_gui.status_label.setText("Completing sign-in and fetching Minecraft profile...")
+                    QApplication.processEvents()
+                    return
                 if message == "AGY_WEBAUTHN_START":
                     self.parent_gui._set_webauthn_loading(js_active=True)
                     return
@@ -4476,17 +4691,45 @@ class LauncherGUI(QMainWindow):
                 self.loading_widget.hide()
         if ok and getattr(self, 'browser', None):
             self.browser.page().runJavaScript("""
-                setTimeout(function() {
-                    var btn = document.querySelector('#idSIButton9, input[type=submit], button[type=submit]');
-                    if(btn && btn.value !== 'Cancel' && btn.innerText !== 'Cancel') {
-                        btn.click();
+                (function() {
+                    function checkCompleteAndClick() {
+                        var bodyText = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : "";
+                        var completeEl = document.querySelector('#message_Complete, #idDiv_RemoteConnect_Success');
+                        if (
+                            completeEl ||
+                            bodyText.indexOf("you have signed in") !== -1 ||
+                            bodyText.indexOf("you're signed in") !== -1 ||
+                            bodyText.indexOf("you have now logged in") !== -1 ||
+                            bodyText.indexOf("you can close this window") !== -1 ||
+                            bodyText.indexOf("you can now close this window") !== -1
+                        ) {
+                            console.log("AGY_LOGIN_PAGE_COMPLETE");
+                            return;
+                        }
+
+                        // Do not auto-click Next if a visible empty email or password input is waiting for the user
+                        var visibleInputs = document.querySelectorAll('input[type="email"], input[name="loginfmt"], input[type="password"], input[name="passwd"]');
+                        for (var i = 0; i < visibleInputs.length; i++) {
+                            var inp = visibleInputs[i];
+                            if (inp.offsetParent !== null && !inp.value) {
+                                return;
+                            }
+                        }
+
+                        var btn = document.querySelector('#idSIButton9, #acceptButton, [data-testid="appConsentPrimaryButton"], input[type=submit], button[type=submit]');
+                        if (btn && btn.offsetParent !== null && btn.value !== 'Cancel' && btn.innerText !== 'Cancel') {
+                            btn.click();
+                        }
                     }
-                }, 500);
+                    setTimeout(checkCompleteAndClick, 400);
+                    setTimeout(checkCompleteAndClick, 1000);
+                })();
             """)
 
     def on_browser_url_changed(self, url):
         url_str = url.toString()
         if "login.live.com/undefined" in url_str or "oauth20_desktop.srf" in url_str:
+            self._browser_auth_done = True
             if self.browser_window:
                 self.browser_window.hide()
             self.step_progress_bar.setVisible(True)

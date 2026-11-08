@@ -4,3 +4,4 @@ PyQt6-WebEngine
 minecraft-launcher-lib
 nbt
 nbtlib
+msal[broker]>=1.30.0

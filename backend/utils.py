@@ -878,6 +878,9 @@ def _deduplicate_accounts(accounts: dict, prefer_pid: str = None) -> tuple[dict,
                     break
         if matched_group is not None:
             matched_group[0].append(pid)
+            old_email = matched_group[1].get("msa_email") if isinstance(matched_group[1], dict) else None
+            if old_email and isinstance(pdata, dict) and not pdata.get("msa_email"):
+                pdata["msa_email"] = old_email
             matched_group[1] = pdata  # Later entry has fresher auth data/tokens
             matched_group[2].update(akeys)
             modified = True
@@ -1463,4 +1466,361 @@ def create_windows_shortcut(
         return False, (res.stderr.strip() or f"PowerShell exited with code {res.returncode}")
     except Exception as e:
         return False, str(e)
+
+
+def get_windows_linked_microsoft_accounts() -> list:
+    """
+    Discover personal Microsoft accounts (MSA) currently linked with Windows
+    (Settings > Accounts > Your info / Email & accounts, IdentityCRL, Personal OneDrive,
+    XboxLive, Office LiveId, and Windows MicrosoftAccount security groups).
+
+    Excludes school/work organizational accounts (Azure AD / Entra ID / .edu / .ac / etc.)
+    and never scrapes raw binary cache files.
+
+    Returns a deduplicated list of dicts:
+        [
+            {
+                "email": "user@example.com",
+                "display_name": "Optional Display Name",
+                "source": "Windows Account",
+                "cid": "optional_msa_cid",
+                "wam_account_id": "optional_wam_id",
+                "cached_profile_id": "optional_profile_uuid",
+                "mc_username": "OptionalMCName",
+                "xbox_gamertag": "OptionalGamertag",
+            },
+            ...
+        ]
+    """
+    if os.name != "nt":
+        return []
+
+    import re
+
+    email_re = re.compile(r"^[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]{2,}\.[A-Za-z]{2,12}$")
+
+    ignored_domains = {
+        "example.com",
+        "localhost",
+        "microsoft.com",
+        "windows.com",
+        "xbox.com",
+        "xboxlive.com",
+        "minecraft.net",
+        "mojang.com",
+    }
+
+    # Known consumer email providers and valid top-level domains
+    known_consumer_domains = {
+        "outlook.com", "hotmail.com", "live.com", "msn.com", "passport.com",
+        "gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "icloud.com",
+        "me.com", "mac.com", "aol.com", "protonmail.com", "proton.me",
+        "zoho.com", "gmx.com", "gmx.de", "web.de", "mail.com", "fastmail.com",
+        "btinternet.com", "sky.com", "virginmedia.com", "talktalk.net",
+        "comcast.net", "att.net", "verizon.net", "sbcglobal.net", "cox.net",
+        "charter.net", "shaw.ca", "rogers.com", "bell.net", "telus.net",
+        "optusnet.com.au", "bigpond.com", "xtra.co.nz", "free.fr", "orange.fr",
+        "wanadoo.fr", "sfr.fr", "laposte.net", "t-online.de", "freenet.de",
+        "libero.it", "alice.it", "tin.it", "virgilio.it", "wp.pl", "onet.pl",
+        "interia.pl", "o2.pl", "seznam.cz", "qq.com", "163.com", "126.com",
+        "naver.com", "daum.net", "hanmail.net", "yahoo.co.uk", "yahoo.co.jp",
+        "yahoo.ca", "yahoo.com.au", "yahoo.fr", "yahoo.de", "yahoo.es",
+        "yahoo.it", "yahoo.com.br", "hotmail.co.uk", "hotmail.fr", "hotmail.de",
+        "hotmail.it", "hotmail.es", "hotmail.ca", "live.co.uk", "live.fr",
+        "live.de", "live.it", "live.nl", "live.ca", "live.com.au",
+        "outlook.co.uk", "outlook.fr", "outlook.de", "outlook.es", "outlook.it",
+        "outlook.jp", "outlook.com.au", "outlook.com.br", "outlook.kr",
+    }
+
+    valid_tlds = {
+        "com", "net", "org", "io", "me", "co", "us", "uk", "ca", "au", "nz",
+        "de", "fr", "es", "it", "nl", "be", "ch", "at", "se", "no", "dk",
+        "fi", "ie", "pt", "pl", "cz", "sk", "hu", "ro", "bg", "gr", "tr",
+        "ru", "ua", "il", "ae", "sa", "za", "in", "sg", "my", "ph", "th",
+        "vn", "id", "jp", "kr", "tw", "hk", "cn", "br", "mx", "ar", "cl",
+        "co", "pe", "xyz", "dev", "app", "tech", "online", "site", "email",
+        "live", "outlook", "hotmail", "msn",
+    }
+
+    def _is_valid_personal_email(clean: str) -> bool:
+        if not email_re.match(clean):
+            return False
+        local_part, domain = clean.rsplit("@", 1)
+        domain = domain.lower()
+        if domain in ignored_domains:
+            return False
+
+        # Reject school, university, government, and Azure AD tenant domains
+        school_or_org_patterns = (
+            ".edu", ".ac.", ".sch.", ".school", ".k12.", ".gov", ".mil",
+            ".onmicrosoft.com", ".internal", ".local", ".corp", ".lan",
+            "student.", "students.", "school.", "college.", "uni.", "university.",
+        )
+        for pat in school_or_org_patterns:
+            if domain.endswith(pat) or pat in domain:
+                return False
+
+        # Validate domain labels and TLD so bogus strings like GC@i.xi are rejected
+        labels = domain.split(".")
+        if len(labels) < 2:
+            return False
+        if any(len(lbl) < 2 for lbl in labels[:-1]):
+            return False
+        tld = labels[-1]
+        if domain not in known_consumer_domains and tld not in valid_tlds:
+            return False
+
+        # Ignore machine/GUID-like local parts
+        if len(local_part) >= 32 and all(c in "0123456789abcdefABCDEF-" for c in local_part):
+            return False
+        return True
+
+    discovered = {}  # lower_email -> dict
+
+    def _add_account(email_str: str, display_name: str = "", source: str = "Windows Account", cid: str = ""):
+        if not email_str or not isinstance(email_str, str):
+            return
+        clean = email_str.strip().strip("\x00\"'<>()[]{};, ")
+        if "\\" in clean:
+            prefix, rest = clean.split("\\", 1)
+            # Only allow MicrosoftAccount\ prefix, never AzureAD\ or domain\ work accounts
+            if prefix.lower() not in ("microsoftaccount", "msaccount", "live"):
+                return
+            clean = rest.strip()
+        if clean.lower().startswith("microsoftaccount:user="):
+            clean = clean.split("=", 1)[-1].strip()
+        if not _is_valid_personal_email(clean):
+            return
+
+        key = clean.lower()
+        disp = (display_name or "").strip().strip("\x00")
+        if disp.lower() == key:
+            disp = ""
+        cid_clean = (cid or "").strip().strip("\x00")
+
+        if key not in discovered:
+            discovered[key] = {
+                "email": clean,
+                "display_name": disp,
+                "source": source,
+                "cid": cid_clean,
+                "wam_account_id": cid_clean,
+                "cached_profile_id": None,
+                "mc_username": "",
+                "xbox_gamertag": "",
+            }
+        else:
+            if disp and not discovered[key].get("display_name"):
+                discovered[key]["display_name"] = disp
+            if cid_clean and not discovered[key].get("cid"):
+                discovered[key]["cid"] = cid_clean
+                if not discovered[key].get("wam_account_id"):
+                    discovered[key]["wam_account_id"] = cid_clean
+            if source == "Windows Account" and discovered[key].get("source") != "Windows Account":
+                discovered[key]["source"] = source
+
+    # 1. Windows Registry checks (winreg) — Personal Microsoft Accounts only
+    try:
+        import winreg
+
+        def _read_reg_str(key_handle, val_name: str) -> str:
+            try:
+                val, _ = winreg.QueryValueEx(key_handle, val_name)
+                return str(val).strip() if val else ""
+            except Exception:
+                return ""
+
+        # 1a. HKCU\Software\Microsoft\IdentityCRL\UserExtendedProperties & StoredIdentities
+        for sub_path, src_label in [
+            (r"Software\Microsoft\IdentityCRL\UserExtendedProperties", "Windows Account"),
+            (r"Software\Microsoft\IdentityCRL\StoredIdentities", "Windows Account"),
+        ]:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub_path) as k:
+                    num_sub, _, _ = winreg.QueryInfoKey(k)
+                    for i in range(num_sub):
+                        sub_name = winreg.EnumKey(k, i)
+                        disp_name = ""
+                        cid_val = ""
+                        try:
+                            with winreg.OpenKey(k, sub_name) as sk:
+                                cid_val = (
+                                    _read_reg_str(sk, "PUID")
+                                    or _read_reg_str(sk, "puid")
+                                    or _read_reg_str(sk, "cid")
+                                    or _read_reg_str(sk, "CID")
+                                )
+                                disp_name = (
+                                    _read_reg_str(sk, "DisplayName")
+                                    or _read_reg_str(sk, "FriendlyName")
+                                    or " ".join(
+                                        p for p in (_read_reg_str(sk, "FirstName"), _read_reg_str(sk, "LastName")) if p
+                                    )
+                                )
+                        except Exception:
+                            pass
+                        _add_account(sub_name, disp_name, src_label, cid=cid_val)
+            except Exception:
+                pass
+
+        # 1b. HKCU\Software\Microsoft\OneDrive\Accounts\Personal (Personal only, skip Business/School)
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\OneDrive\Accounts\Personal") as sk:
+                email_val = _read_reg_str(sk, "UserEmail") or _read_reg_str(sk, "Email")
+                disp_val = _read_reg_str(sk, "DisplayName") or _read_reg_str(sk, "UserName")
+                cid_val = _read_reg_str(sk, "cid") or _read_reg_str(sk, "CID")
+                if email_val:
+                    _add_account(email_val, disp_val, "Windows Account", cid=cid_val)
+        except Exception:
+            pass
+
+        # 1c. HKCU\Software\Microsoft\Office\16.0\Common\Identity\Identities (Consumer 'live' accounts only, skip 'aad'/'orgid' school/work)
+        for office_ver in ("16.0", "15.0"):
+            try:
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    rf"Software\Microsoft\Office\{office_ver}\Common\Identity\Identities",
+                ) as k:
+                    num_sub, _, _ = winreg.QueryInfoKey(k)
+                    for i in range(num_sub):
+                        sub_name = winreg.EnumKey(k, i)
+                        try:
+                            with winreg.OpenKey(k, sub_name) as sk:
+                                prov_type = _read_reg_str(sk, "ProviderType").lower()
+                                sub_lower = sub_name.lower()
+                                # Strictly require consumer 'live' identity; skip 'aad', 'orgid', 'adal' (school/work)
+                                if prov_type == "live" or sub_lower.endswith("_liveid"):
+                                    email_val = _read_reg_str(sk, "EmailAddress") or _read_reg_str(sk, "SigninName")
+                                    disp_val = _read_reg_str(sk, "FriendlyName")
+                                    cid_val = _read_reg_str(sk, "UserId") or sub_name.split("_")[0]
+                                    if email_val:
+                                        _add_account(email_val, disp_val, "Windows Account", cid=cid_val)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # 1d. HKCU\Software\Microsoft\XboxLive
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\XboxLive") as k:
+                email_val = _read_reg_str(k, "UserName") or _read_reg_str(k, "Email")
+                gt_val = _read_reg_str(k, "Gamertag")
+                cid_val = _read_reg_str(k, "cid") or _read_reg_str(k, "CID")
+                if email_val:
+                    _add_account(email_val, gt_val, "Windows / Xbox", cid=cid_val)
+        except Exception:
+            pass
+
+        # 1e. HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI",
+            ) as k:
+                disp_val = _read_reg_str(k, "LastLoggedOnDisplayName")
+                for vname in ("LastLoggedOnUser", "LastLoggedOnSAMUser", "SelectedUser"):
+                    u_val = _read_reg_str(k, vname)
+                    if "@" in u_val and ("\\" not in u_val or u_val.lower().startswith("microsoftaccount\\")):
+                        _add_account(u_val, disp_val, "Windows Sign-In")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # 2. Check Windows security groups / credential manager (whoami /groups & cmdkey /list) for MicrosoftAccount
+    try:
+        import subprocess
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        res = subprocess.run(
+            ["whoami", "/groups"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            creationflags=creationflags,
+        )
+        if res.returncode == 0 and res.stdout:
+            for line in res.stdout.splitlines():
+                if "MicrosoftAccount\\" in line:
+                    part = "MicrosoftAccount\\" + line.split("MicrosoftAccount\\", 1)[1].split()[0].strip()
+                    _add_account(part, "", "Windows Sign-In")
+    except Exception:
+        pass
+
+    try:
+        import subprocess
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        res = subprocess.run(
+            ["cmdkey", "/list"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            creationflags=creationflags,
+        )
+        if res.returncode == 0 and res.stdout:
+            for line in res.stdout.splitlines():
+                if "MicrosoftAccount:user=" in line:
+                    user_part = line.split("MicrosoftAccount:user=", 1)[1].split()[0].strip()
+                    _add_account(user_part, "", "Windows Account")
+    except Exception:
+        pass
+
+    # 3. Match discovered emails against Windows CloudExperienceHost TokenBroker account files (.tbacct)
+    #    so wam_account_id uses the exact TokenBroker account ID when available.
+    try:
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        tb_dir = os.path.join(
+            local_app_data,
+            "Packages",
+            "Microsoft.Windows.CloudExperienceHost_cw5n1h2txyewy",
+            "AC",
+            "TokenBroker",
+            "Accounts",
+        )
+        if os.path.isdir(tb_dir) and discovered:
+            for fname in os.listdir(tb_dir):
+                if not fname.lower().endswith(".tbacct"):
+                    continue
+                stem = os.path.splitext(fname)[0]
+                fpath = os.path.join(tb_dir, fname)
+                try:
+                    with open(fpath, "rb") as f:
+                        raw = f.read(65536)
+                    text_utf16 = raw.decode("utf-16le", errors="ignore").lower()
+                    text_utf8 = raw.decode("utf-8", errors="ignore").lower()
+                    for email_key, acc_info in discovered.items():
+                        if email_key in text_utf16 or email_key in text_utf8:
+                            acc_info["wam_account_id"] = stem
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 4. Cross-reference with existing launcher accounts and wam_tokens.json
+    try:
+        wam_tokens_file = ROOT_DIR / ".cache" / "wam_tokens.json"
+        if wam_tokens_file.exists():
+            wam_data = json.loads(wam_tokens_file.read_text(encoding="utf-8")) or {}
+            for email_key, winfo in wam_data.items():
+                if email_key in discovered and isinstance(winfo, dict) and winfo.get("wam_account_id"):
+                    discovered[email_key]["wam_account_id"] = str(winfo["wam_account_id"])
+    except Exception:
+        pass
+
+    try:
+        accounts_data = load_accounts()
+        for pid, pdata in accounts_data.get("profiles", {}).items():
+            if not isinstance(pdata, dict):
+                continue
+            saved_email = str(pdata.get("msa_email") or "").strip().lower()
+            if saved_email and saved_email in discovered:
+                discovered[saved_email]["cached_profile_id"] = pid
+                discovered[saved_email]["mc_username"] = pdata.get("mc_username", "")
+                discovered[saved_email]["xbox_gamertag"] = pdata.get("xbox_gamertag", "")
+                if pdata.get("wam_account_id"):
+                    discovered[saved_email]["wam_account_id"] = pdata["wam_account_id"]
+    except Exception:
+        pass
+
+    return list(discovered.values())
+
 
