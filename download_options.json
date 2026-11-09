@@ -1,8 +1,7 @@
 {
-    "PC App only (comes with development soon will without)": {
+    "Minecraft Launcher for PC": {
         "Files": [
             "setup-start.bat",
-            "installer_and_updater.py",
             "launcher.py",
             "requirements.txt",
             "README.md",
@@ -13,7 +12,8 @@
             ".cache/",
             "__pycache__/",
             "minecraft_downloads/",
-            "launcher_config.json"
+            "launcher_config.json",
+            "updater_config.json"
         ],
         "Message": "Run the setup-start.bat file first, it will tell you what to do next!"
     }

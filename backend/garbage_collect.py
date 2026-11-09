@@ -12,7 +12,7 @@ for _p in [str(_pkg_dir), str(_root_dir)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from utils import get_download_dir, get_dir, get_downloaded_versions, load_launcher_config
+from utils import get_download_dir, get_dir, get_downloaded_versions, load_launcher_config, load_accounts, get_active_profile_id
 
 
 def _on_rm_error(func, path, exc_info):
@@ -98,7 +98,38 @@ def _expand_dir_for_deletion(dir_path: Path, files_out: list, dirs_out: list, pr
         dirs_out.append((root_p.name, root_p))
 
 
+def _clean_launcher_cache(log_callback=print):
+    """Remove orphaned profile folders and obsolete token files from the .cache folder."""
+    import re
+    cache_root = _root_dir / ".cache"
+    if not cache_root.is_dir():
+        return
+    try:
+        known = set((load_accounts() or {}).get("profiles", {}).keys())
+    except Exception:
+        return  # cannot tell which profiles are valid; delete nothing
+    try:
+        known.add(get_active_profile_id())
+    except Exception:
+        pass
+    uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+    week_ago = time.time() - 7 * 86400
+    for entry in list(cache_root.iterdir()):
+        try:
+            if entry.is_dir() and uuid_re.match(entry.name) and entry.name not in known:
+                if entry.stat().st_mtime < week_ago:
+                    log_callback(f"[Garbage Collection] Removing orphaned profile cache: {entry.name}")
+                    shutil.rmtree(entry, onerror=_on_rm_error)
+            elif entry.is_file() and entry.name == "wam_tokens.json":
+                log_callback("[Garbage Collection] Removing obsolete wam_tokens.json")
+                _safe_unlink(entry)
+        except Exception:
+            pass
+
+
 def perform_garbage_collection(log_callback=print, progress_callback=None):
+    _clean_launcher_cache(log_callback)
+
     base_dir = get_dir("base")
     versions_dir = get_dir("versions")
     assets_dir = get_dir("assets")

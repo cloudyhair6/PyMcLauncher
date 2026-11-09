@@ -2647,6 +2647,81 @@ class InstanceLogWindow(QMainWindow):
         event.accept()
 
 
+class LauncherLogWindow(QMainWindow):
+    """Detached window mirroring the launcher's main console log."""
+    closed_sig = QtCore.pyqtSignal()
+
+    def __init__(self, launcher):
+        super().__init__(None)
+        self.launcher = launcher
+        self.setWindowTitle("PyMcLauncher - Log")
+        self.resize(800, 500)
+        self.setWindowIcon(launcher.windowIcon())
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        lay = QVBoxLayout(central)
+        lay.setContentsMargins(10, 10, 10, 10)
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+        # Share the main console's document so every line (however it was written) shows up live.
+        self.text_edit.setDocument(launcher.results_text.document())
+        lay.addWidget(self.text_edit, stretch=1)
+        self._to_bottom()
+        self.text_edit.document().contentsChanged.connect(self._to_bottom)
+
+    def refresh(self):
+        self._to_bottom()
+
+    def append_line(self, formatted):
+        pass
+
+    def _to_bottom(self):
+        sb = self.text_edit.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def closeEvent(self, event):
+        self.closed_sig.emit()
+        event.accept()
+
+
+def set_taskbar_progress_state(widget, state: str):
+    """Set the native Windows taskbar progress state ('none', 'normal', 'error') for a window."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        flags = {"none": 0x0, "normal": 0x2, "error": 0x4}[state]
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitialize(None)
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("a", ctypes.c_ulong), ("b", ctypes.c_ushort), ("c", ctypes.c_ushort), ("d", ctypes.c_ubyte * 8)]
+
+        def mk(a, b, c, *d):
+            return GUID(a, b, c, (ctypes.c_ubyte * 8)(*d))
+
+        clsid = mk(0x56FDF344, 0xFD6D, 0x11D0, 0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90)
+        iid = mk(0xEA1AFB91, 0x9E28, 0x4B86, 0x90, 0xE9, 0x9E, 0x9E, 0x5A, 0xEF, 0xAF)
+        ptr = ctypes.c_void_p()
+        hr = ole32.CoCreateInstance(ctypes.byref(clsid), None, 1, ctypes.byref(iid), ctypes.byref(ptr))
+        if hr != 0 or not ptr.value:
+            return
+        vtbl = ctypes.cast(ctypes.cast(ptr, ctypes.POINTER(ctypes.c_void_p))[0], ctypes.POINTER(ctypes.c_void_p))
+        hwnd = wintypes.HWND(int(widget.winId()))
+        HrInit = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(vtbl[3])
+        SetValue = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.HWND, ctypes.c_ulonglong, ctypes.c_ulonglong)(vtbl[9])
+        SetState = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.HWND, ctypes.c_int)(vtbl[10])
+        Release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[2])
+        HrInit(ptr)
+        if state == "error":
+            SetValue(ptr, hwnd, 100, 100)
+        SetState(ptr, hwnd, flags)
+        Release(ptr)
+    except Exception:
+        pass
+
+
 class LauncherGUI(QMainWindow):
     def __init__(self, startup_args=None):
         super().__init__()
@@ -2768,7 +2843,13 @@ class LauncherGUI(QMainWindow):
         self.results_text = QTextEdit()
         self.results_text.setReadOnly(True)
         self.results_text.setVisible(self.show_console)
-        self.layout.addWidget(self.results_text)
+        self.log_window = None
+        self.pop_log_btn = QPushButton("Pop Out Log")
+        self.pop_log_btn.setToolTip("Show the log in its own window")
+        self.pop_log_btn.clicked.connect(self.toggle_log_popout)
+        self.pop_log_btn.setVisible(self.show_console)
+        self.layout.addWidget(self.pop_log_btn, alignment=Qt.AlignmentFlag.AlignRight)
+        self.layout.addWidget(self.results_text, stretch=1000)
 
         # Status Label
         self.status_label = QLabel("Ready to launch.")
@@ -2814,6 +2895,7 @@ class LauncherGUI(QMainWindow):
         self.dummy_width_widget = QWidget()
         self.dummy_width_widget.setFixedSize(610, 0)
         self.layout.addWidget(self.dummy_width_widget)
+        self.layout.insertStretch(self.layout.indexOf(self.status_label), 1)
         
         # Pipeline State
         self.pipeline_steps = []
@@ -2840,6 +2922,13 @@ class LauncherGUI(QMainWindow):
 
         # Run startup garbage collection after UI is shown
         QTimer.singleShot(100, self.run_startup_garbage_collection)
+
+        # Update status row (bottom of the window), changelog after updates, and requirements check
+        try:
+            from launcher_update import UpdateController
+            self.update_controller = UpdateController(self)
+        except Exception as e:
+            print(f"[Warning] Update checker unavailable: {e}")
 
     def open_create_shortcut_dialog(self):
         dlg = CreateShortcutDialog(self)
@@ -3030,6 +3119,7 @@ class LauncherGUI(QMainWindow):
             self.options_btn.setEnabled(not is_busy)
         if hasattr(self, 'dirs_btn'):
             self.dirs_btn.setEnabled(not is_busy)
+        self._refresh_auth_buttons()
         if hasattr(self, 'login_btn'):
             self.login_btn.setEnabled(not is_busy)
         if hasattr(self, 'switch_account_btn'):
@@ -3423,6 +3513,9 @@ class LauncherGUI(QMainWindow):
                 QApplication.processEvents()
 
             self.banner_widget = ProfileBannerWidget(auth_data, self, progress_callback=banner_progress)
+            # Keep the previous height while the new banner loads so the window doesn't collapse and re-grow.
+            if getattr(self, "_banner_last_h", 0):
+                self.banner_widget.setMinimumHeight(self._banner_last_h)
             self.banner_container.addWidget(self.banner_widget)
             
             # Hide the progress bar after it's done loading, unless a launch pipeline or authentication is active
@@ -3436,31 +3529,91 @@ class LauncherGUI(QMainWindow):
         self.update_ui_state()
         self.update_window_size()
 
+    def _refresh_auth_buttons(self):
+        """Show Login when no account is signed in; otherwise show Switch/Logout."""
+        if not all(hasattr(self, n) for n in ("login_btn", "logout_btn", "switch_account_btn")):
+            return
+        try:
+            accounts = load_accounts() or {}
+            active = accounts.get("active_profile")
+            logged_in = bool(active and active in accounts.get("profiles", {}))
+        except Exception:
+            logged_in = False
+        self.login_btn.setVisible(not logged_in)
+        self.logout_btn.setVisible(logged_in)
+        self.switch_account_btn.setVisible(logged_in)
+
+    def _apply_console_visibility(self):
+        popped = bool(self.log_window and self.log_window.isVisible())
+        self.results_text.setVisible(self.show_console and not popped)
+        self.pop_log_btn.setVisible(self.show_console)
+        self.pop_log_btn.setText("Dock Log" if popped else "Pop Out Log")
+        self.update_window_size()
+        if not self.results_text.isVisible():
+            self.resize(self.width(), self.sizeHint().height())  # collapse the space the console used
+
+    def toggle_log_popout(self):
+        if self.log_window and self.log_window.isVisible():
+            self.log_window.close()
+            return
+        self.log_window = LauncherLogWindow(self)
+        self.log_window.closed_sig.connect(lambda: QTimer.singleShot(0, self._apply_console_visibility))
+        self.log_window.show()
+        self._apply_console_visibility()
+
+    def _lock_banner_minimum(self):
+        """Stop the profile banner from being squashed below its natural size."""
+        bw = getattr(self, "banner_widget", None)
+        if not bw:
+            return
+        try:
+            if bw.isVisible() or not bw.isHidden():
+                h = bw.sizeHint()
+                if h.isValid() and h.height() > bw.minimumHeight():
+                    bw.setMinimumHeight(h.height())
+        except RuntimeError:
+            self.banner_widget = None
+
     def update_window_size(self):
-        # We exclusively use SetFixedSize constraint so the window flawlessly shrink-wraps its contents
-        # without any arbitrary gaps or cutoff content. The dummy_width_widget guarantees width=650.
-        
-        if self.show_console:
-            self.setMinimumHeight(0)
-            self.setMaximumHeight(16777215)
-            # Give the console a comfortable minimum height so it's readable
-            if hasattr(self, 'results_text'):
-                self.results_text.setMinimumHeight(300)
-            self.layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetFixedSize)
-            self.layout.setContentsMargins(20, 20, 20, 35)
-        else:
-            self.setMinimumHeight(0)
-            self.setMaximumHeight(16777215)
-            if hasattr(self, 'results_text'):
-                self.results_text.setMinimumHeight(0)
-            self.layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetFixedSize)
-            self.layout.setContentsMargins(20, 20, 20, 35)
-            
-        # Force layout evaluation and explicitly resize to apply constraints properly
+        # The window can be freely enlarged: the console (when visible) stretches with it, and the
+        # layout's minimum size keeps all controls readable. Height only shrink-wraps when no console is shown.
+        self.layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
+        self.layout.setContentsMargins(20, 20, 20, 35)
+        if not hasattr(self, 'dummy_width_widget'):
+            return  # UI still being constructed
+        console_shown = self.results_text.isVisible()
+        self.results_text.setMinimumHeight(300 if console_shown else 0)
+        self.setMaximumHeight(16777215)
+        self._lock_banner_minimum()
         self.layout.activate()
-        QApplication.processEvents()
-        self.adjustSize()
-        self.resize(self.sizeHint())
+        hint = self.sizeHint()
+        # Do not call setMinimumSize() manually: the layout's SetMinimumSize constraint keeps the window
+        # minimum in sync with the contents whenever any text or widget changes.
+        self.setMinimumSize(0, 0)
+        self.layout.invalidate()
+        self.layout.activate()
+        hint = self.sizeHint()
+        self.resize(max(self.width(), hint.width()), max(self.height(), hint.height()))
+        # The banner loads asynchronously; re-measure once it has settled.
+        if not getattr(self, "_min_remeasure_pending", False):
+            self._min_remeasure_pending = True
+
+            def _again():
+                self._min_remeasure_pending = False
+                try:
+                    bw = getattr(self, "banner_widget", None)
+                    if bw:
+                        bw.setMinimumHeight(0)
+                        self._lock_banner_minimum()
+                        self._banner_last_h = bw.minimumHeight()
+                    self.layout.invalidate()
+                    self.layout.activate()
+                    h = self.sizeHint()
+                    self.resize(max(self.width(), h.width()), max(self.height(), h.height()))
+                except RuntimeError:
+                    pass
+            QTimer.singleShot(700, _again)
+            QTimer.singleShot(2500, _again)
 
     def load_versions(self):
         old_selected = self.version_combo.currentData()
@@ -3596,7 +3749,7 @@ class LauncherGUI(QMainWindow):
             self.hide_release_date = dialog.get_hide_release_date()
             self.dev_mode = dialog.get_dev_mode()
 
-            self.results_text.setVisible(self.show_console)
+            self._apply_console_visibility()
 
             # Save to config
             config = load_launcher_config()
@@ -3698,6 +3851,8 @@ class LauncherGUI(QMainWindow):
             self.results_text.append(self._format_log_line(raw_line))
         scrollbar = self.results_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+        if getattr(self, 'log_window', None) and self.log_window.isVisible():
+            self.log_window.refresh()
 
     def log(self, message):
         clean_msg = message.strip()
@@ -3708,6 +3863,8 @@ class LauncherGUI(QMainWindow):
         self.results_text.append(formatted)
         scrollbar = self.results_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+        if getattr(self, 'log_window', None) and self.log_window.isVisible():
+            self.log_window.append_line(formatted)
 
     def check_opengl_backend_prompt(self):
         """Prompt user before changing preferredGraphicsBackend to OpenGL in options.txt."""
@@ -4232,36 +4389,25 @@ class LauncherGUI(QMainWindow):
             self._log_instance_line(inst, line)
 
     def show_progress_error(self, step_title: str, error_detail: str):
-        """Display an unmistakable red error state on the progress bars."""
-        red_chunk_style = """
-            QProgressBar {
-                border: 1px solid #c9302c;
-                border-radius: 4px;
-                text-align: center;
-                background-color: #2b2b2b;
-                color: #ffffff;
-                font-weight: bold;
-            }
-            QProgressBar::chunk {
-                background-color: #d9534f;
-            }
-        """
-        self.step_progress_bar.setStyleSheet(red_chunk_style)
-        self.task_progress_bar.setStyleSheet(red_chunk_style)
+        """Show a failure using the native progress bar style plus the red Windows taskbar error state."""
+        self.step_progress_bar.setStyleSheet("")
+        self.task_progress_bar.setStyleSheet("")
         self.step_progress_bar.setRange(0, 100)
-        self.step_progress_bar.setValue(100)
+        self.step_progress_bar.setValue(0)
         self.step_progress_bar.setFormat(f"Failed: {step_title}")
 
         self.task_progress_bar.setRange(0, 100)
-        self.task_progress_bar.setValue(100)
+        self.task_progress_bar.setValue(0)
         self.task_progress_bar.setFormat(f"Error: {error_detail}")
 
         self.set_progress_visible(True)
+        set_taskbar_progress_state(self, "error")
 
     def clear_progress_error(self):
-        """Restore default progress bar styling."""
+        """Restore default progress bar styling and clear the taskbar error state."""
         self.step_progress_bar.setStyleSheet("")
         self.task_progress_bar.setStyleSheet("")
+        set_taskbar_progress_state(self, "none")
 
     def _on_instance_finished(self, inst: dict, exitCode: int, exitStatus):
         if inst.get("window_timer"):

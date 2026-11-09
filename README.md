@@ -11,7 +11,7 @@ Before running the launcher, make sure you have the following installed on your 
 
 ---
 
-Follow the intructions on the latest [release](https://github.com/cloudyhair6/PyMcLauncher/releases/latest) or just download the latest [installer\_and\_updater.py](https://github.com/cloudyhair6/PyMcLauncher/releases/latest/download/installer_and_updater.py)
+Follow the intructions on the latest [release](https://github.com/cloudyhair6/PyMcLauncher/releases/latest) or just download the latest [installer.py](https://github.com/cloudyhair6/PyMcLauncher/releases/latest/download/installer.py)
 
 ## Quick Start (Automatic)
 
@@ -23,7 +23,7 @@ setup-start.bat
 
 This batch script automatically handles dependency checks and starts the launcher for you.
 
-# BUT download the [installer\_and\_updater.py](https://github.com/cloudyhair6/PyMcLauncher/releases/latest/download/installer_and_updater.py) first.
+# BUT download the [installer.py](https://github.com/cloudyhair6/PyMcLauncher/releases/latest/download/installer.py) first.
 
 ---
 
