@@ -561,5 +561,67 @@ def _run_tkinter_gui():
     root.mainloop()
 
 
+def run_update_check(install_dir=None, relaunch_script=None):
+    """Silently update the installation to the latest release."""
+    if not install_dir:
+        install_dir = os.path.dirname(os.path.abspath(__file__))
+    install_dir = os.path.abspath(install_dir)
+    cfg_file = os.path.join(install_dir, CONFIG_FILE)
+    cfg = {}
+    if os.path.exists(cfg_file):
+        try:
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+
+    selected_opts = cfg.get("selected_options", ["PC App only (comes with development soon will without)"])
+    ver = get_latest_version()
+    if not ver:
+        return
+    download_options = fetch_download_options(ver)
+    if not download_options:
+        return
+    paths = []
+    ignore_files = []
+    for opt in selected_opts:
+        if opt in download_options:
+            opt_data = download_options[opt]
+            if isinstance(opt_data, dict):
+                paths.extend(opt_data.get("Files", []))
+                ignore_files.extend(opt_data.get("Update Ignore Files", []))
+            elif isinstance(opt_data, list):
+                paths.extend(opt_data)
+
+    tree = get_repo_tree(ver)
+    files = resolve_files_to_download(paths, tree, ignore_files=ignore_files)
+    if not files:
+        return
+
+    perform_download_concurrently(files, ver, install_dir)
+    cfg["current_version"] = ver
+    cfg["selected_options"] = selected_opts
+    cfg["install_dir"] = install_dir
+    with open(cfg_file, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=4)
+
+    if relaunch_script:
+        candidate_dirs = [install_dir, os.path.dirname(install_dir), os.getcwd()]
+        for cdir in candidate_dirs:
+            sp = os.path.join(cdir, relaunch_script)
+            if os.path.exists(sp):
+                subprocess.Popen(["cmd.exe", "/c", sp], cwd=cdir, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+                break
+
+
 if __name__ == "__main__":
-    run_installer_gui()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--update-check", action="store_true", help="Perform silent update check and download")
+    parser.add_argument("--relaunch", type=str, default=None, help="Script to relaunch")
+    parser.add_argument("--install-dir", type=str, default=None, help="Target installation directory")
+    args, _ = parser.parse_known_args()
+    if args.update_check:
+        run_update_check(args.install_dir, args.relaunch)
+    else:
+        run_installer_gui()

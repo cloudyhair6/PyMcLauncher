@@ -59,7 +59,7 @@ def list_versions():
     
     print("-" * 70)
 
-def download_version(version_id, jar_type="client", json_mode=None, is_dev_mode=None):
+def download_version(version_id, jar_type="client", json_mode=None, is_dev_mode=None, extract_source=True):
     """Download Minecraft game JAR for a specific version."""
     global dev_mode, download_dir_name, json_output
     if json_mode is not None:
@@ -100,13 +100,13 @@ def download_version(version_id, jar_type="client", json_mode=None, is_dev_mode=
                 sys.stdout.flush()
             if verify_sha1(file_path, expected_sha1):
                 print(f"[OK] Version {version_id} ({jar_type}) already exists and verified.")
-                if dev_mode:
+                if dev_mode and extract_source:
                     extract_source_code(version_id, jar_type, version_json)
                 return True
             print(f"[WARN] Existing {jar_type}.jar failed SHA-1 verification. Re-downloading...")
         elif not expected_sha1:
             print(f"[OK] Version {version_id} ({jar_type}) already exists.")
-            if dev_mode:
+            if dev_mode and extract_source:
                 extract_source_code(version_id, jar_type, version_json)
             return True
     
@@ -116,7 +116,7 @@ def download_version(version_id, jar_type="client", json_mode=None, is_dev_mode=
         print(f"[OK] Successfully downloaded Minecraft {version_id} ({jar_type})")
         
         # In dev mode, extract source code if available
-        if dev_mode:
+        if dev_mode and extract_source:
             extract_source_code(version_id, jar_type, version_json)
         
         return True
@@ -128,7 +128,11 @@ def download_version(version_id, jar_type="client", json_mode=None, is_dev_mode=
 
 def extract_source_code(version_id, jar_type, version_json):
     """Extract and decompile source code for any Minecraft version."""
-    from extract_source_code import extract_version_source
+    try:
+        from extract_source_code import extract_version_source
+    except ImportError:
+        print("[WARN] extract_source_code.py not available; skipping source extraction.")
+        return
     jar_path = get_dir("versions") / f"{version_id}-{jar_type}.jar"
     source_dir = get_dir("source") / f"{version_id}-{jar_type}"
     extract_version_source(
@@ -145,7 +149,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="Download Minecraft game files (client or server JAR)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""\nExamples:\n  python download_minecraft.py --version list\n  python download_minecraft.py --client --version 1.21.1\n  python download_minecraft.py --server --version 1.21.1\n  python download_minecraft.py --client --version 1.21.1 --dev-mode\n  python download_minecraft.py --server --version 1.21.1 --dev-mode\n  python download_minecraft.py --client --version 1.21.1 --dir custom_dir/\n        """
+        epilog="""
+Examples:
+  python download_minecraft.py --version list
+  python download_minecraft.py --client --version 1.21.1
+  python download_minecraft.py --server --version 1.21.1
+  python download_minecraft.py --client --version 1.21.1 --dev-mode
+  python download_minecraft.py --client --version 1.21.1 --dir custom_dir/
+        """
     )
     
     parser.add_argument(
@@ -183,6 +194,10 @@ def main():
         help="Output progress as JSON"
     )
     
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+
     args = parser.parse_args()
     
     global json_output

@@ -37,13 +37,13 @@ REQUIREMENTS_PATH = ROOT_DIR / "requirements.txt"
 CACHE_DIR = ROOT_DIR / ".cache"
 PENDING_PATH = CACHE_DIR / "update_pending.json"
 REQ_HASH_PATH = CACHE_DIR / "requirements.sha256"
-INSTALLER_PATH = ROOT_DIR / "installer_and_updater.py"
+INSTALLER_PATH = ROOT_DIR / "installer.py"
 
 
 def _get_auth_headers():
     try:
-        import installer_and_updater
-        return installer_and_updater.get_auth_headers()
+        import installer
+        return installer.get_auth_headers()
     except Exception:
         return {"User-Agent": USER_AGENT}
 
@@ -101,8 +101,8 @@ def get_current_version() -> str:
 def get_latest_version() -> str | None:
     """Detect latest release tag via GitHub API, web redirect, or atom feed."""
     try:
-        import installer_and_updater
-        ver = installer_and_updater.get_latest_release_version()
+        import installer
+        ver = installer.get_latest_version()
         if ver:
             return str(ver)
     except Exception:
@@ -531,7 +531,7 @@ class UpdateController:
             QMessageBox.critical(
                 self.launcher,
                 "Installer Missing",
-                f"installer_and_updater.py was not found at {INSTALLER_PATH}.",
+                f"installer.py was not found at {INSTALLER_PATH}.",
             )
             return
 
@@ -573,7 +573,59 @@ class UpdateController:
             flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
             subprocess.Popen(cmd, cwd=str(ROOT_DIR), creationflags=flags)
         except Exception as e:
-            QMessageBox.critical(self.launcher, "Update Failed", f"Could not launch installer_and_updater.py: {e}")
+            QMessageBox.critical(self.launcher, "Update Failed", f"Could not launch installer.py: {e}")
             return
 
         QApplication.quit()
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Minecraft Launcher updater and requirements checker CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python launcher_update.py --check
+  python launcher_update.py --requirements
+  python launcher_update.py --version
+"""
+    )
+    parser.add_argument("--check", action="store_true", help="Check for available releases on GitHub")
+    parser.add_argument("--requirements", action="store_true", help="Check installed Python packages against requirements.txt")
+    parser.add_argument("--version", action="store_true", help="Display current launcher version")
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+
+    args = parser.parse_args()
+
+    if args.version:
+        print(f"Current Launcher Version: {get_current_version()}")
+
+    if args.requirements:
+        missing = find_unsatisfied_requirements()
+        if missing:
+            print(f"[Warning] Missing requirements ({len(missing)}):")
+            for m in missing:
+                print(f"  - {m}")
+        else:
+            print("[OK] All packages in requirements.txt are installed.")
+
+    if args.check:
+        cur = get_current_version()
+        print(f"Current version: {cur}")
+        print("Checking GitHub releases for updates...")
+        latest = get_latest_release_tag()
+        if latest and is_newer_version(cur, latest):
+            print(f"[Update Available] A new version is available: {latest} (current: {cur})")
+            diff = fetch_commit_descriptions(cur, latest)
+            if diff:
+                print("\nChanges:")
+                print(diff)
+        elif latest:
+            print(f"[Up to Date] Launcher is up to date ({cur}).")
+        else:
+            print("[Info] Could not query remote release tag.")
+

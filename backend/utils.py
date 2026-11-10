@@ -1824,3 +1824,107 @@ def get_windows_linked_microsoft_accounts() -> list:
     return list(discovered.values())
 
 
+def is_allowed_by_rules(rules: list) -> bool:
+    """Evaluates Mojang version.json rules for OS, architecture, and features."""
+    import platform
+    if not rules:
+        return True
+
+    sysname = platform.system().lower()
+    if sysname == 'windows':
+        os_name = 'windows'
+    elif sysname == 'darwin':
+        os_name = 'osx'
+    else:
+        os_name = 'linux'
+
+    is_64bit = sys.maxsize > 2**32
+    machine = platform.machine().lower()
+    is_arm = 'arm' in machine or 'aarch' in machine
+
+    first_rule = rules[0]
+    if first_rule.get('action') == 'disallow' and ('os' in first_rule or 'features' in first_rule):
+        allowed = True
+    else:
+        allowed = False
+
+    for rule in rules:
+        action = rule.get('action', 'allow')
+        if 'features' in rule:
+            continue
+        os_rule = rule.get('os')
+        match = True
+        if isinstance(os_rule, dict):
+            if 'name' in os_rule and os_rule['name'] != os_name:
+                match = False
+            if 'arch' in os_rule:
+                req_arch = os_rule['arch'].lower()
+                if req_arch == 'x86' and (is_64bit or is_arm):
+                    match = False
+                elif req_arch in ('x64', 'x86_64', 'amd64') and (not is_64bit or is_arm):
+                    match = False
+                elif 'arm' in req_arch and not is_arm:
+                    match = False
+        if match:
+            allowed = (action == 'allow')
+
+    return allowed
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+    parser = argparse.ArgumentParser(
+        description="Minecraft Launcher Utilities CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  python utils.py --dirs
+  python utils.py --accounts
+  python utils.py --versions
+  python utils.py --windows-accounts
+"""
+    )
+    parser.add_argument("--dirs", action="store_true", help="Print configured launcher directories")
+    parser.add_argument("--accounts", action="store_true", help="List saved launcher profiles and active profile")
+    parser.add_argument("--versions", action="store_true", help="List downloaded Minecraft versions")
+    parser.add_argument("--windows-accounts", action="store_true", help="List personal Microsoft accounts linked with Windows")
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+
+    args = parser.parse_args()
+
+    if args.dirs:
+        print("[Launcher Directories]")
+        for dname in ("base", "versions", "assets", "libraries", "natives", "java", "profiles", "shortcuts", "source"):
+            print(f"  {dname:12}: {get_dir(dname)}")
+
+    if args.accounts:
+        accs = load_accounts() or {}
+        active = accs.get("active_profile", "None")
+        profs = accs.get("profiles", {})
+        print(f"[Launcher Accounts] Active: {active} ({len(profs)} profiles)")
+        for pid, pdata in profs.items():
+            uname = pdata.get("mc_username", "Unknown")
+            email = pdata.get("msa_email", "")
+            gt = pdata.get("xbox_gamertag", "")
+            print(f"  * {uname} (Profile: {pid}, Email: {email}, Xbox: {gt})")
+
+    if args.versions:
+        vers = get_downloaded_versions()
+        print(f"[Downloaded Versions] ({len(vers)} total)")
+        for v in vers:
+            print(f"  - {v}")
+
+    if args.windows_accounts:
+        linked = get_windows_linked_microsoft_accounts()
+        print(f"[Windows-Linked Microsoft Accounts] ({len(linked)} total)")
+        for a in linked:
+            em = a.get("email", "")
+            gt = a.get("xbox_gamertag", "")
+            mc = a.get("mc_username", "")
+            print(f"  - {em} (Minecraft: {mc or 'Not yet logged in'}, Xbox: {gt or 'N/A'})")
+
+
+

@@ -764,7 +764,6 @@ class CommandExecutor:
 
 def main():
     """Main entry point"""
-    print("[DEBUG] command_executor starting...")
     parser = argparse.ArgumentParser(
         description='Command Getter and Executor for Minecraft Launcher',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -834,6 +833,10 @@ Examples:
     parser.add_argument('--accessToken', help='Access token')
     parser.add_argument('--xuid', help='XUID')
     parser.add_argument('--clientId', help='Client ID (clientid)')
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
 
     args = parser.parse_args()
     

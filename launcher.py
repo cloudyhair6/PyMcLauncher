@@ -1821,7 +1821,6 @@ class PlayerDataOptionsDialog(QDialog):
 class ProfileBannerWidget(QWidget):
     def __init__(self, auth_data, parent=None, progress_callback=None):
         super().__init__(parent)
-        self.setMinimumHeight(44)
         self.auth_data = auth_data
         
         self.config = load_launcher_config()
@@ -2024,12 +2023,53 @@ class ProfileBannerWidget(QWidget):
         main_layout.addLayout(top_layout)
         
         # 5. Bottom: Interactive Locator Bar spanning full width
+        def _on_locator_status(text):
+            if hasattr(self, 'waypoint_status_label') and self.waypoint_status_label:
+                self.waypoint_status_label.setText(text)
+                win = self.window()
+                if hasattr(win, 'update_window_size'):
+                    win.update_window_size()
+
         self.locator_bar = LocatorBarWidget(
             locator_color,
-            status_callback=self.waypoint_status_label.setText if hasattr(self, 'waypoint_status_label') else None
+            status_callback=_on_locator_status
         )
         self.locator_bar.setVisible(self.options.get("show_locator_bar", True))
         main_layout.addWidget(self.locator_bar)
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
+    def sizeHint(self):
+        top_h = 0
+        show_skin = self.options.get("show_3d_skin", True)
+        show_btn = self.options.get("show_change_skin_btn", True)
+        if show_skin:
+            top_h = max(top_h, 180 + (35 if show_btn else 0))
+        elif show_btn:
+            top_h = max(top_h, 35)
+
+        if self.options.get("show_java_profile", True):
+            top_h = max(top_h, 110)
+        else:
+            top_h = max(top_h, 35)
+
+        if self.options.get("show_xbox_profile", True):
+            top_h = max(top_h, 65)
+
+        total_h = top_h
+        if self.options.get("show_locator_bar", True):
+            total_h += 54 + 5
+
+        total_h += 15  # top (10) and bottom (5) layout margins
+
+        w = 610
+        if hasattr(self, 'waypoint_status_label') and self.waypoint_status_label and self.waypoint_status_label.isVisible():
+            txt = self.waypoint_status_label.text()
+            fm = self.waypoint_status_label.fontMetrics()
+            text_w = fm.horizontalAdvance(txt) if hasattr(fm, 'horizontalAdvance') else fm.width(txt)
+            w = max(w, 200 + text_w + 40 + 180)
+        return QtCore.QSize(w, total_h)
 
 
     def open_player_data_options(self):
@@ -2323,15 +2363,17 @@ class WindowsLinkedAccountsDialog(QDialog):
             mc_name = acc.get("mc_username", "")
             gt = acc.get("xbox_gamertag", "")
 
-            if disp and disp.lower() != email.lower():
-                line1 = f"{disp} ({email})"
+            # Show Minecraft username or Xbox Gamertag first if known
+            primary_name = mc_name or gt or disp
+            if primary_name and primary_name.lower() != email.lower():
+                line1 = f"{primary_name} ({email})"
             else:
                 line1 = email
 
             details = [source]
-            if mc_name:
+            if mc_name and primary_name != mc_name:
                 details.append(f"Minecraft: {mc_name}")
-            elif gt and gt.lower() != disp.lower():
+            elif gt and primary_name != gt and gt.lower() != email.lower():
                 details.append(f"Xbox: {gt}")
             text = f"{line1}\n   [{' | '.join(details)}]"
 
@@ -2412,13 +2454,37 @@ class DownloadPipelineWorker(QtCore.QThread):
 
             steps = []
             if need_downloads:
-                steps.append(("Java", lambda: download_java.ensure_java_for_version(self.version, json_mode=True)))
-                steps.append(("Game Client", lambda: download_minecraft.download_version(self.version, jar_type="client", json_mode=True, is_dev_mode=self.dev_mode)))
+                steps.append((
+                    "Java",
+                    f"python backend/download_java.py --version {self.version}",
+                    lambda: download_java.ensure_java_for_version(self.version, json_mode=True)
+                ))
+                steps.append((
+                    "Game Client",
+                    f"python backend/download_minecraft.py --client --version {self.version}",
+                    lambda: download_minecraft.download_version(self.version, jar_type="client", json_mode=True, is_dev_mode=self.dev_mode, extract_source=False)
+                ))
                 if self.dev_mode:
-                    steps.append(("JAR Resources", lambda: extract_source_code.extract_version_source(version_id=self.version, jar_type="client", json_output=True, step="resources")))
-                    steps.append(("Decompiling Classes", lambda: extract_source_code.extract_version_source(version_id=self.version, jar_type="client", json_output=True, step="decompile")))
-                steps.append(("Libraries", lambda: download_libraries.download_libraries(self.version, json_mode=True, is_dev_mode=self.dev_mode)))
-                steps.append(("Assets", lambda: download_assets.download_assets(self.version, json_mode=True, is_dev_mode=self.dev_mode)))
+                    steps.append((
+                        "JAR Resources",
+                        f"python backend/extract_source_code.py --version {self.version} --client --step resources",
+                        lambda: extract_source_code.extract_version_source(version_id=self.version, jar_type="client", json_output=True, step="resources")
+                    ))
+                    steps.append((
+                        "Decompiling Classes",
+                        f"python backend/extract_source_code.py --version {self.version} --client --step decompile",
+                        lambda: extract_source_code.extract_version_source(version_id=self.version, jar_type="client", json_output=True, step="decompile")
+                    ))
+                steps.append((
+                    "Libraries",
+                    f"python backend/download_libraries.py --version {self.version}{' --dev-mode' if self.dev_mode else ''}",
+                    lambda: download_libraries.download_libraries(self.version, json_mode=True, is_dev_mode=self.dev_mode)
+                ))
+                steps.append((
+                    "Assets",
+                    f"python backend/download_assets.py --version {self.version}{' --dev-mode' if self.dev_mode else ''}",
+                    lambda: download_assets.download_assets(self.version, json_mode=True, is_dev_mode=self.dev_mode)
+                ))
 
             total_steps = len(steps) + 1  # +1 for launching game
             current_step_info = ["", 1]
@@ -2468,7 +2534,7 @@ class DownloadPipelineWorker(QtCore.QThread):
                 sys.stdout = redirector
                 sys.stderr = redirector
 
-                for idx, (step_name, step_fn) in enumerate(steps):
+                for idx, (step_name, step_cmd, step_fn) in enumerate(steps):
                     if self._is_cancelled:
                         self.done_sig.emit(False, None, "Launch sequence cancelled.")
                         return
@@ -2479,6 +2545,7 @@ class DownloadPipelineWorker(QtCore.QThread):
 
                     self.progress_sig.emit(step_num, total_steps, step_name, 0.0, f"[{step_num}/{total_steps}] Verifying {step_name}...")
                     self.log_sig.emit(f"\n> Running step [{step_num}/{total_steps}]: {step_name}")
+                    self.log_sig.emit(f"  Command: {step_cmd}")
 
                     success = step_fn()
                     redirector.flush()
@@ -2498,7 +2565,17 @@ class DownloadPipelineWorker(QtCore.QThread):
 
             # Prepare launch command
             launch_step_num = total_steps
+            launch_cmd_str = f"python backend/command_executor.py --version {self.version}"
+            if self.is_offline:
+                launch_cmd_str += " --offline"
+            if self.is_trial:
+                launch_cmd_str += " --demo"
+            if self.quick_play:
+                launch_cmd_str += f" --quickPlayType {self.quick_play.get('type')} --quickPlayId {self.quick_play.get('id')}"
+
             self.progress_sig.emit(launch_step_num, total_steps, "Launching Game...", 0.0, f"[{launch_step_num}/{total_steps}] Preparing launch command...")
+            self.log_sig.emit(f"\n> Running step [{launch_step_num}/{total_steps}]: Launching Game...")
+            self.log_sig.emit(f"  Command: {launch_cmd_str}")
 
             executor = command_executor.CommandExecutor(self.version)
             executor.offline = self.is_offline
@@ -2657,25 +2734,94 @@ class LauncherLogWindow(QMainWindow):
         self.setWindowTitle("PyMcLauncher - Log")
         self.resize(800, 500)
         self.setWindowIcon(launcher.windowIcon())
+
         central = QWidget(self)
         self.setCentralWidget(central)
-        lay = QVBoxLayout(central)
-        lay.setContentsMargins(10, 10, 10, 10)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        # Top bar with controls
+        top_bar = QHBoxLayout()
+        self.title_lbl = QLabel("Launcher Console Log")
+        self.title_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        top_bar.addWidget(self.title_lbl, stretch=1)
+
+        self.auto_scroll_cb = QCheckBox("Auto-scroll")
+        self.auto_scroll_cb.setChecked(True)
+        top_bar.addWidget(self.auto_scroll_cb)
+
+        self.wrap_cb = QCheckBox("Wrap Lines")
+        self.wrap_cb.setChecked(True)
+        self.wrap_cb.toggled.connect(self._toggle_wrap)
+        top_bar.addWidget(self.wrap_cb)
+
+        copy_btn = QPushButton("Copy All")
+        copy_btn.setFixedWidth(80)
+        copy_btn.clicked.connect(self._copy_all)
+        top_bar.addWidget(copy_btn)
+
+        clear_btn = QPushButton("Clear")
+        clear_btn.setFixedWidth(70)
+        clear_btn.clicked.connect(self._clear_log)
+        top_bar.addWidget(clear_btn)
+
+        layout.addLayout(top_bar)
+
+        # Text area with dark console styling
         self.text_edit = QTextEdit()
         self.text_edit.setReadOnly(True)
-        # Share the main console's document so every line (however it was written) shows up live.
-        self.text_edit.setDocument(launcher.results_text.document())
-        lay.addWidget(self.text_edit, stretch=1)
-        self._to_bottom()
-        self.text_edit.document().contentsChanged.connect(self._to_bottom)
+        self.text_edit.setFont(QFont("Consolas", 10))
+        self.text_edit.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #dcdcdc;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+            }
+        """)
+        self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        layout.addWidget(self.text_edit, stretch=1)
+
+        self.refresh()
+
+    def _toggle_wrap(self, checked: bool):
+        if checked:
+            self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        else:
+            self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+
+    def _copy_all(self):
+        text = self.text_edit.toPlainText()
+        if text:
+            clipboard = QApplication.clipboard()
+            if clipboard:
+                clipboard.setText(text)
+
+    def _clear_log(self):
+        self.text_edit.clear()
+        if hasattr(self.launcher, 'results_text'):
+            self.launcher.results_text.clear()
+        if hasattr(self.launcher, '_raw_log_lines'):
+            self.launcher._raw_log_lines = []
 
     def refresh(self):
-        self._to_bottom()
+        self.text_edit.clear()
+        lines = getattr(self.launcher, '_raw_log_lines', [])
+        if lines:
+            for raw_line in lines:
+                formatted = self.launcher._format_log_line(raw_line)
+                self.text_edit.append(formatted)
+        elif hasattr(self.launcher, 'results_text') and self.launcher.results_text.toPlainText():
+            self.text_edit.setPlainText(self.launcher.results_text.toPlainText())
+        self._scroll_to_bottom()
 
-    def append_line(self, formatted):
-        pass
+    def append_line(self, formatted: str):
+        self.text_edit.append(formatted)
+        if self.auto_scroll_cb.isChecked():
+            self._scroll_to_bottom()
 
-    def _to_bottom(self):
+    def _scroll_to_bottom(self):
         sb = self.text_edit.verticalScrollBar()
         sb.setValue(sb.maximum())
 
@@ -2896,6 +3042,7 @@ class LauncherGUI(QMainWindow):
         self.dummy_width_widget.setFixedSize(610, 0)
         self.layout.addWidget(self.dummy_width_widget)
         self.layout.insertStretch(self.layout.indexOf(self.status_label), 1)
+        self.update_window_size()
         
         # Pipeline State
         self.pipeline_steps = []
@@ -2916,7 +3063,7 @@ class LauncherGUI(QMainWindow):
         if is_logged_in and not is_expired:
             self.refresh_process = QProcess()
             self.refresh_process.setProgram(get_python_cli_executable())
-            self.refresh_process.setArguments([get_script_path("get_mc_username.py"), "--json", "--profile", get_active_profile_id()])
+            self.refresh_process.setArguments([get_script_path("ms_accounts.py"), "--json", "--profile", get_active_profile_id()])
             self.refresh_process.readyReadStandardOutput.connect(self.handle_refresh_stdout)
             self.refresh_process.start()
 
@@ -3474,7 +3621,7 @@ class LauncherGUI(QMainWindow):
             self.previous_active_profile = None
             self._auth_cancelled_profile = current_profile
 
-        cmd_args = [get_script_path("get_mc_username.py"), "--json", "--profile", self._auth_cancelled_profile]
+        cmd_args = [get_script_path("ms_accounts.py"), "--json", "--profile", self._auth_cancelled_profile]
         if isinstance(selected_win_acc, dict) and self._pending_login_hint:
             cmd_args.extend(["--wam", "--login-hint", self._pending_login_hint, "--hwnd", str(int(self.winId()))])
             wam_id = selected_win_acc.get("wam_account_id") or selected_win_acc.get("cid")
@@ -3513,8 +3660,11 @@ class LauncherGUI(QMainWindow):
                 QApplication.processEvents()
 
             self.banner_widget = ProfileBannerWidget(auth_data, self, progress_callback=banner_progress)
-            # Keep the previous height while the new banner loads so the window doesn't collapse and re-grow.
-            if getattr(self, "_banner_last_h", 0):
+            h = self.banner_widget.sizeHint()
+            if h.isValid() and h.height() > 0:
+                self.banner_widget.setMinimumHeight(h.height())
+                self._banner_last_h = h.height()
+            elif getattr(self, "_banner_last_h", 0):
                 self.banner_widget.setMinimumHeight(self._banner_last_h)
             self.banner_container.addWidget(self.banner_widget)
             
@@ -3551,14 +3701,21 @@ class LauncherGUI(QMainWindow):
         self.update_window_size()
         if not self.results_text.isVisible():
             self.resize(self.width(), self.sizeHint().height())  # collapse the space the console used
+        else:
+            self._refresh_console_log()
 
     def toggle_log_popout(self):
         if self.log_window and self.log_window.isVisible():
             self.log_window.close()
             return
-        self.log_window = LauncherLogWindow(self)
-        self.log_window.closed_sig.connect(lambda: QTimer.singleShot(0, self._apply_console_visibility))
+        if not self.log_window:
+            self.log_window = LauncherLogWindow(self)
+            self.log_window.closed_sig.connect(lambda: QTimer.singleShot(0, self._apply_console_visibility))
+        else:
+            self.log_window.refresh()
         self.log_window.show()
+        self.log_window.raise_()
+        self.log_window.activateWindow()
         self._apply_console_visibility()
 
     def _lock_banner_minimum(self):
@@ -3578,42 +3735,41 @@ class LauncherGUI(QMainWindow):
         # The window can be freely enlarged: the console (when visible) stretches with it, and the
         # layout's minimum size keeps all controls readable. Height only shrink-wraps when no console is shown.
         self.layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
-        self.layout.setContentsMargins(20, 20, 20, 35)
+        self.layout.setContentsMargins(20, 15, 20, 15)
         if not hasattr(self, 'dummy_width_widget'):
             return  # UI still being constructed
         console_shown = self.results_text.isVisible()
         self.results_text.setMinimumHeight(300 if console_shown else 0)
         self.setMaximumHeight(16777215)
         self._lock_banner_minimum()
-        self.layout.activate()
-        hint = self.sizeHint()
-        # Do not call setMinimumSize() manually: the layout's SetMinimumSize constraint keeps the window
-        # minimum in sync with the contents whenever any text or widget changes.
-        self.setMinimumSize(0, 0)
         self.layout.invalidate()
         self.layout.activate()
-        hint = self.sizeHint()
-        self.resize(max(self.width(), hint.width()), max(self.height(), hint.height()))
-        # The banner loads asynchronously; re-measure once it has settled.
+        hint = self.layout.sizeHint()
+
+        min_w = max(650, hint.width())
+        min_h = hint.height()
+        self.setMinimumSize(min_w, min_h)
+        self.resize(max(self.width(), min_w), max(self.height(), min_h))
+
+        # Re-measure once banner settles without resetting height to 0
         if not getattr(self, "_min_remeasure_pending", False):
             self._min_remeasure_pending = True
 
             def _again():
                 self._min_remeasure_pending = False
                 try:
-                    bw = getattr(self, "banner_widget", None)
-                    if bw:
-                        bw.setMinimumHeight(0)
-                        self._lock_banner_minimum()
-                        self._banner_last_h = bw.minimumHeight()
+                    self._lock_banner_minimum()
                     self.layout.invalidate()
                     self.layout.activate()
-                    h = self.sizeHint()
-                    self.resize(max(self.width(), h.width()), max(self.height(), h.height()))
+                    h = self.layout.sizeHint()
+                    mw = max(650, h.width())
+                    mh = h.height()
+                    self.setMinimumSize(mw, mh)
+                    self.resize(max(self.width(), mw), max(self.height(), mh))
                 except RuntimeError:
                     pass
-            QTimer.singleShot(700, _again)
-            QTimer.singleShot(2500, _again)
+            QTimer.singleShot(400, _again)
+            QTimer.singleShot(1500, _again)
 
     def load_versions(self):
         old_selected = self.version_combo.currentData()
@@ -4016,7 +4172,7 @@ class LauncherGUI(QMainWindow):
         
         self.is_just_logging_in = False
         self._browser_auth_done = False
-        cmd_args = [get_script_path("get_mc_username.py"), "--json", "--profile", target_profile_id]
+        cmd_args = [get_script_path("ms_accounts.py"), "--json", "--profile", target_profile_id]
         if isinstance(selected_win_acc, dict) and self._pending_login_hint:
             cmd_args.extend(["--wam", "--login-hint", self._pending_login_hint, "--hwnd", str(int(self.winId()))])
             wam_id = selected_win_acc.get("wam_account_id") or selected_win_acc.get("cid")

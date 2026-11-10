@@ -227,7 +227,14 @@ def download_libraries(version_id, json_mode=None, is_dev_mode=None):
         print(f"Error: No libraries found for version {version_id}")
         return False
     
-    from garbage_collect import is_allowed_by_rules
+    try:
+        from utils import is_allowed_by_rules
+    except ImportError:
+        try:
+            from garbage_collect import is_allowed_by_rules
+        except ImportError:
+            def is_allowed_by_rules(rules):
+                return True
     libraries = [lib for lib in version_json['libraries'] if is_allowed_by_rules(lib.get('rules', []))]
     print(f"Found {len(libraries)} libraries for current OS")
     
@@ -402,6 +409,10 @@ def main():
         help="Output progress as JSON"
     )
     
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+
     args = parser.parse_args()
     
     global json_output

@@ -456,4 +456,20 @@ def perform_garbage_collection(log_callback=print, progress_callback=None):
 
 
 if __name__ == "__main__":
+    import argparse
+    import sys
+    parser = argparse.ArgumentParser(
+        description="Garbage collection and asset cleanup utility for Minecraft Launcher",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python garbage_collect.py
+  python garbage_collect.py --help
+"""
+    )
+    parser.add_argument("--dir", type=str, help="Custom Minecraft base directory")
+    args = parser.parse_args()
+    if args.dir:
+        from utils import set_download_dir
+        set_download_dir(args.dir)
     perform_garbage_collection()

@@ -190,17 +190,19 @@ def extract_version_source(
                                 if (now - last_emit_time) >= 0.035 or idx == total_res - 1:
                                     pct = ((idx + 1) / total_res) * 100.0
                                     short_name = member.filename[-45:] if len(member.filename) > 45 else member.filename
-                                    emit_progress(
-                                        pct,
-                                        f"Extracting JAR resources ({idx + 1}/{total_res} - {pct:.1f}%): {short_name}",
-                                        json_output
-                                    )
+                                    if step == "all":
+                                        overall_pct = pct * 0.15
+                                        msg = f"[Stage 1/2: Resources] ({idx + 1}/{total_res} - {pct:.1f}%): {short_name}"
+                                    else:
+                                        overall_pct = pct
+                                        msg = f"Extracting JAR resources ({idx + 1}/{total_res} - {pct:.1f}%): {short_name}"
+                                    emit_progress(overall_pct, msg, json_output)
                                     last_emit_time = now
                     if not json_output:
                         print()
                     print(f"[OK] Extracted {total_res} bundled resources to {res_out_dir}", flush=True)
                 else:
-                    emit_progress(100.0, "No bundled resources in JAR.", json_output)
+                    emit_progress(15.0 if step == "all" else 100.0, "No bundled resources in JAR.", json_output)
                     print(f"[Info] No bundled non-class resources found in {jar_path.name}.", flush=True)
 
                 if step == "resources":
@@ -268,7 +270,9 @@ def extract_version_source(
         print(f"Decompiling {total_classes} classes from {jar_path.name}...", flush=True)
 
     print(f"> Running: {' '.join(cmd)}", flush=True)
-    emit_progress(0.0, f"Starting Java decompiler (0/{total_classes} classes)...", json_output)
+    start_pct = 15.0 if step == "all" else 0.0
+    stage_lbl = "[Stage 2/2: Decompiling] " if step == "all" else ""
+    emit_progress(start_pct, f"{stage_lbl}Starting Java decompiler (0/{total_classes} classes)...", json_output)
 
     proc = None
     def _cleanup_cfr():
@@ -304,11 +308,13 @@ def extract_version_source(
                 if (now - last_emit_time) >= 0.035 or processed >= total_classes:
                     ratio = min(processed / total_classes, 1.0)
                     pct = ratio * 100.0
-                    emit_progress(
-                        pct,
-                        f"Decompiling ({processed}/{total_classes} - {pct:.1f}%): {cls_name}",
-                        json_output
-                    )
+                    if step == "all":
+                        overall_pct = 15.0 + (pct * 0.85)
+                        msg = f"[Stage 2/2: Decompiling] ({processed}/{total_classes} - {pct:.1f}%): {cls_name}"
+                    else:
+                        overall_pct = pct
+                        msg = f"Decompiling ({processed}/{total_classes} - {pct:.1f}%): {cls_name}"
+                    emit_progress(overall_pct, msg, json_output)
                     last_emit_time = now
             else:
                 other_lines.append(line)
@@ -357,6 +363,10 @@ def main():
         default="all",
         help="Which phase to run: 'resources', 'decompile', or 'all' (default)"
     )
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
 
     args = parser.parse_args()
 
