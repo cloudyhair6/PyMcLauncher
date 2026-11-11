@@ -197,6 +197,12 @@ def perform_download_concurrently(files, tag, install_dir, progress_cb=None):
             if data:
                 with open(local_fp, "wb") as f:
                     f.write(data)
+                # Ensure shell and command scripts have execution permissions on macOS / Linux
+                if os.name != "nt" and (fp.endswith(".command") or fp.endswith(".sh") or fp.endswith(".py")):
+                    try:
+                        os.chmod(local_fp, 0o755)
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"Error downloading {fp}: {e}")
         finally:
@@ -211,7 +217,7 @@ def perform_download_concurrently(files, tag, install_dir, progress_cb=None):
 
 
 def schedule_self_deletion():
-    """Schedules self-deletion after process exit using detached cmd."""
+    """Schedules self-deletion after process exit using detached background process."""
     try:
         cur_file = os.path.abspath(__file__)
         if os.name == "nt":
@@ -222,10 +228,20 @@ def schedule_self_deletion():
                 creationflags=flags,
             )
         else:
+            # On macOS and Linux, spawn a detached shell to delete the installer after 1 second
             try:
-                os.remove(cur_file)
+                subprocess.Popen(
+                    f'sleep 1 && rm -f "{cur_file}"',
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
             except Exception:
-                pass
+                try:
+                    os.remove(cur_file)
+                except Exception:
+                    pass
     except Exception as e:
         print(f"Self-deletion error: {e}")
 
@@ -458,6 +474,12 @@ def _run_qt_gui(QtModule):
 
     install_btn.clicked.connect(on_install_clicked)
     win.show()
+    if sys.platform == "darwin":
+        try:
+            win.raise_()
+            win.activateWindow()
+        except Exception:
+            pass
     app.exec() if qt_ver == 6 else app.exec_()
 
 
@@ -467,8 +489,17 @@ def _run_tkinter_gui():
 
     root = tk.Tk()
     root.title("PyMcLauncher Installer")
-    root.geometry("520x400")
+    root.geometry("540x440")
     root.resizable(False, False)
+
+    # Bring window to front on macOS
+    if sys.platform == "darwin":
+        try:
+            root.lift()
+            root.attributes('-topmost', True)
+            root.after_idle(root.attributes, '-topmost', False)
+        except Exception:
+            pass
 
     install_dir = os.path.abspath(os.path.dirname(__file__))
 
@@ -493,19 +524,9 @@ def _run_tkinter_gui():
     frame_options.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
 
     check_vars = {}
+    btn_install_ref = [None]
 
-    def fetch_meta():
-        ver = get_latest_version()
-        if not ver:
-            messagebox.showerror("Error", "Could not fetch latest release version from GitHub.")
-            root.destroy()
-            return
-        opts = fetch_download_options(ver)
-        if not opts:
-            messagebox.showerror("Error", f"download_options.json was not found in release {ver}.")
-            root.destroy()
-            return
-
+    def on_meta_success(ver, opts):
         pbar.stop()
         pbar.config(mode="determinate", value=0)
         lbl_status.config(text=f"Latest Version: {ver}. Select options to install:")
@@ -522,35 +543,40 @@ def _run_tkinter_gui():
                 messagebox.showwarning("Warning", "Please select at least one option to install.")
                 return
 
-            btn_install.config(state="disabled")
+            if btn_install_ref[0]:
+                btn_install_ref[0].config(state="disabled")
             lbl_status.config(text="Fetching files...")
 
-            def install_thread():
+            def worker_task(selected_list, ver_str, opts_dict, dest_dir):
                 try:
                     paths = []
                     ignore_files = []
-                    for opt in selected:
-                        opt_data = opts[opt]
+                    for opt in selected_list:
+                        opt_data = opts_dict.get(opt, {})
                         if isinstance(opt_data, dict):
                             paths.extend(opt_data.get("Files", []))
                             ignore_files.extend(opt_data.get("Update Ignore Files", []))
                         elif isinstance(opt_data, list):
                             paths.extend(opt_data)
 
-                    tree = get_repo_tree(ver)
+                    tree = get_repo_tree(ver_str)
                     files = resolve_files_to_download(paths, tree, ignore_files=ignore_files)
+                    if not files:
+                        root.after(0, lambda: messagebox.showerror("Installation Error", "No matching files found in repository to download."))
+                        return
 
                     def on_prog(cur, total, fp):
                         pct = int((cur / total) * 100) if total else 0
-                        root.after(0, lambda: (pbar.config(value=pct), lbl_status.config(text=f"Downloading: {fp[:45]}")))
+                        short_fp = os.path.basename(fp)
+                        root.after(0, lambda p=pct, s=short_fp: (pbar.config(value=p), lbl_status.config(text=f"Downloading: {s}")))
 
-                    perform_download_concurrently(files, ver, install_dir, on_prog)
+                    perform_download_concurrently(files, ver_str, dest_dir, on_prog)
 
-                    cfg_path = os.path.join(install_dir, CONFIG_FILE)
+                    cfg_path = os.path.join(dest_dir, CONFIG_FILE)
                     cfg_data = {
-                        "current_version": ver,
-                        "selected_options": selected,
-                        "install_dir": install_dir,
+                        "current_version": ver_str,
+                        "selected_options": selected_list,
+                        "install_dir": dest_dir,
                     }
                     with open(cfg_path, "w", encoding="utf-8") as f:
                         json.dump(cfg_data, f, indent=4)
@@ -566,7 +592,7 @@ def _run_tkinter_gui():
                     )
 
                     def on_done():
-                        messagebox.showinfo("Success", f"PyMcLauncher ({ver}) installed successfully!{del_note}")
+                        messagebox.showinfo("Success", f"PyMcLauncher ({ver_str}) installed successfully!{del_note}")
                         root.destroy()
                         if should_delete:
                             schedule_self_deletion()
@@ -574,14 +600,37 @@ def _run_tkinter_gui():
 
                     root.after(0, on_done)
                 except Exception as e:
-                    root.after(0, lambda: messagebox.showerror("Installation Error", str(e)))
+                    err_msg = str(e)
+                    root.after(0, lambda m=err_msg: messagebox.showerror("Installation Error", m))
 
-            threading.Thread(target=install_thread, daemon=True).start()
+            threading.Thread(
+                target=worker_task,
+                args=(list(selected), str(ver), dict(opts), str(install_dir)),
+                daemon=True,
+            ).start()
 
-        btn_install = tk.Button(root, text="Download & Install", font=("Arial", 10, "bold"), command=do_install, pady=4)
-        btn_install.pack(pady=10)
+        btn = tk.Button(root, text="Download & Install", font=("Arial", 10, "bold"), command=do_install, pady=4)
+        btn.pack(pady=10)
+        btn_install_ref[0] = btn
 
-    threading.Thread(target=fetch_meta, daemon=True).start()
+    def on_meta_error(err_msg):
+        pbar.stop()
+        messagebox.showerror("Error", err_msg)
+        root.destroy()
+
+    def fetch_meta_thread():
+        # Pure network I/O — zero Tkinter widget access from worker thread
+        ver = get_latest_version()
+        if not ver:
+            root.after(0, lambda: on_meta_error("Could not fetch latest release version from GitHub.\nPlease check your internet connection."))
+            return
+        opts = fetch_download_options(ver)
+        if not opts:
+            root.after(0, lambda: on_meta_error(f"download_options.json was not found in release {ver}."))
+            return
+        root.after(0, lambda: on_meta_success(ver, opts))
+
+    threading.Thread(target=fetch_meta_thread, daemon=True).start()
     root.mainloop()
 
 
@@ -634,7 +683,12 @@ def run_update_check(install_dir=None, relaunch_script=None):
         for cdir in candidate_dirs:
             sp = os.path.join(cdir, relaunch_script)
             if os.path.exists(sp):
-                subprocess.Popen(["cmd.exe", "/c", sp], cwd=cdir, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+                if os.name == "nt":
+                    subprocess.Popen(["cmd.exe", "/c", sp], cwd=cdir, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", sp], cwd=cdir)
+                else:
+                    subprocess.Popen(["bash", sp], cwd=cdir)
                 break
 
 
