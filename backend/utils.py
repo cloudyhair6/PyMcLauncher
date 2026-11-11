@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+import sys
 from pathlib import Path
 import requests
 import requests.adapters
@@ -733,6 +734,11 @@ def delete_source_folder(progress_callback=None, log_callback=None):
                 )
             except Exception:
                 pass
+        else:
+            try:
+                subprocess.run(['pkill', '-f', 'cfr-'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            except Exception:
+                pass
 
         targets = [
             ("source", get_dir("source")),
@@ -1160,8 +1166,11 @@ def fetch_player_textures(profile_id, uuid, gamerpic_url=None, progress_callback
                         f.write(r.content)
             except Exception as e:
                 print(f"Failed to fetch gamerpic: {e}")
+    else:
+        if progress_callback: progress_callback(40, "Loading cached textures...")
 
     if not js_path.exists():
+        if progress_callback: progress_callback(75, "Setting up 3D skin viewer...")
         try:
             r = requests.get("https://unpkg.com/skinview3d@3.0.0/bundles/skinview3d.bundle.js", timeout=5)
             if r.status_code == 200:
@@ -1169,6 +1178,8 @@ def fetch_player_textures(profile_id, uuid, gamerpic_url=None, progress_callback
                     f.write(r.content)
         except Exception as e:
             print(f"Failed to download skinview3d: {e}")
+
+    if progress_callback: progress_callback(100, "Profile ready")
 
     # Generate skin_viewer.html (always ensure latest HTML with proper null cape handling)
     html_content = """<!DOCTYPE html>
@@ -1292,6 +1303,33 @@ def get_process_tree_pids(parent_pid: int) -> set:
 
 def is_minecraft_window_visible(pid: int = None, version: str = None) -> bool:
     """Return True if an actual visible top-level game window exists for the given PID tree or Minecraft version."""
+    if platform.system() == 'Darwin':
+        try:
+            cmd = [
+                'osascript', '-e',
+                f'''
+                tell application "System Events"
+                    if {pid or 0} > 0 then
+                        set procs to every process whose unix id is {pid or 0}
+                        if (count of procs) > 0 then
+                            return (count of (every window of (item 1 of procs))) > 0
+                        end if
+                    end if
+                    set mcProcs to (every process whose name contains "java" or name contains "Minecraft")
+                    repeat with p in mcProcs
+                        if (count of (every window of p)) > 0 then
+                            return true
+                        end if
+                    end repeat
+                    return false
+                end tell
+                '''
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=1)
+            return 'true' in res.stdout.lower()
+        except Exception:
+            return False
+
     if os.name != 'nt':
         return False
     try:
@@ -1398,6 +1436,20 @@ def get_start_menu_programs_dir() -> Path:
     return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
 
 
+def get_applications_dir() -> Path:
+    """Resolve the user's Applications / Programs directory across platforms."""
+    if os.name == 'nt':
+        return get_start_menu_programs_dir()
+    elif sys.platform == 'darwin':
+        user_apps = Path.home() / "Applications"
+        user_apps.mkdir(parents=True, exist_ok=True)
+        return user_apps
+    else:
+        user_apps = Path.home() / ".local" / "share" / "applications"
+        user_apps.mkdir(parents=True, exist_ok=True)
+        return user_apps
+
+
 def create_windows_shortcut(
     lnk_path: Path,
     target_exe: str,
@@ -1413,6 +1465,7 @@ def create_windows_shortcut(
     Returns (success: bool, message: str).
     """
     import subprocess
+    import base64
     try:
         lnk_path = Path(lnk_path).resolve()
         lnk_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1428,42 +1481,140 @@ def create_windows_shortcut(
         env["SC_PARENT"] = str(lnk_path.parent)
         env["SC_NAME"] = str(lnk_path.name)
 
-        ps_cmd = (
-            "$ws = New-Object -ComObject WScript.Shell; "
-            "$s = $ws.CreateShortcut($env:SC_LNK_PATH); "
-            "$s.TargetPath = $env:SC_TARGET; "
-            "$s.Arguments = $env:SC_ARGS; "
-            "$s.WorkingDirectory = $env:SC_WORKDIR; "
-            "if ($env:SC_ICON) { $s.IconLocation = $env:SC_ICON }; "
-            "if ($env:SC_DESC) { $s.Description = $env:SC_DESC }; "
-            "$s.Save(); "
-            "if ($env:SC_PIN -eq '1') { "
-            "  try { "
-            "    $sh = New-Object -ComObject Shell.Application; "
-            "    $folder = $sh.Namespace($env:SC_PARENT); "
-            "    if ($folder) { "
-            "      $item = $folder.ParseName($env:SC_NAME); "
-            "      if ($item) { "
-            "        $verb = $item.Verbs() | Where-Object { ($_.Name -replace '&','') -match 'Pin to Start' } | Select-Object -First 1; "
-            "        if ($verb) { $verb.DoIt() } "
-            "      } "
-            "    } "
-            "  } catch {} "
-            "}"
+        ps_script = (
+            "$ws = New-Object -ComObject WScript.Shell\n"
+            "$s = $ws.CreateShortcut($env:SC_LNK_PATH)\n"
+            "$s.TargetPath = $env:SC_TARGET\n"
+            "$s.Arguments = $env:SC_ARGS\n"
+            "$s.WorkingDirectory = $env:SC_WORKDIR\n"
+            "if ($env:SC_ICON) { $s.IconLocation = $env:SC_ICON }\n"
+            "if ($env:SC_DESC) { $s.Description = $env:SC_DESC }\n"
+            "$s.Save()\n"
+            "if ($env:SC_PIN -eq '1') {\n"
+            "  try {\n"
+            "    $sh = New-Object -ComObject Shell.Application\n"
+            "    $folder = $sh.Namespace($env:SC_PARENT)\n"
+            "    if ($folder) {\n"
+            "      $item = $folder.ParseName($env:SC_NAME)\n"
+            "      if ($item) {\n"
+            "        $verb = $item.Verbs() | Where-Object { $_.Name -and ($_.Name.Replace('&','') -match 'Pin to Start') } | Select-Object -First 1\n"
+            "        if ($verb) { $verb.DoIt() }\n"
+            "      }\n"
+            "    }\n"
+            "  } catch {}\n"
+            "}\n"
         )
+
+        encoded_cmd = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
 
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
         res = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded_cmd],
             env=env,
             capture_output=True,
             text=True,
             timeout=15,
             creationflags=creationflags
         )
-        if res.returncode == 0 and lnk_path.exists():
+        if lnk_path.exists():
             return True, str(lnk_path)
-        return False, (res.stderr.strip() or f"PowerShell exited with code {res.returncode}")
+        err = res.stderr.strip()
+        if "_x000D__x000A_" in err:
+            import re
+            clean = re.sub(r'<[^>]+>', ' ', err)
+            clean = clean.replace("_x000D__x000A_", "\n").strip()
+            err = clean or err
+        return False, (err or f"PowerShell exited with code {res.returncode}")
+    except Exception as e:
+        return False, str(e)
+
+
+def create_macos_shortcut(
+    dest_path: Path,
+    target_exe: str,
+    arguments: str,
+    working_dir: str,
+    icon_path: str = None,
+    name: str = "Minecraft"
+) -> tuple:
+    """
+    Create a native macOS .app application bundle or .command launcher shortcut (macOS Big Sur 11.0+).
+    Returns (success: bool, message: str).
+    """
+    try:
+        dest_path = Path(dest_path).resolve()
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # If dest_path ends with .app, create a macOS application bundle
+        if dest_path.suffix == ".app":
+            import shutil
+            import re
+            if dest_path.exists():
+                if dest_path.is_dir():
+                    shutil.rmtree(dest_path)
+                else:
+                    dest_path.unlink()
+
+            macos_dir = dest_path / "Contents" / "MacOS"
+            resources_dir = dest_path / "Contents" / "Resources"
+            macos_dir.mkdir(parents=True, exist_ok=True)
+            resources_dir.mkdir(parents=True, exist_ok=True)
+
+            launcher_script = macos_dir / "launcher"
+            safe_name = re.sub(r'[^A-Za-z0-9_.-]', '', name) or "PyMcLauncher"
+
+            script_content = (
+                "#!/bin/bash\n"
+                f'cd "{working_dir}"\n'
+                f'exec "{target_exe}" launcher.py {arguments}\n'
+            )
+            launcher_script.write_text(script_content, encoding="utf-8")
+            os.chmod(launcher_script, 0o755)
+
+            # Info.plist
+            plist_content = (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                '<plist version="1.0">\n'
+                '<dict>\n'
+                '    <key>CFBundleExecutable</key>\n'
+                '    <string>launcher</string>\n'
+                '    <key>CFBundleIdentifier</key>\n'
+                f'    <string>com.cloudyhair6.pymclauncher.{safe_name.lower()}</string>\n'
+                '    <key>CFBundleName</key>\n'
+                f'    <string>{name}</string>\n'
+                '    <key>CFBundlePackageType</key>\n'
+                '    <string>APPL</string>\n'
+                '    <key>CFBundleShortVersionString</key>\n'
+                '    <string>1.0</string>\n'
+                '    <key>CFBundleIconFile</key>\n'
+                '    <string>app.icns</string>\n'
+                '</dict>\n'
+                '</plist>\n'
+            )
+            (dest_path / "Contents" / "Info.plist").write_text(plist_content, encoding="utf-8")
+
+            if icon_path and Path(icon_path).exists():
+                try:
+                    src_icon = Path(icon_path)
+                    if src_icon.suffix.lower() == ".icns":
+                        shutil.copy2(src_icon, resources_dir / "app.icns")
+                    elif src_icon.suffix.lower() in (".png", ".ico", ".svg"):
+                        shutil.copy2(src_icon, resources_dir / f"app{src_icon.suffix.lower()}")
+                except Exception:
+                    pass
+
+            return True, str(dest_path)
+        else:
+            # Create a standard executable .command script
+            script_content = (
+                "#!/bin/bash\n"
+                f'cd "{working_dir}"\n'
+                f'exec "{target_exe}" launcher.py {arguments}\n'
+            )
+            dest_path.write_text(script_content, encoding="utf-8")
+            os.chmod(dest_path, 0o755)
+            return True, str(dest_path)
     except Exception as e:
         return False, str(e)
 
@@ -1863,8 +2014,16 @@ def is_allowed_by_rules(rules: list) -> bool:
                     match = False
                 elif req_arch in ('x64', 'x86_64', 'amd64') and (not is_64bit or is_arm):
                     match = False
-                elif 'arm' in req_arch and not is_arm:
+                elif ('arm' in req_arch or 'aarch' in req_arch) and not is_arm:
                     match = False
+            if 'version' in os_rule and sysname == 'darwin':
+                ver_pattern = os_rule['version']
+                # Older Mojang manifests hardcoded ^10\. for all macOS versions before Big Sur (macOS 11.0+)
+                if ver_pattern != '^10\\.' and ver_pattern != r'^10\.':
+                    import re
+                    mac_ver = platform.mac_ver()[0]
+                    if mac_ver and not re.search(ver_pattern, mac_ver):
+                        match = False
         if match:
             allowed = (action == 'allow')
 

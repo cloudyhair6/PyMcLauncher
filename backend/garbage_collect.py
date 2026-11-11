@@ -76,8 +76,16 @@ def is_allowed_by_rules(rules):
                     match = False
                 elif req_arch in ('x64', 'x86_64', 'amd64') and (not is_64bit or is_arm):
                     match = False
-                elif 'arm' in req_arch and not is_arm:
+                elif ('arm' in req_arch or 'aarch' in req_arch) and not is_arm:
                     match = False
+            if 'version' in os_rule and sysname == 'darwin':
+                ver_pattern = os_rule['version']
+                # Older Mojang manifests hardcoded ^10\. for all macOS versions before Big Sur (macOS 11.0+)
+                if ver_pattern != '^10\\.' and ver_pattern != r'^10\.':
+                    import re
+                    mac_ver = platform.mac_ver()[0]
+                    if mac_ver and not re.search(ver_pattern, mac_ver):
+                        match = False
         if match:
             allowed = (action == 'allow')
 

@@ -154,7 +154,7 @@ Examples:
   python download_minecraft.py --version list
   python download_minecraft.py --client --version 1.21.1
   python download_minecraft.py --server --version 1.21.1
-  python download_minecraft.py --client --version 1.21.1 --dev-mode
+  python download_minecraft.py --client --version 1.21.1 --source
   python download_minecraft.py --client --version 1.21.1 --dir custom_dir/
         """
     )
@@ -178,9 +178,11 @@ Examples:
     )
     
     parser.add_argument(
+        "--source",
         "--dev-mode",
+        dest="source",
         action="store_true",
-        help="Dev mode: also download and extract source mappings, save to dev_minecraft_downloads/"
+        help="Source mode: also extract and decompile source code, save to dev_minecraft_downloads/"
     )
     
     parser.add_argument(
@@ -204,7 +206,7 @@ Examples:
     json_output = args.json
     
     # Handle directory setup (respect active profile in launcher_config.json unless --dir is passed)
-    if args.dev_mode:
+    if args.source:
         dev_mode = True
     if args.dir:
         set_download_dir(args.dir)

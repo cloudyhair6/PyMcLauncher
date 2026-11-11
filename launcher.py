@@ -95,7 +95,8 @@ from utils import (
     delete_version_files, load_launcher_config, 
     save_launcher_config, get_auth_cache, save_auth_cache, clear_auth_cache, get_active_profile_id, load_accounts, save_accounts, 
     has_any_downloads, delete_all_downloads, has_any_source, delete_source_folder, fetch_player_textures,
-    is_minecraft_window_visible, get_desktop_dir, get_start_menu_programs_dir, create_windows_shortcut,
+    is_minecraft_window_visible, get_desktop_dir, get_start_menu_programs_dir, get_applications_dir,
+    create_windows_shortcut, create_macos_shortcut,
     calculate_locator_bar_color, get_windows_linked_microsoft_accounts
 )
 
@@ -124,8 +125,54 @@ def _save_qimage_as_ico(img: QImage, ico_path: Path) -> Optional[Path]:
         return None
 
 
+def get_pymclauncher_ico_path() -> Optional[Path]:
+    """Return the official PyMcLauncher.ico file path if it exists."""
+    candidates = [
+        _root_dir / "images" / "icon" / "PyMcLauncher.ico",
+    ]
+    try:
+        resolved = Path(get_image_path("icon/PyMcLauncher.ico"))
+        candidates.append(resolved)
+    except Exception:
+        pass
+    for cand in candidates:
+        if cand.exists() and cand.stat().st_size > 0:
+            return cand
+    return None
+
+
+def get_pymclauncher_icon() -> QIcon:
+    """Return the official PyMcLauncher QIcon using SVG with ICO fallback."""
+    icon = QIcon()
+    svg_candidates = [
+        _root_dir / "images" / "icon" / "PyMcLauncher.svg",
+    ]
+    try:
+        svg_candidates.append(Path(get_image_path("icon/PyMcLauncher.svg")))
+    except Exception:
+        pass
+    for svg_path in svg_candidates:
+        if svg_path.exists() and svg_path.stat().st_size > 0:
+            icon.addFile(str(svg_path))
+            break
+
+    ico_path = get_pymclauncher_ico_path()
+    if ico_path and ico_path.exists():
+        icon.addFile(str(ico_path))
+
+    if icon.isNull():
+        fallback_ico = ensure_default_minecraft_ico()
+        if fallback_ico and fallback_ico.exists():
+            icon = QIcon(str(fallback_ico))
+    return icon
+
+
 def ensure_default_minecraft_ico() -> Optional[Path]:
-    """Generate and return a pixel-art Minecraft Grass Block .ico file in .cache/icons/."""
+    """Return official PyMcLauncher.ico if present, or generate and return fallback grass block .ico in .cache/icons/."""
+    official_ico = get_pymclauncher_ico_path()
+    if official_ico and official_ico.exists():
+        return official_ico
+
     ico_path = _cache_dir / "icons" / "pymclauncher_grass.ico"
     if ico_path.exists() and ico_path.stat().st_size > 100:
         return ico_path
@@ -164,12 +211,16 @@ def ensure_default_minecraft_ico() -> Optional[Path]:
 
 
 def image_to_ico(source_path: str, ico_name: str) -> Optional[Path]:
-    """Convert a PNG/JPG/ICO image file into a Windows .ico file in .cache/icons/."""
+    """Convert a PNG/JPG/SVG/ICO image file into a Windows .ico file in .cache/icons/."""
     src = Path(source_path)
     if not src.exists():
         return ensure_default_minecraft_ico()
     if src.suffix.lower() == ".ico":
         return src
+    if "pymclauncher" in src.name.lower():
+        official_ico = get_pymclauncher_ico_path()
+        if official_ico and official_ico.exists():
+            return official_ico
     img = QImage(str(src))
     if img.isNull():
         return ensure_default_minecraft_ico()
@@ -258,7 +309,7 @@ class CreateShortcutDialog(QDialog):
         self.desktop_cb.setChecked(True)
         details_layout.addWidget(self.desktop_cb)
 
-        self.start_menu_cb = QCheckBox("Pin to Start / Add to Start Menu")
+        self.start_menu_cb = QCheckBox("Add to Applications folder" if sys.platform == "darwin" else "Pin to Start / Add to Start Menu")
         self.start_menu_cb.setChecked(True)
         details_layout.addWidget(self.start_menu_cb)
 
@@ -412,6 +463,12 @@ class CreateShortcutDialog(QDialog):
         qp = self.qp_combo.currentData()
         if isinstance(qp, dict) and qp.get("icon_path") and Path(qp["icon_path"]).exists():
             return qp["icon_path"]
+        svg_cand = _root_dir / "images" / "icon" / "PyMcLauncher.svg"
+        if svg_cand.exists():
+            return str(svg_cand)
+        ico_cand = get_pymclauncher_ico_path()
+        if ico_cand and ico_cand.exists():
+            return str(ico_cand)
         default_ico = ensure_default_minecraft_ico()
         return str(default_ico) if default_ico else None
 
@@ -422,7 +479,7 @@ class CreateShortcutDialog(QDialog):
         elif isinstance(self.qp_combo.currentData(), dict) and self.qp_combo.currentData().get("icon_path") == src and src:
             self.icon_source_lbl.setText("World Icon (icon.png)")
         else:
-            self.icon_source_lbl.setText("Default Minecraft Icon")
+            self.icon_source_lbl.setText("Default PyMcLauncher Icon")
 
         if src and Path(src).exists():
             pix = QPixmap(str(src))
@@ -484,37 +541,69 @@ class CreateShortcutDialog(QDialog):
         created_locations = []
         errors = []
 
-        if to_desktop:
-            desktop_lnk = get_desktop_dir() / f"{safe_filename}.lnk"
-            ok, msg = create_windows_shortcut(
-                lnk_path=desktop_lnk,
-                target_exe=target_exe,
-                arguments=arguments_str,
-                working_dir=working_dir,
-                icon_path=ico_str,
-                description=description,
-                pin_to_start=False
-            )
-            if ok:
-                created_locations.append(f"Desktop: {desktop_lnk}")
-            else:
-                errors.append(f"Desktop shortcut failed: {msg}")
+        if sys.platform == "darwin":
+            if to_desktop:
+                desktop_app = get_desktop_dir() / f"{safe_filename}.app"
+                ok, msg = create_macos_shortcut(
+                    dest_path=desktop_app,
+                    target_exe=target_exe,
+                    arguments=arguments_str,
+                    working_dir=working_dir,
+                    icon_path=ico_str,
+                    name=name
+                )
+                if ok:
+                    created_locations.append(f"Desktop: {desktop_app}")
+                else:
+                    errors.append(f"Desktop shortcut failed: {msg}")
 
-        if to_start:
-            start_lnk = get_start_menu_programs_dir() / f"{safe_filename}.lnk"
-            ok, msg = create_windows_shortcut(
-                lnk_path=start_lnk,
-                target_exe=target_exe,
-                arguments=arguments_str,
-                working_dir=working_dir,
-                icon_path=ico_str,
-                description=description,
-                pin_to_start=True
-            )
-            if ok:
-                created_locations.append(f"Start Menu (Pinned): {start_lnk}")
-            else:
-                errors.append(f"Start Menu shortcut failed: {msg}")
+            if to_start:
+                apps_dir = get_applications_dir()
+                app_dest = apps_dir / f"{safe_filename}.app"
+                ok, msg = create_macos_shortcut(
+                    dest_path=app_dest,
+                    target_exe=target_exe,
+                    arguments=arguments_str,
+                    working_dir=working_dir,
+                    icon_path=ico_str,
+                    name=name
+                )
+                if ok:
+                    created_locations.append(f"Applications: {app_dest}")
+                else:
+                    errors.append(f"Applications shortcut failed: {msg}")
+        else:
+            if to_desktop:
+                desktop_lnk = get_desktop_dir() / f"{safe_filename}.lnk"
+                ok, msg = create_windows_shortcut(
+                    lnk_path=desktop_lnk,
+                    target_exe=target_exe,
+                    arguments=arguments_str,
+                    working_dir=working_dir,
+                    icon_path=ico_str,
+                    description=description,
+                    pin_to_start=False
+                )
+                if ok:
+                    created_locations.append(f"Desktop: {desktop_lnk}")
+                else:
+                    errors.append(f"Desktop shortcut failed: {msg}")
+
+            if to_start:
+                start_lnk = get_start_menu_programs_dir() / f"{safe_filename}.lnk"
+                ok, msg = create_windows_shortcut(
+                    lnk_path=start_lnk,
+                    target_exe=target_exe,
+                    arguments=arguments_str,
+                    working_dir=working_dir,
+                    icon_path=ico_str,
+                    description=description,
+                    pin_to_start=True
+                )
+                if ok:
+                    created_locations.append(f"Start Menu: {start_lnk}")
+                else:
+                    errors.append(f"Start Menu shortcut failed: {msg}")
 
         for loc in created_locations:
             self.launcher_gui.log(f"[Shortcut] Created {loc}")
@@ -526,6 +615,11 @@ class CreateShortcutDialog(QDialog):
         summary = "Successfully created shortcut(s):\n\n" + "\n".join(f"• {loc}" for loc in created_locations)
         if errors:
             summary += "\n\nWarnings:\n" + "\n".join(errors)
+        if to_start:
+            if sys.platform == "darwin":
+                summary += "\n\nTip: The shortcut is now in your Applications folder and can be launched directly or dragged to the macOS Dock."
+            elif sys.platform == "win32":
+                summary += "\n\nTip: The shortcut is now in your Start Menu ('All apps' and search). To pin it to your front Start tiles on Windows 11, right-click the shortcut in Start and select 'Pin to Start'."
         QMessageBox.information(self, "Shortcut Created", summary)
         self.accept()
 
@@ -801,8 +895,8 @@ class VersionOptionsDialog(QDialog):
         self.hide_date_cb.setChecked(hide_release_date)
         layout.addWidget(self.hide_date_cb)
 
-        # Dev Mode (--dev-mode)
-        self.dev_mode_cb = QCheckBox("Dev Mode (unpack readable assets & source)")
+        # Source Mode (--source)
+        self.dev_mode_cb = QCheckBox("Source Mode (--source: unpack readable assets & source)")
         self.dev_mode_cb.setChecked(dev_mode)
         layout.addWidget(self.dev_mode_cb)
 
@@ -2477,12 +2571,12 @@ class DownloadPipelineWorker(QtCore.QThread):
                     ))
                 steps.append((
                     "Libraries",
-                    f"python backend/download_libraries.py --version {self.version}{' --dev-mode' if self.dev_mode else ''}",
+                    f"python backend/download_libraries.py --version {self.version}{' --source' if self.dev_mode else ''}",
                     lambda: download_libraries.download_libraries(self.version, json_mode=True, is_dev_mode=self.dev_mode)
                 ))
                 steps.append((
                     "Assets",
-                    f"python backend/download_assets.py --version {self.version}{' --dev-mode' if self.dev_mode else ''}",
+                    f"python backend/download_assets.py --version {self.version}{' --source' if self.dev_mode else ''}",
                     lambda: download_assets.download_assets(self.version, json_mode=True, is_dev_mode=self.dev_mode)
                 ))
 
@@ -2874,9 +2968,7 @@ class LauncherGUI(QMainWindow):
         self.setWindowTitle("PyMcLauncher")
         self._startup_args = startup_args
         try:
-            default_ico = ensure_default_minecraft_ico()
-            if default_ico and default_ico.exists():
-                self.setWindowIcon(QIcon(str(default_ico)))
+            self.setWindowIcon(get_pymclauncher_icon())
         except Exception:
             pass
 
@@ -2971,19 +3063,26 @@ class LauncherGUI(QMainWindow):
 
         # Update Banner
         self.step_progress_bar = QProgressBar()
+        self.step_progress_bar.setTextVisible(True)
         self.step_progress_bar.setRange(0, 100)
         self.step_progress_bar.setValue(0)
         self.step_progress_bar.setVisible(False)
         self.layout.addWidget(self.step_progress_bar)
 
         self.task_progress_bar = QProgressBar()
+        self.task_progress_bar.setTextVisible(True)
         self.task_progress_bar.setRange(0, 100)
         self.task_progress_bar.setValue(0)
         self.task_progress_bar.setFormat("Current Task: %p%")
         self.task_progress_bar.setVisible(False)
         self.layout.addWidget(self.task_progress_bar)
         
-        self.update_profile_banner()
+        self.banner_widget = None
+        if is_logged_in:
+            self.step_progress_bar.setVisible(True)
+            self.step_progress_bar.setValue(10)
+            self.step_progress_bar.setFormat("Loading profile and textures... (%p%)")
+        QTimer.singleShot(0, self.update_profile_banner)
 
         # Console Output
         self.results_text = QTextEdit()
@@ -2998,7 +3097,7 @@ class LauncherGUI(QMainWindow):
         self.layout.addWidget(self.results_text, stretch=1000)
 
         # Status Label
-        self.status_label = QLabel("Ready to launch.")
+        self.status_label = QLabel("Loading profile and textures..." if is_logged_in else "Ready to launch.")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.status_label.setMinimumWidth(610) # Forces layout sizeHint width to 650 (610 + 20*2 margins)
         self.layout.addWidget(self.status_label)
@@ -3165,17 +3264,24 @@ class LauncherGUI(QMainWindow):
         if not proc or proc.state() == QProcess.ProcessState.NotRunning:
             return
         pid = proc.processId()
-        if os.name == 'nt' and pid:
-            import subprocess
-            try:
-                subprocess.run(
-                    ['taskkill', '/F', '/T', '/PID', str(pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
-                )
-            except Exception:
-                pass
+        if pid:
+            if os.name == 'nt':
+                import subprocess
+                try:
+                    subprocess.run(
+                        ['taskkill', '/F', '/T', '/PID', str(pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                    )
+                except Exception:
+                    pass
+            else:
+                import signal
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
         try:
             proc.kill()
         except Exception:
@@ -3579,11 +3685,17 @@ class LauncherGUI(QMainWindow):
     def do_login(self):
         self.clear_progress_error()
         self.task_progress_bar.setVisible(False)
-        self.step_progress_bar.setVisible(False)
+        self.step_progress_bar.setVisible(True)
+        self.step_progress_bar.setRange(0, 100)
+        self.step_progress_bar.setValue(5)
+        self.step_progress_bar.setFormat("Checking accounts... (%p%)")
+        self.status_label.setText("Checking accounts...")
+        QApplication.processEvents()
 
         proceed, selected_win_acc = self._prompt_windows_linked_accounts()
         if not proceed:
             self._force_new_login = False
+            self.step_progress_bar.setVisible(False)
             self.update_profile_banner()
             self.update_ui_state()
             return
@@ -3599,8 +3711,9 @@ class LauncherGUI(QMainWindow):
         self.status_label.setText("Authenticating with Microsoft...")
         self.update_ui_state()
         
-        self.step_progress_bar.setRange(0, 0)
-        self.step_progress_bar.setFormat("Authenticating with Microsoft...")
+        self.step_progress_bar.setRange(0, 100)
+        self.step_progress_bar.setValue(20)
+        self.step_progress_bar.setFormat("Authenticating with Microsoft... (%p%)")
         self.step_progress_bar.setVisible(True)
 
         current_profile = get_active_profile_id()
@@ -3656,7 +3769,8 @@ class LauncherGUI(QMainWindow):
                 self.step_progress_bar.setVisible(True)
                 self.step_progress_bar.setRange(0, 100)
                 self.step_progress_bar.setValue(percent)
-                self.step_progress_bar.setFormat(msg)
+                self.step_progress_bar.setFormat(f"{msg} ({percent}%)")
+                self.status_label.setText(msg)
                 QApplication.processEvents()
 
             self.banner_widget = ProfileBannerWidget(auth_data, self, progress_callback=banner_progress)
@@ -3674,7 +3788,14 @@ class LauncherGUI(QMainWindow):
                 and not getattr(self, 'is_authenticating', False)
                 and (not getattr(self, 'task_progress_bar', None) or not self.task_progress_bar.isVisible())
             ):
+                self.step_progress_bar.setValue(100)
+                self.step_progress_bar.setFormat("Ready! (100%)")
+                self.status_label.setText("Ready to launch.")
+                QTimer.singleShot(600, lambda: self.step_progress_bar.setVisible(False) if not getattr(self, 'is_pipeline_running', False) and not getattr(self, 'is_authenticating', False) else None)
+        else:
+            if not getattr(self, 'is_pipeline_running', False) and not getattr(self, 'is_authenticating', False):
                 self.step_progress_bar.setVisible(False)
+                self.status_label.setText("Ready to launch.")
 
         self.update_ui_state()
         self.update_window_size()
@@ -4216,7 +4337,9 @@ class LauncherGUI(QMainWindow):
                 save_auth_cache(obj)
                 self._cleanup_browser()
                 self.step_progress_bar.setVisible(True)
-                self.step_progress_bar.setRange(0, 0)
+                self.step_progress_bar.setRange(0, 100)
+                self.step_progress_bar.setValue(50)
+                self.step_progress_bar.setFormat("Loading profile and textures... (%p%)")
                 self.status_label.setText("Loading profile and textures...")
                 QApplication.processEvents()
             elif "error" in obj:
@@ -4238,10 +4361,10 @@ class LauncherGUI(QMainWindow):
                 self.log(line)
 
     def auth_finished(self, exitCode, exitStatus):
-        self.is_authenticating = False
         self._cleanup_browser()
 
         if exitCode != 0 or not self.auth_data:
+            self.is_authenticating = False
             self.step_progress_bar.setVisible(False)
             self.step_progress_bar.setRange(0, 100)
             self.is_pipeline_running = False
@@ -4277,16 +4400,25 @@ class LauncherGUI(QMainWindow):
 
         # Keep the loading bar visible while finalizing authentication & loading profile textures
         self.step_progress_bar.setVisible(True)
+        self.step_progress_bar.setRange(0, 100)
+        self.step_progress_bar.setValue(60)
+        self.step_progress_bar.setFormat("Finalizing authentication... (%p%)")
+        self.status_label.setText("Finalizing authentication...")
+        QApplication.processEvents()
+
         self._finalize_auth(self.auth_data)
+        self.is_authenticating = False
 
         if self.is_just_logging_in:
             self.is_pipeline_running = False
             self.step_progress_bar.setRange(0, 100)
-            self.step_progress_bar.setVisible(False)
+            self.step_progress_bar.setValue(100)
+            self.step_progress_bar.setFormat("Login complete! (100%)")
             self.log("[System] Login complete. Ready to play.")
             self.status_label.setText("Ready to launch.")
             self.update_ui_state()
             self.update_window_size()
+            QTimer.singleShot(800, lambda: self.step_progress_bar.setVisible(False) if not getattr(self, 'is_pipeline_running', False) and not getattr(self, 'is_authenticating', False) else None)
         else:
             self.start_download_pipeline()
         
@@ -4838,8 +4970,9 @@ class LauncherGUI(QMainWindow):
                     if getattr(self.parent_gui, "browser_window", None):
                         self.parent_gui.browser_window.hide()
                     self.parent_gui.step_progress_bar.setVisible(True)
-                    self.parent_gui.step_progress_bar.setRange(0, 0)
-                    self.parent_gui.step_progress_bar.setFormat("Completing Microsoft Sign-In...")
+                    self.parent_gui.step_progress_bar.setRange(0, 100)
+                    self.parent_gui.step_progress_bar.setValue(40)
+                    self.parent_gui.step_progress_bar.setFormat("Completing Microsoft Sign-In... (%p%)")
                     self.parent_gui.status_label.setText("Completing sign-in and fetching Minecraft profile...")
                     QApplication.processEvents()
                     return
@@ -5035,8 +5168,9 @@ class LauncherGUI(QMainWindow):
             if self.browser_window:
                 self.browser_window.hide()
             self.step_progress_bar.setVisible(True)
-            self.step_progress_bar.setRange(0, 0)
-            self.step_progress_bar.setFormat("Completing Microsoft Sign-In...")
+            self.step_progress_bar.setRange(0, 100)
+            self.step_progress_bar.setValue(40)
+            self.step_progress_bar.setFormat("Completing Microsoft Sign-In... (%p%)")
             self.status_label.setText("Completing sign-in and fetching Minecraft profile...")
             QApplication.processEvents()
 
@@ -5061,11 +5195,23 @@ if __name__ == '__main__':
         except Exception:
             pass
 
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("cloudyhair6.pymclauncher")
+        except Exception:
+            pass
+
     os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
     app = QApplication(sys.argv)
     
-    # Force the use of the native Windows UX theme engine (comctl32.dll)
-    app.setStyle("windowsvista")
+    # Force the use of the native Windows UX theme engine (comctl32.dll) on Windows
+    if sys.platform == "win32":
+        app.setStyle("windowsvista")
+    try:
+        app.setWindowIcon(get_pymclauncher_icon())
+    except Exception:
+        pass
     
     window = LauncherGUI(startup_args=cli_args)
     window.show()

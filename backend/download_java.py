@@ -121,14 +121,24 @@ def get_java_download_url(major_version: int) -> Optional[str]:
     """Get Java runtime download URL from Eclipse Adoptium API"""
     try:
         system = platform.system().lower()
-        arch = 'x64' if sys.maxsize > 2**32 else 'x86'
-        
+        machine = platform.machine().lower()
+        is_arm = 'arm' in machine or 'aarch' in machine
+
         if system == 'windows':
             os_name = 'windows'
+            arch = 'arm64' if is_arm else ('x64' if sys.maxsize > 2**32 else 'x86')
         elif system == 'darwin':
             os_name = 'mac'
+            # Adoptium officially provides 'aarch64' for Apple Silicon (macOS Big Sur 11.0+)
+            # and 'x64' for Intel Macs. Note: For Java <= 8, Adoptium mac builds are x64 only
+            # (which runs via macOS Rosetta 2).
+            if is_arm:
+                arch = 'x64' if major_version <= 8 else 'aarch64'
+            else:
+                arch = 'x64'
         elif system == 'linux':
             os_name = 'linux'
+            arch = 'aarch64' if is_arm else ('x64' if sys.maxsize > 2**32 else 'x86')
         else:
             logger.error(f"Unsupported OS: {system}")
             return None
@@ -145,7 +155,13 @@ def get_java_download_url(major_version: int) -> Optional[str]:
 def get_system_info() -> Dict[str, str]:
     """Get system information"""
     system = platform.system().lower()
-    arch = 'x64' if sys.maxsize > 2**32 else 'x86'
+    machine = platform.machine().lower()
+    is_arm = 'arm' in machine or 'aarch' in machine
+    
+    if is_arm:
+        arch = 'arm64' if system == 'darwin' else 'aarch64'
+    else:
+        arch = 'x64' if sys.maxsize > 2**32 else 'x86'
     
     if system == 'windows':
         return {'os': 'windows', 'arch': arch, 'ext': 'zip'}
@@ -228,6 +244,22 @@ def is_java_version_compatible(actual_major: int, expected_major: int) -> bool:
         return actual_major == expected_major
 
 
+def get_java_executable_in_home(java_home: Path) -> Path:
+    """Locate java binary in standard bin directory or macOS JDK bundle layout (Contents/Home/bin/java)."""
+    exe_name = 'java.exe' if platform.system() == 'Windows' else 'java'
+    std = java_home / 'bin' / exe_name
+    if std.exists():
+        return std
+    mac_bundle = java_home / 'Contents' / 'Home' / 'bin' / exe_name
+    if mac_bundle.exists():
+        return mac_bundle
+    if java_home.is_dir():
+        found = list(java_home.rglob(exe_name))
+        if found:
+            return found[0]
+    return std
+
+
 def download_java_runtime(major_version: int, component: str, output_dir: Optional[Path] = None) -> bool:
     """Download Java runtime from Adoptium API."""
     import json
@@ -239,7 +271,7 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
         java_home = output_dir / component
         
         # Check if already downloaded / exists
-        java_exec = java_home / 'bin' / ('java.exe' if platform.system() == 'Windows' else 'java')
+        java_exec = get_java_executable_in_home(java_home)
 
         if os.path.lexists(str(java_home)):
             if java_exec.exists():
@@ -259,7 +291,11 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
         # Java Runtime Re-Use: Check existing runtimes across all directories & system before downloading
         existing_exec = find_existing_java_runtime(component, major_version)
         if existing_exec and existing_exec.exists():
-            existing_home = existing_exec.parent.parent
+            # Support macOS bundle parent (Contents/Home) or standard parent
+            if 'Contents' in existing_exec.parts:
+                existing_home = existing_exec.parent.parent.parent.parent
+            else:
+                existing_home = existing_exec.parent.parent
             logger.info(f"[INFO] Re-using existing Java runtime for {component} (v{major_version}) from {existing_home}")
             if os.path.lexists(str(java_home)):
                 try:
@@ -280,6 +316,7 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
             except Exception as e:
                 logger.warning(f"Could not create junction/symlink for runtime re-use: {e}")
 
+            java_exec = get_java_executable_in_home(java_home)
             if java_exec.exists():
                 logger.info(f"[OK] Java runtime {component} (v{major_version}) ready via runtime re-use")
                 return True
@@ -298,8 +335,19 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
         logger.info(f"Fetching from: {download_url}")
         
         tmp_archive = output_dir / f"{component}.archive"
-        with requests.get(download_url, stream=True, timeout=60, allow_redirects=True) as r:
+        try:
+            r = requests.get(download_url, stream=True, timeout=60, allow_redirects=True)
+            if r.status_code == 404 and platform.system().lower() == 'darwin':
+                # If aarch64 was requested and not found, try x64 as fallback for macOS Rosetta 2
+                alt_url = f"https://api.adoptium.net/v3/binary/latest/{major_version}/ga/mac/x64/jdk/hotspot/normal/eclipse"
+                logger.info(f"aarch64 binary not found. Retrying with x64 Rosetta fallback: {alt_url}")
+                r = requests.get(alt_url, stream=True, timeout=60, allow_redirects=True)
             r.raise_for_status()
+        except Exception as e:
+            logger.error(f"Failed to connect to Java download URL: {e}")
+            return False
+
+        with r:
             total_size = int(r.headers.get('content-length', 0))
             downloaded = 0
             last_percent = -1
@@ -327,7 +375,6 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
             if platform.system() == 'Windows':
                 with zipfile.ZipFile(tmp_archive, 'r') as z:
                     # Adoptium zips usually have a root folder like 'jdk-17.0.8+7-jre'
-                    # We want to extract its contents directly into java_home, or just extract and rename
                     members = z.infolist()
                     total_members = max(len(members), 1)
                     last_percent = -1
@@ -377,6 +424,31 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
                         if os.path.lexists(str(java_home)):
                             safely_remove_path(java_home)
                         extracted_dir.rename(java_home)
+
+            # On macOS, Adoptium tarballs have Contents/Home layout.
+            # Create a symlink or direct bin access if bin is inside Contents/Home
+            contents_home = java_home / 'Contents' / 'Home'
+            if contents_home.is_dir() and not (java_home / 'bin').exists():
+                try:
+                    (java_home / 'bin').symlink_to(contents_home / 'bin')
+                except Exception:
+                    pass
+
+            java_exec = get_java_executable_in_home(java_home)
+
+            # Ensure execution permissions on non-Windows
+            if platform.system() != 'Windows' and java_exec.exists():
+                try:
+                    os.chmod(str(java_exec), 0o755)
+                except Exception:
+                    pass
+
+            # On macOS Big Sur and up, strip Gatekeeper quarantine attributes to prevent execution block
+            if platform.system() == 'Darwin' and os.path.lexists(str(java_home)):
+                try:
+                    subprocess.run(['xattr', '-cr', str(java_home)], capture_output=True, timeout=10)
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning(f"Failed to extract runtime archive: {e}")
             return False
@@ -386,6 +458,7 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
             except Exception:
                 pass
                 
+        java_exec = get_java_executable_in_home(java_home)
         if java_exec.exists() and verify_java_installation(str(java_exec), expected_major_version=major_version):
             logger.info(f"[OK] Java runtime {component} downloaded successfully!")
             return True
@@ -576,11 +649,7 @@ def find_existing_java_runtime(component: str, major_version: int) -> Optional[P
             pass
 
         if home.exists() and home.is_dir():
-            java_exec = home / 'bin' / exe_name
-            if not java_exec.exists():
-                found = list(home.rglob(exe_name))
-                if found:
-                    java_exec = found[0]
+            java_exec = get_java_executable_in_home(home)
             if java_exec.exists() and verify_java_installation(str(java_exec), expected_major_version=major_version):
                 return java_exec
 
@@ -588,7 +657,7 @@ def find_existing_java_runtime(component: str, major_version: int) -> Optional[P
     java_home_env = os.environ.get("JAVA_HOME")
     if java_home_env:
         jh = Path(java_home_env)
-        j_bin = jh / 'bin' / exe_name
+        j_bin = get_java_executable_in_home(jh)
         if j_bin.exists() and verify_java_installation(str(j_bin), expected_major_version=major_version):
             return j_bin
 
@@ -609,9 +678,45 @@ def find_existing_java_runtime(component: str, major_version: int) -> Optional[P
             if c_root.exists():
                 for sub in c_root.iterdir():
                     if sub.is_dir():
-                        j_bin = sub / 'bin' / exe_name
+                        j_bin = get_java_executable_in_home(sub)
                         if j_bin.exists() and verify_java_installation(str(j_bin), expected_major_version=major_version):
                             return j_bin
+
+    # 7. Check common macOS JDK directories (Big Sur 11.0+)
+    if platform.system() == 'Darwin':
+        mac_roots = [
+            Path("/Library/Java/JavaVirtualMachines"),
+            Path.home() / "Library/Java/JavaVirtualMachines",
+            Path("/System/Library/Java/JavaVirtualMachines"),
+            Path("/opt/homebrew/opt"),
+            Path("/usr/local/opt"),
+        ]
+        for m_root in mac_roots:
+            if m_root.exists():
+                try:
+                    for sub in m_root.iterdir():
+                        if sub.is_dir():
+                            j_bin = get_java_executable_in_home(sub)
+                            if j_bin.exists() and verify_java_installation(str(j_bin), expected_major_version=major_version):
+                                return j_bin
+                except Exception:
+                    pass
+
+        # Try macOS native /usr/libexec/java_home tool
+        try:
+            res = subprocess.run(
+                ["/usr/libexec/java_home", "-v", str(major_version)],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                jh = Path(res.stdout.strip())
+                j_bin = get_java_executable_in_home(jh)
+                if j_bin.exists() and verify_java_installation(str(j_bin), expected_major_version=major_version):
+                    return j_bin
+        except Exception:
+            pass
 
     return None
 

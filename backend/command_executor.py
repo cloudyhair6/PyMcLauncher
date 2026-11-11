@@ -99,16 +99,24 @@ def is_correct_native_arch(lib_name: str) -> bool:
         classifier = lib_name
         
     if 'natives' in classifier:
-        lib_is_arm64 = 'arm64' in classifier
-        lib_is_arm32 = 'arm32' in classifier or ('arm' in classifier and not 'arm64' in classifier)
+        lib_is_arm64 = 'arm64' in classifier or 'aarch64' in classifier
+        lib_is_arm32 = 'arm32' in classifier or ('arm' in classifier and not ('arm64' in classifier or 'aarch64' in classifier))
         lib_is_x86 = 'x86' in classifier and not 'x86_64' in classifier
         
         # If the classifier has NO explicit arch, it implies 64-bit x86_64
         has_explicit_arch = lib_is_arm64 or lib_is_arm32 or lib_is_x86
         
         if is_arm:
-            # We are on ARM
-            return lib_is_arm64
+            # We are on ARM (Apple Silicon or ARM64 Linux/Windows)
+            if lib_is_arm64:
+                return True
+            if lib_is_arm32 or lib_is_x86:
+                return False
+            # On macOS Big Sur and up on Apple Silicon, allow unadorned natives (natives-macos / natives-osx)
+            # so older Minecraft versions lacking arm64 natives can execute via Rosetta 2
+            if platform.system() == 'Darwin':
+                return True
+            return False
         elif is_32bit:
             return lib_is_x86
         else:
@@ -372,8 +380,8 @@ class CommandExecutor:
                     major_ver = java_info.get('major_version', 17)
                     java_home = utils.get_dir("java") / comp
                     exe_name = 'java.exe' if platform.system() == 'Windows' else 'java'
-                    potential = java_home / 'bin' / exe_name
-                    from download_java import verify_java_installation, find_existing_java_runtime
+                    from download_java import verify_java_installation, find_existing_java_runtime, get_java_executable_in_home
+                    potential = get_java_executable_in_home(java_home)
                     if potential.exists() and verify_java_installation(str(potential), expected_major_version=major_ver):
                         self.variables['java_path'] = str(potential.absolute())
                     else:
@@ -467,7 +475,12 @@ class CommandExecutor:
             if sysname == 'windows':
                 platform_id_candidates = ['windows', 'windows-x86', 'windows-x64', 'windows-x86_64', 'windows-arm64']
             elif sysname == 'darwin':
-                platform_id_candidates = ['osx', 'macos', 'macos-arm64']
+                machine = platform.machine().lower()
+                is_arm = 'arm' in machine or 'aarch' in machine
+                if is_arm:
+                    platform_id_candidates = ['macos-arm64', 'osx-arm64', 'macos', 'osx']
+                else:
+                    platform_id_candidates = ['macos', 'osx']
             else:
                 platform_id_candidates = ['linux']
 
@@ -564,6 +577,15 @@ class CommandExecutor:
             extra_jvm.append(f'-Djava.library.path={str(natives_dir)}')
         if '-cp' not in jvm_args:
             extra_jvm.extend(['-cp', cp_str])
+
+        # macOS Big Sur and up GLFW / Cocoa requirement
+        if platform.system() == 'Darwin':
+            if not any('-XstartOnFirstThread' in a for a in jvm_args) and not any('-XstartOnFirstThread' in a for a in extra_jvm):
+                extra_jvm.insert(0, '-XstartOnFirstThread')
+            if not any('-Xdock:name=' in a for a in jvm_args):
+                extra_jvm.append('-Xdock:name=Minecraft')
+            if not any('-Dapple.laf.useScreenMenuBar=' in a for a in jvm_args):
+                extra_jvm.append('-Dapple.laf.useScreenMenuBar=true')
 
         if not game_args:
             game_args = [

@@ -1,2 +1,49 @@
-# Auto detect text files and perform LF normalization
+# Auto detect text files and perform LF normalization in the repository
 * text=auto
+
+# Enforce LF line endings for all shell and POSIX scripts (critical for macOS/Linux)
+*.sh text eol=lf
+*.command text eol=lf
+*.bash text eol=lf
+*.zsh text eol=lf
+
+# Source code and configuration files: enforce LF line endings
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.xml text eol=lf
+*.svg text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.plist text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+
+# Windows batch files must retain CRLF line endings
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files (do not touch line endings or modify bytes)
+*.jar binary
+*.class binary
+*.dll binary
+*.exe binary
+*.dylib binary
+*.so binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.zip binary
+*.tar.gz binary
+*.gz binary
+*.archive binary
+*.dat binary
+*.nbt binary
+*.db binary

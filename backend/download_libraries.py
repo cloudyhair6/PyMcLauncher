@@ -247,6 +247,8 @@ def download_libraries(version_id, json_mode=None, is_dev_mode=None):
     sysname = platform.system().lower()
     os_key = 'osx' if sysname == 'darwin' else ('windows' if sysname == 'windows' else 'linux')
     arch_bits = '64' if sys.maxsize > 2**32 else '32'
+    machine = platform.machine().lower()
+    is_arm = 'arm' in machine or 'aarch' in machine
 
     candidate_items = []
     for library in libraries:
@@ -265,14 +267,37 @@ def download_libraries(version_id, json_mode=None, is_dev_mode=None):
         if 'classifiers' in downloads:
             classifiers = downloads['classifiers']
             natives_map = library.get('natives')
+            target_keys = []
             if isinstance(natives_map, dict):
                 raw_cls_key = natives_map.get(os_key)
-                target_keys = [raw_cls_key.replace('${arch}', arch_bits)] if raw_cls_key else []
-            else:
-                target_keys = [
-                    k for k in classifiers.keys()
-                    if os_key in k.lower() or ('osx' if os_key == 'osx' else os_key) in k.lower()
-                ] or list(classifiers.keys())
+                if raw_cls_key:
+                    formatted_key = raw_cls_key.replace('${arch}', arch_bits)
+                    if sysname == 'darwin' and is_arm:
+                        arm_key = f"{formatted_key}-arm64"
+                        if arm_key in classifiers:
+                            target_keys.append(arm_key)
+                        else:
+                            target_keys.append(formatted_key)
+                    else:
+                        target_keys.append(formatted_key)
+            if not target_keys:
+                if sysname == 'darwin':
+                    if is_arm:
+                        # Prefer arm64 classifiers if available on Apple Silicon
+                        target_keys = [
+                            k for k in classifiers.keys()
+                            if ('osx' in k.lower() or 'macos' in k.lower()) and 'arm64' in k.lower()
+                        ]
+                    if not target_keys:
+                        target_keys = [
+                            k for k in classifiers.keys()
+                            if 'osx' in k.lower() or 'macos' in k.lower()
+                        ]
+                else:
+                    target_keys = [
+                        k for k in classifiers.keys()
+                        if os_key in k.lower() or ('osx' if os_key == 'osx' else os_key) in k.lower()
+                    ] or list(classifiers.keys())
             for classifier_key in target_keys:
                 if classifier_key not in classifiers:
                     continue
@@ -382,7 +407,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Download Minecraft libraries for a specific version",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""\nExamples:\n  python download_libraries.py --version list\n  python download_libraries.py --version 1.21.1\n  python download_libraries.py --version 1.21.1 --dev-mode\n  python download_libraries.py --version 1.21.1 --dir custom_minecraft/\n        """
+        epilog="""\nExamples:\n  python download_libraries.py --version list\n  python download_libraries.py --version 1.21.1\n  python download_libraries.py --version 1.21.1 --source\n  python download_libraries.py --version 1.21.1 --dir custom_minecraft/\n        """
     )
     
     parser.add_argument(
@@ -392,9 +417,11 @@ def main():
     )
     
     parser.add_argument(
+        "--source",
         "--dev-mode",
+        dest="source",
         action="store_true",
-        help="Dev mode: save to dev_minecraft_downloads/"
+        help="Source mode: save to dev_minecraft_downloads/"
     )
     
     parser.add_argument(
@@ -419,7 +446,7 @@ def main():
     json_output = args.json
     
     # Handle directory setup (respect active profile in launcher_config.json unless --dir is passed)
-    if args.dev_mode:
+    if args.source:
         dev_mode = True
     if args.dir:
         set_download_dir(args.dir)

@@ -256,6 +256,23 @@ def _run_qt_gui(QtModule):
 
     install_dir = os.path.abspath(os.path.dirname(__file__))
 
+    try:
+        if qt_ver == 6:
+            from PyQt6.QtGui import QIcon
+        else:
+            from PyQt5.QtGui import QIcon
+        inst_icon = QIcon()
+        icon_svg = os.path.join(install_dir, "images", "icon", "PyMcLauncher.svg")
+        icon_ico = os.path.join(install_dir, "images", "icon", "PyMcLauncher.ico")
+        if os.path.exists(icon_svg):
+            inst_icon.addFile(icon_svg)
+        if os.path.exists(icon_ico):
+            inst_icon.addFile(icon_ico)
+        if not inst_icon.isNull():
+            app.setWindowIcon(inst_icon)
+    except Exception:
+        pass
+
     # Splash / loading
     splash = QtWidgets.QProgressDialog("Checking latest release information...", None, 0, 0)
     splash.setWindowTitle("PyMcLauncher Installer")
@@ -454,6 +471,13 @@ def _run_tkinter_gui():
     root.resizable(False, False)
 
     install_dir = os.path.abspath(os.path.dirname(__file__))
+
+    icon_ico = os.path.join(install_dir, "images", "icon", "PyMcLauncher.ico")
+    if os.path.exists(icon_ico):
+        try:
+            root.iconbitmap(icon_ico)
+        except Exception:
+            pass
 
     lbl_title = tk.Label(root, text="PyMcLauncher Installer", font=("Arial", 14, "bold"))
     lbl_title.pack(pady=10)

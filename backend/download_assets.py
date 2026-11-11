@@ -419,7 +419,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Download Minecraft assets",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""\nExamples:\n  python download_assets.py --version list\n  python download_assets.py --version 1.21.1\n  python download_assets.py --version 1.21.1 --dev-mode\n  python download_assets.py --version 1.21.1 --dir custom_dir/\n        """
+        epilog="""\nExamples:\n  python download_assets.py --version list\n  python download_assets.py --version 1.21.1\n  python download_assets.py --version 1.21.1 --source\n  python download_assets.py --version 1.21.1 --dir custom_dir/\n        """
     )
     
     parser.add_argument(
@@ -429,9 +429,11 @@ def main():
     )
     
     parser.add_argument(
+        "--source",
         "--dev-mode",
+        dest="source",
         action="store_true",
-        help="Download assets with proper folder structure (e.g., minecraft/sounds/ambient/) instead of hash-based, saves to dev_minecraft_downloads/"
+        help="Source mode: download assets with proper folder structure (e.g., minecraft/sounds/ambient/) instead of hash-based, saves to dev_minecraft_downloads/"
     )
     
     parser.add_argument(
@@ -456,7 +458,7 @@ def main():
     json_output = args.json
     
     # Handle directory setup (respect active profile in launcher_config.json unless --dir is passed)
-    if args.dev_mode:
+    if args.source:
         dev_mode = True
     if args.dir:
         set_download_dir(args.dir)

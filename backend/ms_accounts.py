@@ -326,12 +326,22 @@ class PurePythonAuthFlow:
             print(f"---> [COPIED] Authentication Code: {code}", flush=True)
             print("---> The code has been copied to your clipboard. Paste it into the page!", flush=True)
             print(f"\n{msg}", flush=True)
-            if os.name == "nt":
-                try:
+            try:
+                if sys.platform == "darwin":
+                    subprocess.run(["pbcopy"], input=code.strip().encode("utf-8"), check=False)
+                    subprocess.run(["open", direct_url], check=False)
+                elif os.name == "nt":
                     subprocess.run(f"echo {code} | clip", shell=True)
                     os.startfile(direct_url)
-                except Exception:
-                    pass
+                else:
+                    import webbrowser
+                    try:
+                        subprocess.run(["xclip", "-selection", "clipboard"], input=code.strip().encode("utf-8"), check=False)
+                    except Exception:
+                        pass
+                    webbrowser.open(direct_url)
+            except Exception:
+                pass
 
         interval = min(int(res.get("interval", 5)), 2)
         expires_in = int(res.get("expires_in", 900))
