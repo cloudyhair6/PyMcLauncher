@@ -11,6 +11,10 @@ Before running the launcher, make sure you have the following installed on your 
 - **Python 3.10 or newer** (Python 3.11 or 3.12 64-bit recommended).
   - **Windows**: Make sure to check **"Add Python to PATH"** during installation.
   - **macOS**: Install Python 3 via the official [Python.org macOS installer](https://www.python.org/downloads/macos/) or via Homebrew (`brew install python`).
+- If you don't know what your doing then download this for:
+  - **[Windows](https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe)**
+  - **[macOS](https://www.python.org/ftp/python/3.12.7/python-3.12.7-macos11.pkg)**
+  - The python page is [here](https://www.python.org/downloads/release/python-3127/)
 - **Operating System**:
   - **Windows**: Windows 10 or Windows 11 (64-bit).
   - **macOS**: macOS 11.0 Big Sur, Monterey 12, Ventura 13, Sonoma 14, Sequoia 15+ (Apple Silicon `arm64` and Intel `x86_64`).
