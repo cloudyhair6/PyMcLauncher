@@ -2,6 +2,8 @@
     "Minecraft Launcher for PC": {
         "Files": [
             "setup-start.bat",
+            "setup-start.command",
+            "setup-start.sh",
             "launcher.py",
             "requirements.txt",
             "README.md",

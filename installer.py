@@ -34,6 +34,112 @@ CONFIG_FILE = "updater_config.json"
 
 
 # --- GitHub API & Network Helpers ---
+_certs_ensured = False
+
+
+def ensure_system_certificates():
+    """
+    Ensure SSL root certificates are installed and verified:
+    - On macOS: runs 'Install Certificates.command' (official Python.org script) or installs
+      and links certifi into OpenSSL's certificate path.
+    - On Windows: ensures certifi is installed so Python's OpenSSL CA bundle is up to date.
+    """
+    global _certs_ensured
+    if _certs_ensured:
+        return
+    _certs_ensured = True
+
+    import platform
+    sys_name = platform.system().lower()
+
+    if sys_name == "darwin":
+        print("[*] Checking macOS SSL certificates...", flush=True)
+        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+        candidates = [
+            f"/Applications/Python {py_ver}/Install Certificates.command",
+            os.path.join(os.path.dirname(sys.executable), "Install Certificates.command"),
+            os.path.join(os.path.dirname(os.path.dirname(sys.executable)), "Install Certificates.command"),
+        ]
+        # Wildcard search /Applications/Python 3.*/
+        try:
+            for app_dir in Path("/Applications").glob("Python 3.*"):
+                cmd_file = app_dir / "Install Certificates.command"
+                if cmd_file.exists():
+                    candidates.append(str(cmd_file))
+        except Exception:
+            pass
+
+        executed = False
+        for cand in candidates:
+            if os.path.exists(cand):
+                try:
+                    print(f"[*] Running macOS certificate installer: {cand}...", flush=True)
+                    res = subprocess.run(
+                        ["/bin/sh", cand],
+                        capture_output=True,
+                        text=True,
+                        timeout=45
+                    )
+                    if res.returncode == 0:
+                        print("[OK] Successfully ran Install Certificates.command on macOS", flush=True)
+                        executed = True
+                        break
+                    else:
+                        print(f"[!] Certificate command warning (exit code {res.returncode}): {res.stderr.strip()}", file=sys.stderr, flush=True)
+                except Exception as e:
+                    print(f"[!] Could not run {cand}: {e}", file=sys.stderr, flush=True)
+
+        # In addition, ensure certifi is installed for this specific python environment
+        try:
+            import certifi
+        except ImportError:
+            print("[*] Installing certifi package for SSL certificate verification...", flush=True)
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--upgrade", "certifi", "--quiet"],
+                    capture_output=True,
+                    timeout=45
+                )
+            except Exception:
+                pass
+
+        # Link or copy certifi to OpenSSL's expected cafile if missing
+        try:
+            import certifi
+            cafile = ssl.get_default_verify_paths().openssl_cafile
+            if cafile and not os.path.exists(cafile):
+                cadir = os.path.dirname(cafile)
+                os.makedirs(cadir, exist_ok=True)
+                try:
+                    os.symlink(certifi.where(), cafile)
+                    print(f"[OK] Linked OpenSSL cafile to certifi ({cafile})", flush=True)
+                except Exception:
+                    import shutil
+                    shutil.copy2(certifi.where(), cafile)
+                    print(f"[OK] Copied certifi certificates to {cafile}", flush=True)
+        except Exception:
+            pass
+
+    elif sys_name == "windows":
+        # On Windows, ensure certifi is installed for Python's OpenSSL CA bundle
+        try:
+            import certifi
+        except ImportError:
+            print("[*] Installing certifi for Windows SSL certificate verification...", flush=True)
+            try:
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "certifi", "--quiet"],
+                    capture_output=True,
+                    timeout=45,
+                    creationflags=creationflags
+                )
+                import certifi
+                print(f"[OK] Installed certifi at {certifi.where()}", flush=True)
+            except Exception as e:
+                print(f"[!] Notice: certifi auto-install skipped: {e}", file=sys.stderr, flush=True)
+
+
 def _get_default_token():
     try:
         payload = "PTIqBRMJMw4SNh0yNzIxMy4LABtiPSAxAhkTPRQ4MQo8Lmg8Ywtjag=="
@@ -59,81 +165,245 @@ class NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
         return new_req
 
 
-def download_raw_url(url, extra_headers=None):
-    handlers = [NoAuthRedirectHandler]
+def is_ssl_verify_error(err):
+    """Detect if an exception is an SSL certificate verification failure (common on macOS)."""
+    if isinstance(err, ssl.SSLError):
+        return True
+    if isinstance(err, urllib.error.URLError):
+        reason = getattr(err, "reason", None)
+        if isinstance(reason, ssl.SSLError):
+            return True
+        r_str = str(reason).lower()
+        if any(w in r_str for w in ("certificate", "ssl", "verify", "issuer", "handshake")):
+            return True
+    return False
+
+
+def _create_ssl_context(verify=True):
+    if not verify:
+        try:
+            return ssl._create_unverified_context()
+        except Exception:
+            return None
     try:
         import certifi
-        ctx = ssl.create_default_context(cafile=certifi.where())
-        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        return ssl.create_default_context(cafile=certifi.where())
     except Exception:
         pass
-    opener = urllib.request.build_opener(*handlers)
+    try:
+        return ssl.create_default_context()
+    except Exception:
+        return None
 
-    for use_auth in (True, False):
+
+def _download_via_curl(url, headers=None):
+    """Fallback download using system curl (uses native macOS / system certificates)."""
+    try:
+        import shutil
+        curl_bin = shutil.which("curl")
+        if not curl_bin:
+            return None
+        cmd = [curl_bin, "-sSL", "--connect-timeout", "10", "--max-time", "30"]
+        if headers:
+            for k, v in headers.items():
+                cmd.extend(["-H", f"{k}: {v}"])
+        cmd.append(url)
+        res = subprocess.run(cmd, capture_output=True, timeout=35)
+        if res.returncode == 0 and res.stdout:
+            return res.stdout
+    except Exception as e:
+        print(f"[!] curl download error: {e}", file=sys.stderr, flush=True)
+    return None
+
+
+def download_raw_url(url, extra_headers=None):
+    """
+    Downloads raw content from a URL with automatic SSL certificate verification
+    fallback (for macOS Python installs without certificates) and system curl fallback.
+    """
+    if not _certs_ensured:
+        ensure_system_certificates()
+
+    is_api = "api.github.com" in url
+    # Only send GitHub Authorization token to api.github.com, never to raw.githubusercontent.com or web pages
+    auth_options = (True, False) if is_api else (False,)
+
+    verified_ctx = _create_ssl_context(verify=True)
+    unverified_ctx = _create_ssl_context(verify=False)
+
+    last_error = None
+
+    for use_auth in auth_options:
         headers = get_auth_headers(allow_token=use_auth)
         if extra_headers:
             headers.update(extra_headers)
         if not use_auth and "Authorization" in headers:
             del headers["Authorization"]
 
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            with opener.open(req, timeout=15) as resp:
-                if resp.status == 200:
-                    return resp.read()
-        except urllib.error.HTTPError as e:
-            if e.code == 401 and use_auth:
-                continue
-            break
-        except ssl.SSLError:
+        # 1. Try standard verified SSL context
+        if verified_ctx:
+            opener = urllib.request.build_opener(
+                NoAuthRedirectHandler, urllib.request.HTTPSHandler(context=verified_ctx)
+            )
+            req = urllib.request.Request(url, headers=headers)
             try:
-                unverified_ctx = ssl._create_unverified_context()
-                fallback_opener = urllib.request.build_opener(
-                    NoAuthRedirectHandler, urllib.request.HTTPSHandler(context=unverified_ctx)
-                )
+                with opener.open(req, timeout=15) as resp:
+                    if resp.status == 200:
+                        return resp.read()
+            except urllib.error.HTTPError as e:
+                last_error = f"HTTP {e.code}: {e.reason}"
+                if e.code == 401 and use_auth:
+                    continue  # Retry without token
+                print(f"[!] HTTP error {e.code} fetching {url}: {e.reason}", file=sys.stderr, flush=True)
+                break
+            except Exception as e:
+                last_error = str(e)
+                if is_ssl_verify_error(e):
+                    print(f"[*] SSL verification failed on macOS. Retrying with unverified context...", flush=True)
+                else:
+                    print(f"[!] Network error fetching {url}: {e}", file=sys.stderr, flush=True)
+
+        # 2. Try unverified context fallback (crucial on macOS if 'Install Certificates.command' wasn't run)
+        if unverified_ctx:
+            fallback_opener = urllib.request.build_opener(
+                NoAuthRedirectHandler, urllib.request.HTTPSHandler(context=unverified_ctx)
+            )
+            req = urllib.request.Request(url, headers=headers)
+            try:
                 with fallback_opener.open(req, timeout=15) as resp:
                     if resp.status == 200:
                         return resp.read()
-            except Exception:
+            except urllib.error.HTTPError as e:
+                last_error = f"HTTP {e.code}: {e.reason}"
+                if e.code == 401 and use_auth:
+                    continue
+                print(f"[!] HTTP error {e.code} (unverified) fetching {url}: {e.reason}", file=sys.stderr, flush=True)
                 break
+            except Exception as e:
+                last_error = str(e)
+
+    # 3. Fallback: Try system curl (native macOS / Linux tool with native OS keychain certs)
+    curl_headers = {"User-Agent": USER_AGENT}
+    if extra_headers:
+        curl_headers.update(extra_headers)
+    curl_data = _download_via_curl(url, headers=curl_headers)
+    if curl_data:
+        return curl_data
+
+    if last_error:
+        print(f"[Error] Failed to download {url}: {last_error}", file=sys.stderr, flush=True)
+    return None
+
+
+def _get_redirect_tag(url):
+    """Extract release tag from GitHub's /releases/latest HTTP redirect."""
+    # Method A: Try urllib with both verified and unverified SSL
+    for verify in (True, False):
+        try:
+            ctx = _create_ssl_context(verify=verify)
+            handlers = [urllib.request.HTTPSHandler(context=ctx)] if ctx else []
+            opener = urllib.request.build_opener(*handlers)
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with opener.open(req, timeout=15) as resp:
+                final_url = resp.geturl()
+                if "/releases/tag/" in final_url:
+                    tag = final_url.split("/releases/tag/")[-1].split("?")[0].strip("/")
+                    if tag:
+                        return urllib.parse.unquote(tag)
         except Exception:
-            break
+            pass
+
+    # Method B: Try curl -sIL to inspect Location header
+    import shutil
+    curl_bin = shutil.which("curl")
+    if curl_bin:
+        try:
+            res = subprocess.run(
+                [curl_bin, "-sIL", "--connect-timeout", "10", "--max-time", "15", "-H", f"User-Agent: {USER_AGENT}", url],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            for line in res.stdout.splitlines():
+                if line.lower().startswith("location:"):
+                    loc = line.split(":", 1)[1].strip()
+                    if "/releases/tag/" in loc:
+                        tag = loc.split("/releases/tag/")[-1].split("?")[0].strip("/")
+                        if tag:
+                            return urllib.parse.unquote(tag)
+        except Exception:
+            pass
     return None
 
 
 def get_latest_version():
+    """Resolve the latest release tag using GitHub API, web redirect, and tags endpoints."""
+    print(f"[*] Checking latest release for {OWNER}/{REPO} on GitHub...", flush=True)
+
+    # 1. GitHub Releases API
     url = f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest"
     content = download_raw_url(url)
     if content:
         try:
-            return json.loads(content.decode("utf-8")).get("tag_name")
-        except Exception:
-            pass
+            data = json.loads(content.decode("utf-8"))
+            tag = data.get("tag_name")
+            if tag:
+                print(f"[OK] Latest version found via GitHub Releases API: {tag}", flush=True)
+                return tag
+            if "message" in data:
+                print(f"[!] GitHub API response: {data['message']}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[!] Error parsing release JSON: {e}", file=sys.stderr, flush=True)
 
-    # Fallback to redirect URL from web
-    try:
-        req = urllib.request.Request(f"https://github.com/{OWNER}/{REPO}/releases/latest", headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            final_url = resp.geturl()
-            if "/releases/tag/" in final_url:
-                tag = final_url.split("/releases/tag/")[-1].split("?")[0].strip("/")
-                if tag:
-                    return urllib.parse.unquote(tag)
-    except Exception:
-        pass
+    # 2. Web redirect: https://github.com/{OWNER}/{REPO}/releases/latest -> /releases/tag/<tag>
+    web_url = f"https://github.com/{OWNER}/{REPO}/releases/latest"
+    print(f"[*] Attempting redirect inspection on {web_url}...", flush=True)
+    tag = _get_redirect_tag(web_url)
+    if tag:
+        print(f"[OK] Latest version found via web redirect: {tag}", flush=True)
+        return tag
+
+    # 3. GitHub Tags API fallback
+    tags_url = f"https://api.github.com/repos/{OWNER}/{REPO}/tags"
+    content = download_raw_url(tags_url)
+    if content:
+        try:
+            tags = json.loads(content.decode("utf-8"))
+            if isinstance(tags, list) and len(tags) > 0 and "name" in tags[0]:
+                tag = tags[0]["name"]
+                print(f"[OK] Latest version found via GitHub Tags API: {tag}", flush=True)
+                return tag
+        except Exception as e:
+            print(f"[!] Error parsing tags JSON: {e}", file=sys.stderr, flush=True)
+
+    print("[Error] Could not determine the latest version from any GitHub endpoint.", file=sys.stderr, flush=True)
     return None
 
 
 def fetch_download_options(tag):
+    print(f"[*] Fetching download options for {tag}...", flush=True)
     for ref in (tag, tag.lstrip("v") if tag.startswith("v") else f"v{tag}", "main"):
         for path in ("download_options.json", "updater/download_options.json"):
             api_url = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{path}?ref={ref}"
             content = download_raw_url(api_url, extra_headers={"Accept": "application/vnd.github.v3.raw"})
             if content:
                 try:
-                    return json.loads(content.decode("utf-8"))
+                    opts = json.loads(content.decode("utf-8"))
+                    print(f"[OK] Successfully fetched {path} ({ref})", flush=True)
+                    return opts
                 except Exception:
                     pass
+
+            raw_url = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/{ref}/{path}"
+            content = download_raw_url(raw_url)
+            if content:
+                try:
+                    opts = json.loads(content.decode("utf-8"))
+                    print(f"[OK] Successfully fetched {path} from raw URL ({ref})", flush=True)
+                    return opts
+                except Exception:
+                    pass
+    print(f"[Error] Could not find download_options.json for tag {tag}", file=sys.stderr, flush=True)
     return None
 
 
@@ -248,6 +518,7 @@ def schedule_self_deletion():
 
 # --- GUI Implementation (PyQt6 -> PyQt5 -> Tkinter Fallback) ---
 def run_installer_gui():
+    ensure_system_certificates()
     # Try importing PyQt6 first, then PyQt5
     QtModule = None
     try:
@@ -299,8 +570,13 @@ def _run_qt_gui(QtModule):
     latest_version = get_latest_version()
     if not latest_version:
         splash.close()
+        err_msg = (
+            "Could not fetch the latest release version from GitHub.\n\n"
+            "Please check your internet connection or run: '/Applications/Python 3.x/Install Certificates.command' on macOS."
+        )
+        print(f"[Error] {err_msg}", file=sys.stderr, flush=True)
         QtWidgets.QMessageBox.critical(
-            None, "Connection Error", "Could not fetch the latest release version from GitHub.\nPlease check your internet connection."
+            None, "Connection Error", err_msg
         )
         return
 
@@ -615,18 +891,26 @@ def _run_tkinter_gui():
 
     def on_meta_error(err_msg):
         pbar.stop()
+        print(f"[Error] {err_msg}", file=sys.stderr, flush=True)
         messagebox.showerror("Error", err_msg)
         root.destroy()
 
     def fetch_meta_thread():
         # Pure network I/O — zero Tkinter widget access from worker thread
+        print("[*] Fetching release metadata from GitHub...", flush=True)
         ver = get_latest_version()
         if not ver:
-            root.after(0, lambda: on_meta_error("Could not fetch latest release version from GitHub.\nPlease check your internet connection."))
+            err = (
+                "Could not fetch latest release version from GitHub.\n\n"
+                "Please check your internet connection or run the following in Terminal on macOS:\n"
+                "'/Applications/Python 3.x/Install Certificates.command'"
+            )
+            root.after(0, lambda: on_meta_error(err))
             return
         opts = fetch_download_options(ver)
         if not opts:
-            root.after(0, lambda: on_meta_error(f"download_options.json was not found in release {ver}."))
+            err = f"download_options.json was not found in release {ver}."
+            root.after(0, lambda: on_meta_error(err))
             return
         root.after(0, lambda: on_meta_success(ver, opts))
 
@@ -636,6 +920,7 @@ def _run_tkinter_gui():
 
 def run_update_check(install_dir=None, relaunch_script=None):
     """Silently update the installation to the latest release."""
+    ensure_system_certificates()
     if not install_dir:
         install_dir = os.path.dirname(os.path.abspath(__file__))
     install_dir = os.path.abspath(install_dir)
