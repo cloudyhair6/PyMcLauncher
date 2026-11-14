@@ -1,7 +1,11 @@
 requests>=2.28.0
-PyQt6
-PyQt6-WebEngine
 minecraft-launcher-lib
 nbt
 nbtlib
-msal[broker]>=1.30.0
+certifi
+msal[broker]>=1.30.0; sys_platform == 'win32'
+msal>=1.30.0; sys_platform != 'win32'
+PyQt6<6.8.0; sys_platform == 'darwin' and platform_release < '21.0.0'
+PyQt6; sys_platform != 'darwin' or platform_release >= '21.0.0'
+PyQt6-WebEngine<6.8.0; sys_platform == 'darwin' and platform_release < '21.0.0'
+PyQt6-WebEngine; sys_platform != 'darwin' or platform_release >= '21.0.0'
