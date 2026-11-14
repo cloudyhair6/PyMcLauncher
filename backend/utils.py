@@ -1589,6 +1589,10 @@ def create_macos_shortcut(
                 '    <string>1.0</string>\n'
                 '    <key>CFBundleIconFile</key>\n'
                 '    <string>app.icns</string>\n'
+                '    <key>NSBluetoothAlwaysUsageDescription</key>\n'
+                '    <string>PyMcLauncher uses Bluetooth for passkey and security key sign-in.</string>\n'
+                '    <key>NSBluetoothPeripheralUsageDescription</key>\n'
+                '    <string>PyMcLauncher uses Bluetooth for passkey and security key sign-in.</string>\n'
                 '</dict>\n'
                 '</plist>\n'
             )

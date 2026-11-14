@@ -3284,6 +3284,7 @@ class LauncherGUI(QMainWindow):
                     pass
         try:
             proc.kill()
+            proc.waitForFinished(1500)
         except Exception:
             pass
 
@@ -3291,6 +3292,7 @@ class LauncherGUI(QMainWindow):
         if getattr(self, '_pipeline_worker', None) and self._pipeline_worker.isRunning():
             self._pipeline_worker.cancel()
             self._pipeline_worker.wait(1000)
+        self._cleanup_browser()
         self._kill_qprocess_tree(getattr(self, 'process', None))
         for inst in list(getattr(self, 'running_instances', [])):
             if inst.get('window_timer'):
@@ -3306,8 +3308,13 @@ class LauncherGUI(QMainWindow):
                 except Exception:
                     pass
             self._kill_qprocess_tree(inst.get('process'))
-        if getattr(self, 'refresh_process', None) and self.refresh_process.state() != QProcess.ProcessState.NotRunning:
-            self.refresh_process.kill()
+        refresh_proc = getattr(self, 'refresh_process', None)
+        if refresh_proc and refresh_proc.state() != QProcess.ProcessState.NotRunning:
+            try:
+                refresh_proc.kill()
+                refresh_proc.waitForFinished(1500)
+            except Exception:
+                pass
         event.accept()
 
     def update_ui_state(self):
@@ -4338,9 +4345,22 @@ class LauncherGUI(QMainWindow):
                 self.log("[System] Waiting for user to complete Microsoft login in popup window...")
                 self.open_browser(url, login_hint=hint, mode="oauth_popup")
             elif obj.get("status") == "pending_browser_login":
-                code = obj.get("user_code")
-                url = obj.get("verification_uri")
+                code = obj.get("user_code") or ""
+                url = obj.get("verification_uri") or "https://www.microsoft.com/link"
                 self.log(f"[System] Opened default web browser for sign-in ({url}). Code: {code}")
+                if code:
+                    try:
+                        from PyQt6.QtGui import QGuiApplication
+                        cb = QGuiApplication.clipboard()
+                        if cb:
+                            cb.setText(code)
+                    except Exception:
+                        pass
+                    self.status_label.setText(f"Finish signing in in your browser (Code copied: {code})")
+                    self.step_progress_bar.setFormat(f"Waiting for browser sign-in... Code: {code}")
+                else:
+                    self.status_label.setText("Finish signing in in your default web browser...")
+                    self.step_progress_bar.setFormat("Waiting for browser sign-in...")
             elif obj.get("status") == "pending_login":
                 url = obj.get("verification_uri")
                 code = obj.get("user_code")
@@ -4880,18 +4900,25 @@ class LauncherGUI(QMainWindow):
                         except Exception:
                             pass
                         proc.kill()
+                        try:
+                            proc.waitForFinished(1000)
+                        except Exception:
+                            pass
                 super().closeEvent(event)
 
         self._browser_login_hint = (login_hint or "").strip() or None
         self._browser_user_code = (user_code or "").strip() or None
         self._browser_mode = mode or "device_code"
+        self._browser_start_url = url
         self._browser_auth_done = False
+        self._initial_load_finished = False
         self.browser_window = LoginBrowserWindow(self)
         if user_code:
             self.browser_window.setWindowTitle(f"Microsoft Login - Code: {user_code} (Copied to Clipboard)")
         else:
             self.browser_window.setWindowTitle("Microsoft Login - Minecraft Launcher")
-        self.browser_window.setFixedSize(600, 750)
+        self.browser_window.resize(600, 780)
+        self.browser_window.setMinimumSize(520, 660)
         
         self.browser_central = QWidget()
         main_layout = QVBoxLayout(self.browser_central)
@@ -4911,6 +4938,29 @@ class LauncherGUI(QMainWindow):
             copy_btn.clicked.connect(lambda: QGuiApplication.clipboard().setText(user_code))
             banner_layout.addWidget(copy_btn)
             main_layout.addWidget(code_banner)
+
+        browser_helper_bar = QWidget()
+        browser_helper_bar.setStyleSheet("background-color: #252526; border-bottom: 1px solid #3c3c3c;")
+        helper_layout = QHBoxLayout(browser_helper_bar)
+        helper_layout.setContentsMargins(12, 6, 12, 6)
+        helper_layout.setSpacing(8)
+        default_helper_text = (
+            "Using a phone or iCloud passkey? Click 'Open in Default Browser'."
+            if os.name != "nt"
+            else "Trouble with passkey or sign-in? You can switch to your default browser."
+        )
+        self.browser_helper_label = QLabel(default_helper_text)
+        self.browser_helper_label.setWordWrap(True)
+        self.browser_helper_label.setStyleSheet("color: #d4d4d4; font-size: 12px;")
+        helper_layout.addWidget(self.browser_helper_label, stretch=1)
+        open_ext_btn = QPushButton("Open in Default Browser")
+        open_ext_btn.setStyleSheet(
+            "background-color: #0078D7; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 5px 12px; font-size: 12px;"
+        )
+        open_ext_btn.clicked.connect(self._switch_to_default_browser_login)
+        helper_layout.addWidget(open_ext_btn)
+        main_layout.addWidget(browser_helper_bar)
 
         view_container = QWidget()
         self.browser_layout = QGridLayout(view_container)
@@ -4935,7 +4985,6 @@ class LauncherGUI(QMainWindow):
         loading_layout.addWidget(self.loading_label)
         
         from utils import get_active_profile_id
-        import os
         active_id = get_active_profile_id()
 
         if not hasattr(self, '_profile_cache'):
@@ -5049,19 +5098,41 @@ class LauncherGUI(QMainWindow):
                     QApplication.processEvents()
                     return
                 if message == "AGY_WEBAUTHN_START":
-                    self.parent_gui._set_webauthn_loading(js_active=True)
+                    if os.name == "nt":
+                        self.parent_gui._set_webauthn_loading(js_active=True)
+                    else:
+                        self.parent_gui._set_browser_helper_notice(
+                            "Passkey / security key check active. If no prompt opens, choose 'Other ways to sign in' below or click 'Open in Default Browser'.",
+                            warning=False,
+                        )
                     return
                 if message == "AGY_WEBAUTHN_SUCCESS":
-                    self.parent_gui._webauthn_completed = True
-                    self.parent_gui._set_webauthn_loading(js_active=True)
+                    if os.name == "nt":
+                        self.parent_gui._webauthn_completed = True
+                        self.parent_gui._set_webauthn_loading(js_active=True)
+                        QTimer.singleShot(6000, self.parent_gui._clear_stuck_webauthn_loading)
                     return
                 if message in ("AGY_WEBAUTHN_END", "AGY_WEBAUTHN_CANCEL"):
                     self.parent_gui._webauthn_completed = False
                     self.parent_gui._set_webauthn_loading(js_active=False)
+                    if os.name != "nt":
+                        self.parent_gui._set_browser_helper_notice(
+                            "Passkey couldn't complete in the embedded window. Click 'Other ways to sign in' below, or click 'Open in Default Browser'.",
+                            warning=True,
+                        )
                     return
                 super().javaScriptConsoleMessage(level, message, lineNumber, sourceID)
                 
         self.web_page = LoginWebPage(self.web_profile, self)
+        try:
+            from ms_accounts import attach_webauthn_ux_handler
+            attach_webauthn_ux_handler(
+                self.web_page,
+                parent_window=self.browser_window,
+                on_switch_browser=self._switch_to_default_browser_login,
+            )
+        except Exception as e:
+            self.log(f"[System] Optional Qt WebAuthn dialog setup skipped: {e}")
         
         self.browser = QWebEngineView()
         self.browser.setPage(self.web_page)
@@ -5076,18 +5147,75 @@ class LauncherGUI(QMainWindow):
         self.browser.loadFinished.connect(self.on_browser_load_finished)
         self.browser.urlChanged.connect(self.on_browser_url_changed)
 
-        # Poll for native Windows Security (WebAuthn / Passkey / Security Key) modal dialog
-        self._webauthn_poll_timer = QTimer(self.browser_window)
-        self._webauthn_poll_timer.setInterval(120)
-        self._webauthn_poll_timer.timeout.connect(self._poll_windows_webauthn_dialog)
-        self._webauthn_poll_timer.start()
+        if os.name == "nt":
+            # Poll for native Windows Security (WebAuthn / Passkey / Security Key) modal dialog
+            self._webauthn_poll_timer = QTimer(self.browser_window)
+            self._webauthn_poll_timer.setInterval(120)
+            self._webauthn_poll_timer.timeout.connect(self._poll_windows_webauthn_dialog)
+            self._webauthn_poll_timer.start()
+        else:
+            self._webauthn_poll_timer = None
 
         self.browser_window.setCentralWidget(self.browser_central)
         self.loading_widget.show()
         self.loading_widget.raise_()
+        QTimer.singleShot(8000, self._clear_stuck_initial_loading)
         self.browser_window.show()
 
+    def _set_browser_helper_notice(self, text: str, warning: bool = False):
+        lbl = getattr(self, "browser_helper_label", None)
+        if not lbl:
+            return
+        try:
+            lbl.setText(text)
+            if warning:
+                lbl.setStyleSheet("color: #ffd479; font-size: 12px; font-weight: bold;")
+            else:
+                lbl.setStyleSheet("color: #d4d4d4; font-size: 12px;")
+        except RuntimeError:
+            pass
+
+    def _clear_stuck_initial_loading(self):
+        if getattr(self, "_browser_page_loading", False) and not getattr(self, "_initial_load_finished", False):
+            self._browser_page_loading = False
+            self._set_webauthn_loading()
+
+    def _clear_stuck_webauthn_loading(self):
+        if getattr(self, "_webauthn_completed", False) and not getattr(self, "_browser_auth_done", False):
+            self._webauthn_completed = False
+            self._webauthn_js_active = False
+            self._set_webauthn_loading()
+
+    def _switch_to_default_browser_login(self):
+        if getattr(self, "_browser_auth_done", False):
+            return
+        self._browser_auth_done = True
+        mode = getattr(self, "_browser_mode", "")
+        proc = getattr(self, "process", None)
+        if mode == "oauth_popup" and proc:
+            self.log("[System] Switching Microsoft sign-in to default web browser...")
+            self.status_label.setText("Opening your default web browser for sign-in...")
+            self.step_progress_bar.setFormat("Opening default web browser...")
+            try:
+                proc.write(b'{"switch_to_browser": true}\n')
+                proc.closeWriteChannel()
+            except Exception as e:
+                self.log(f"[Error] Could not switch popup to browser mode: {e}")
+            self._cleanup_browser()
+            return
+
+        # Fallback when already in device_code mode
+        target_url = getattr(self, "_browser_start_url", None) or "https://www.microsoft.com/link"
+        try:
+            from PyQt6.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl(target_url))
+        except Exception:
+            pass
+        self._cleanup_browser()
+
     def _on_browser_load_started(self):
+        if getattr(self, "_initial_load_finished", False):
+            return
         self._browser_page_loading = True
         if hasattr(self, 'loading_widget') and self.loading_widget:
             self.loading_widget.show()
@@ -5142,6 +5270,8 @@ class LauncherGUI(QMainWindow):
         self._webauthn_os_active = False
         self._webauthn_completed = False
         self._browser_page_loading = False
+        self._initial_load_finished = False
+        self._browser_start_url = None
         if getattr(self, '_webauthn_poll_timer', None):
             try:
                 self._webauthn_poll_timer.stop()
@@ -5163,6 +5293,8 @@ class LauncherGUI(QMainWindow):
             self.browser = None
             self.web_page = None
             self.web_profile = None
+            self.loading_widget = None
+            self.browser_helper_label = None
             
             # 1. Delete view
             if browser:
@@ -5188,14 +5320,9 @@ class LauncherGUI(QMainWindow):
         self._is_cleaning_up = False
 
     def on_browser_load_finished(self, ok):
+        self._initial_load_finished = True
         self._browser_page_loading = False
-        if hasattr(self, 'loading_widget') and self.loading_widget:
-            if (
-                not getattr(self, '_webauthn_js_active', False)
-                and not getattr(self, '_webauthn_os_active', False)
-                and not getattr(self, '_webauthn_completed', False)
-            ):
-                self.loading_widget.hide()
+        self._set_webauthn_loading()
         if ok and getattr(self, 'browser', None):
             code_val = json.dumps(getattr(self, '_browser_user_code', None) or "")
             hint_val = json.dumps(getattr(self, '_browser_login_hint', None) or "")

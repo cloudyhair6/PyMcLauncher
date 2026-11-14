@@ -245,6 +245,333 @@ class _QtPopupUnavailable(RuntimeError):
     """Raised when PyQt6 / PyQt6-WebEngine cannot be loaded for the standalone popup."""
 
 
+class _SwitchToBrowserRequested(RuntimeError):
+    """Raised when the user opts to continue Microsoft sign-in in their default browser."""
+
+
+def attach_webauthn_ux_handler(
+    page,
+    parent_window=None,
+    on_switch_browser=None,
+    on_state_update=None,
+):
+    """Attach a Qt 6.7+ WebAuthn / Passkey UX dialog handler to a QWebEnginePage.
+
+    Handles SelectAccount, CollectPin, FinishTokenCollection, RequestFailed,
+    Cancelled, and Completed states so hardware security keys and local passkey
+    prompts never hang with no UI handler.
+    """
+    if page is None or not hasattr(page, "webAuthUxRequested"):
+        return None
+
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWebEngineCore import QWebEngineWebAuthUxRequest
+    from PyQt6.QtWidgets import (
+        QDialog,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QListWidget,
+        QPushButton,
+        QVBoxLayout,
+        QWidget,
+    )
+
+    state_enum = QWebEngineWebAuthUxRequest.WebAuthUxState
+    state_values = {
+        "not_started": getattr(state_enum, "NotStarted", 0),
+        "select_account": getattr(state_enum, "SelectAccount", 1),
+        "collect_pin": getattr(state_enum, "CollectPin", 2),
+        "finish_token": getattr(state_enum, "FinishTokenCollection", 3),
+        "failed": getattr(state_enum, "RequestFailed", 4),
+        "cancelled": getattr(state_enum, "Cancelled", 5),
+        "completed": getattr(state_enum, "Completed", 6),
+    }
+
+    pin_reason_map = {
+        0: "Create a PIN for your security key.",
+        1: "Change the PIN on your security key.",
+        2: "Enter the PIN for your security key.",
+    }
+    pin_error_map = {
+        1: "Security key user verification is locked.",
+        2: "Incorrect PIN. Please try again.",
+        3: "PIN is too short.",
+        4: "PIN contains invalid characters.",
+        5: "New PIN cannot be the same as the current PIN.",
+    }
+    failure_reason_map = {
+        0: "The passkey / security key request timed out.",
+        1: "This security key is not registered with your Microsoft account.",
+        2: "This security key is already registered.",
+        3: "Too many wrong PIN attempts. Remove and reinsert your security key.",
+        4: "Security key PIN is blocked due to too many failed attempts.",
+        5: "The security key was removed before PIN entry finished.",
+        6: "This security key does not support resident keys (passkeys).",
+        7: "This security key does not support user verification.",
+        8: "This security key does not support large blobs.",
+        9: "No compatible credential algorithm found on this key.",
+        10: "Security key credential storage is full.",
+        11: "Passkey verification was denied or cancelled.",
+        12: "Passkey verification was cancelled.",
+    }
+
+    def _enum_int(val, default: int = -1) -> int:
+        if val is None:
+            return default
+        raw = getattr(val, "value", val)
+        try:
+            return int(raw)
+        except Exception:
+            return default
+
+    controller = {"request": None, "dialog": None, "closing": False}
+
+    class _WebAuthUxDialog(QDialog):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Security Key / Passkey Verification")
+            self.setMinimumWidth(390)
+            self.setModal(False)
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+
+            root = QVBoxLayout(self)
+            root.setContentsMargins(16, 16, 16, 16)
+            root.setSpacing(10)
+
+            self.title_lbl = QLabel("Passkey Verification")
+            self.title_lbl.setStyleSheet("font-size: 15px; font-weight: bold;")
+            self.title_lbl.setWordWrap(True)
+            root.addWidget(self.title_lbl)
+
+            self.desc_lbl = QLabel("")
+            self.desc_lbl.setWordWrap(True)
+            root.addWidget(self.desc_lbl)
+
+            self.err_lbl = QLabel("")
+            self.err_lbl.setWordWrap(True)
+            self.err_lbl.setStyleSheet("color: #d9534f; font-weight: bold;")
+            self.err_lbl.setVisible(False)
+            root.addWidget(self.err_lbl)
+
+            self.account_list = QListWidget()
+            self.account_list.setVisible(False)
+            self.account_list.itemDoubleClicked.connect(lambda _item: self._submit_account())
+            root.addWidget(self.account_list)
+
+            self.pin_edit = QLineEdit()
+            self.pin_edit.setEchoMode(QLineEdit.EchoMode.Password)
+            self.pin_edit.setPlaceholderText("Enter security key PIN")
+            self.pin_edit.setVisible(False)
+            self.pin_edit.returnPressed.connect(self._submit_pin)
+            root.addWidget(self.pin_edit)
+
+            btn_row = QWidget()
+            btn_layout = QHBoxLayout(btn_row)
+            btn_layout.setContentsMargins(0, 4, 0, 0)
+            btn_layout.setSpacing(8)
+
+            self.browser_btn = QPushButton("Open in Default Browser")
+            self.browser_btn.setVisible(callable(on_switch_browser))
+            self.browser_btn.clicked.connect(self._switch_to_browser)
+            btn_layout.addWidget(self.browser_btn)
+
+            btn_layout.addStretch(1)
+
+            self.retry_btn = QPushButton("Try Again")
+            self.retry_btn.setVisible(False)
+            self.retry_btn.clicked.connect(self._retry_request)
+            btn_layout.addWidget(self.retry_btn)
+
+            self.primary_btn = QPushButton("Continue")
+            self.primary_btn.setVisible(False)
+            self.primary_btn.clicked.connect(self._handle_primary)
+            btn_layout.addWidget(self.primary_btn)
+
+            self.cancel_btn = QPushButton("Cancel")
+            self.cancel_btn.clicked.connect(self._cancel_request)
+            btn_layout.addWidget(self.cancel_btn)
+
+            root.addWidget(btn_row)
+
+        def _active_req(self):
+            return controller.get("request")
+
+        def _submit_account(self):
+            req = self._active_req()
+            item = self.account_list.currentItem()
+            if req and item:
+                try:
+                    req.setSelectedAccount(item.text())
+                except RuntimeError:
+                    pass
+
+        def _submit_pin(self):
+            req = self._active_req()
+            pin = self.pin_edit.text()
+            if req and pin:
+                self.pin_edit.clear()
+                try:
+                    req.setPin(pin)
+                except RuntimeError:
+                    pass
+
+        def _handle_primary(self):
+            if self.account_list.isVisible():
+                self._submit_account()
+            elif self.pin_edit.isVisible():
+                self._submit_pin()
+
+        def _retry_request(self):
+            req = self._active_req()
+            if req:
+                try:
+                    req.retry()
+                except RuntimeError:
+                    pass
+
+        def _cancel_request(self):
+            req = self._active_req()
+            controller["request"] = None
+            controller["closing"] = True
+            if req:
+                try:
+                    req.cancel()
+                except RuntimeError:
+                    pass
+            self.close()
+
+        def _switch_to_browser(self):
+            self._cancel_request()
+            if callable(on_switch_browser):
+                on_switch_browser()
+
+        def closeEvent(self, event):
+            if not controller.get("closing"):
+                req = self._active_req()
+                controller["request"] = None
+                if req:
+                    try:
+                        req.cancel()
+                    except RuntimeError:
+                        pass
+            super().closeEvent(event)
+
+    def _close_dialog():
+        dlg = controller.get("dialog")
+        controller["request"] = None
+        if dlg is not None:
+            controller["closing"] = True
+            try:
+                dlg.close()
+                dlg.deleteLater()
+            except RuntimeError:
+                pass
+            controller["dialog"] = None
+            controller["closing"] = False
+
+    def _ensure_dialog():
+        dlg = controller.get("dialog")
+        if dlg is None:
+            dlg = _WebAuthUxDialog(parent_window)
+            controller["dialog"] = dlg
+        return dlg
+
+    def _sync_state(state):
+        req = controller.get("request")
+        if req is None:
+            return
+        try:
+            rp = req.relyingPartyId() or "Microsoft"
+        except RuntimeError:
+            _close_dialog()
+            return
+
+        if callable(on_state_update):
+            try:
+                on_state_update(state, req)
+            except Exception:
+                pass
+
+        if state in (state_values["cancelled"], state_values["completed"]):
+            _close_dialog()
+            return
+        if state == state_values["not_started"]:
+            return
+
+        dlg = _ensure_dialog()
+        controller["closing"] = False
+        dlg.err_lbl.setVisible(False)
+        dlg.account_list.setVisible(False)
+        dlg.pin_edit.setVisible(False)
+        dlg.primary_btn.setVisible(False)
+        dlg.retry_btn.setVisible(False)
+
+        if state == state_values["select_account"]:
+            dlg.title_lbl.setText("Choose a Passkey Account")
+            dlg.desc_lbl.setText(f"Select which account to use with {rp}:")
+            dlg.account_list.clear()
+            for name in req.userNames():
+                dlg.account_list.addItem(name)
+            if dlg.account_list.count() > 0:
+                dlg.account_list.setCurrentRow(0)
+            dlg.account_list.setVisible(True)
+            dlg.primary_btn.setText("Continue")
+            dlg.primary_btn.setVisible(True)
+        elif state == state_values["collect_pin"]:
+            pin_req = req.pinRequest()
+            reason_code = _enum_int(getattr(pin_req, "reason", None), 2)
+            err_code = _enum_int(getattr(pin_req, "error", None), 0)
+            min_len = getattr(pin_req, "minPinLength", 0) or 0
+            attempts = getattr(pin_req, "remainingAttempts", 0) or 0
+            dlg.title_lbl.setText("Security Key PIN Required")
+            hint = pin_reason_map.get(reason_code, "Enter the PIN for your security key.")
+            if min_len > 0:
+                hint += f" (Minimum {min_len} characters)"
+            dlg.desc_lbl.setText(hint)
+            if err_code > 0:
+                err_txt = pin_error_map.get(err_code, "PIN error. Please try again.")
+                if attempts > 0:
+                    err_txt += f" ({attempts} attempts remaining)"
+                dlg.err_lbl.setText(err_txt)
+                dlg.err_lbl.setVisible(True)
+            dlg.pin_edit.setVisible(True)
+            dlg.primary_btn.setText("Submit PIN")
+            dlg.primary_btn.setVisible(True)
+            dlg.pin_edit.setFocus()
+        elif state == state_values["finish_token"]:
+            dlg.title_lbl.setText("Complete Security Key / Passkey Check")
+            dlg.desc_lbl.setText(
+                f"Touch your security key or complete verification for {rp}.\n"
+                "If your passkey is on your phone or Chrome/Safari, click 'Open in Default Browser'."
+            )
+        elif state == state_values["failed"]:
+            fail_code = _enum_int(req.requestFailureReason(), -1)
+            msg = failure_reason_map.get(fail_code, "Passkey or security key verification failed.")
+            dlg.title_lbl.setText("Passkey Verification Failed")
+            dlg.desc_lbl.setText(
+                f"{msg}\n\nYou can try again, use another sign-in method on the page, "
+                "or open sign-in in your default browser."
+            )
+            dlg.retry_btn.setVisible(True)
+
+        dlg.adjustSize()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_ux_requested(request):
+        _close_dialog()
+        controller["request"] = request
+        request.stateChanged.connect(_sync_state)
+        _sync_state(request.state())
+
+    page.webAuthUxRequested.connect(_on_ux_requested)
+    page.destroyed.connect(_close_dialog)
+    page._webauthn_ux_controller = controller
+    return controller
+
+
 def _copy_to_clipboard(text: str) -> bool:
     """Copy text to the OS clipboard cleanly on Windows, macOS, and Linux."""
     clean = (text or "").strip()
@@ -296,7 +623,15 @@ def _open_qt_oauth_popup(auth_url: str, redirect_prefix: str = LIVE_DESKTOP_REDI
         from PyQt6.QtCore import QEventLoop, QTimer, QUrl
         from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
         from PyQt6.QtWebEngineWidgets import QWebEngineView
-        from PyQt6.QtWidgets import QApplication, QMainWindow
+        from PyQt6.QtWidgets import (
+            QApplication,
+            QHBoxLayout,
+            QLabel,
+            QMainWindow,
+            QPushButton,
+            QVBoxLayout,
+            QWidget,
+        )
     except Exception as exc:
         raise _QtPopupUnavailable(str(exc)) from exc
 
@@ -305,13 +640,18 @@ def _open_qt_oauth_popup(auth_url: str, redirect_prefix: str = LIVE_DESKTOP_REDI
     app = existing_app or QApplication([sys.argv[0] or "ms_accounts.py"])
     loop = None if owns_app else QEventLoop()
 
-    profile = QWebEngineProfile()
-    _QT_PROFILE_KEEPALIVE.append(profile)
+    if not _QT_PROFILE_KEEPALIVE:
+        _QT_PROFILE_KEEPALIVE.append(QWebEngineProfile(app))
+    profile = _QT_PROFILE_KEEPALIVE[0]
+    try:
+        profile.cookieStore().deleteAllCookies()
+    except Exception:
+        pass
     page = QWebEnginePage(profile)
     view = QWebEngineView()
     view.setPage(page)
 
-    state = {"url": "", "done": False}
+    state = {"url": "", "done": False, "switch_browser": False}
 
     class _PopupWindow(QMainWindow):
         def closeEvent(self, event):
@@ -322,8 +662,35 @@ def _open_qt_oauth_popup(auth_url: str, redirect_prefix: str = LIVE_DESKTOP_REDI
 
     win = _PopupWindow()
     win.setWindowTitle("Microsoft Sign-In - PyMcLauncher")
-    win.resize(540, 700)
-    win.setCentralWidget(view)
+    win.resize(580, 740)
+
+    central = QWidget()
+    root_layout = QVBoxLayout(central)
+    root_layout.setContentsMargins(0, 0, 0, 0)
+    root_layout.setSpacing(0)
+
+    helper_bar = QWidget()
+    helper_bar.setStyleSheet("background-color: #252526; border-bottom: 1px solid #3c3c3c;")
+    helper_layout = QHBoxLayout(helper_bar)
+    helper_layout.setContentsMargins(10, 6, 10, 6)
+    helper_lbl = QLabel(
+        "Using a phone/iCloud passkey? Click 'Open in Default Browser'."
+        if sys.platform != "win32"
+        else "Trouble with Passkey or Sign-In?"
+    )
+    helper_lbl.setStyleSheet("color: #d4d4d4; font-size: 12px;")
+    helper_layout.addWidget(helper_lbl, stretch=1)
+
+    switch_btn = QPushButton("Open in Default Browser")
+    switch_btn.setStyleSheet(
+        "background-color: #0078D7; color: white; font-weight: bold; "
+        "border-radius: 4px; padding: 4px 10px; font-size: 12px;"
+    )
+    helper_layout.addWidget(switch_btn)
+
+    root_layout.addWidget(helper_bar)
+    root_layout.addWidget(view, stretch=1)
+    win.setCentralWidget(central)
 
     def _quit_loop():
         if owns_app:
@@ -343,6 +710,21 @@ def _open_qt_oauth_popup(auth_url: str, redirect_prefix: str = LIVE_DESKTOP_REDI
         except Exception:
             pass
         QTimer.singleShot(50, _quit_loop)
+
+    def _trigger_switch_browser():
+        if state["done"]:
+            return
+        state["switch_browser"] = True
+        state["done"] = True
+        QTimer.singleShot(0, _teardown)
+
+    switch_btn.clicked.connect(_trigger_switch_browser)
+
+    attach_webauthn_ux_handler(
+        page,
+        parent_window=win,
+        on_switch_browser=_trigger_switch_browser,
+    )
 
     def _handle_url(qurl):
         if state["done"]:
@@ -370,6 +752,8 @@ def _open_qt_oauth_popup(auth_url: str, redirect_prefix: str = LIVE_DESKTOP_REDI
     else:
         loop.exec()
 
+    if state["switch_browser"]:
+        raise _SwitchToBrowserRequested()
     if not state["url"]:
         raise RuntimeError("Popup sign-in was cancelled.")
     return state["url"]
@@ -485,6 +869,8 @@ class PurePythonAuthFlow:
                 msg = json.loads(raw_line)
             except json.JSONDecodeError:
                 msg = {"redirect_url": raw_line}
+            if isinstance(msg, dict) and msg.get("switch_to_browser"):
+                return self._device_code_live_auth(open_browser=True)
             if isinstance(msg, dict) and msg.get("error"):
                 raise RuntimeError(f"Popup sign-in failed: {msg.get('error')}")
             redirect_url = msg.get("redirect_url", "") if isinstance(msg, dict) else str(msg)
@@ -493,6 +879,10 @@ class PurePythonAuthFlow:
                 print("\nOpening built-in Microsoft Sign-In popup window...", flush=True)
             try:
                 redirect_url = _open_qt_oauth_popup(auth_url, LIVE_DESKTOP_REDIRECT)
+            except _SwitchToBrowserRequested:
+                if not self.is_json:
+                    print("[*] Switching sign-in to default web browser...")
+                return self._device_code_live_auth(open_browser=True)
             except _QtPopupUnavailable as e:
                 if not self.is_json:
                     print(f"[!] Built-in popup unavailable ({e}). Falling back to default web browser...")
