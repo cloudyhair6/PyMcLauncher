@@ -3735,11 +3735,13 @@ class LauncherGUI(QMainWindow):
             self._auth_cancelled_profile = current_profile
 
         cmd_args = [get_script_path("ms_accounts.py"), "--json", "--profile", self._auth_cancelled_profile]
-        if isinstance(selected_win_acc, dict) and self._pending_login_hint:
+        if sys.platform == "win32" and isinstance(selected_win_acc, dict) and self._pending_login_hint:
             cmd_args.extend(["--wam", "--login-hint", self._pending_login_hint, "--hwnd", str(int(self.winId()))])
             wam_id = selected_win_acc.get("wam_account_id") or selected_win_acc.get("cid")
             if wam_id:
                 cmd_args.extend(["--wam-id", str(wam_id)])
+        elif sys.platform != "win32":
+            cmd_args.extend(["--device"])
 
         self.process = QProcess()
         self.process.setProgram(get_python_cli_executable())
@@ -4294,11 +4296,13 @@ class LauncherGUI(QMainWindow):
         self.is_just_logging_in = False
         self._browser_auth_done = False
         cmd_args = [get_script_path("ms_accounts.py"), "--json", "--profile", target_profile_id]
-        if isinstance(selected_win_acc, dict) and self._pending_login_hint:
+        if sys.platform == "win32" and isinstance(selected_win_acc, dict) and self._pending_login_hint:
             cmd_args.extend(["--wam", "--login-hint", self._pending_login_hint, "--hwnd", str(int(self.winId()))])
             wam_id = selected_win_acc.get("wam_account_id") or selected_win_acc.get("cid")
             if wam_id:
                 cmd_args.extend(["--wam-id", str(wam_id)])
+        elif sys.platform != "win32":
+            cmd_args.extend(["--device"])
 
         self.process = QProcess()
         self.process.setProgram(get_python_cli_executable())
@@ -4325,10 +4329,20 @@ class LauncherGUI(QMainWindow):
                 continue
 
             if obj.get("status") == "pending_login":
-                self.log("[System] Waiting for user to complete Microsoft login in browser...")
                 url = obj.get("verification_uri")
+                code = obj.get("user_code")
                 hint = obj.get("login_hint") or getattr(self, "_pending_login_hint", None)
-                self.open_browser(url, login_hint=hint)
+                if code:
+                    self.log(f"[System] Authentication code: {code} (Copied to clipboard)")
+                    try:
+                        from PyQt6.QtGui import QGuiApplication
+                        cb = QGuiApplication.clipboard()
+                        if cb:
+                            cb.setText(code)
+                    except Exception:
+                        pass
+                self.log("[System] Waiting for user to complete Microsoft login in popup window...")
+                self.open_browser(url, login_hint=hint, user_code=code)
             elif "mc_username" in obj:
                 if getattr(self, "_pending_login_hint", None) and not obj.get("msa_email"):
                     obj["msa_email"] = self._pending_login_hint
@@ -4822,7 +4836,7 @@ class LauncherGUI(QMainWindow):
         self.update_ui_state()
 
     # --- Browser Window Code (from old GUI) ---
-    def open_browser(self, url, login_hint: Optional[str] = None):
+    def open_browser(self, url, login_hint: Optional[str] = None, user_code: Optional[str] = None):
         class LoginBrowserWindow(QMainWindow):
             def __init__(self, parent_launcher):
                 super().__init__()
@@ -4846,9 +4860,13 @@ class LauncherGUI(QMainWindow):
                 super().closeEvent(event)
 
         self._browser_login_hint = (login_hint or "").strip() or None
+        self._browser_user_code = (user_code or "").strip() or None
         self._browser_auth_done = False
         self.browser_window = LoginBrowserWindow(self)
-        self.browser_window.setWindowTitle("Microsoft Login - Minecraft Launcher")
+        if user_code:
+            self.browser_window.setWindowTitle(f"Microsoft Login - Code: {user_code} (Copied to Clipboard)")
+        else:
+            self.browser_window.setWindowTitle("Microsoft Login - Minecraft Launcher")
         self.browser_window.setFixedSize(600, 750)
         
         self.browser_central = QWidget()
@@ -5125,9 +5143,38 @@ class LauncherGUI(QMainWindow):
             ):
                 self.loading_widget.hide()
         if ok and getattr(self, 'browser', None):
-            self.browser.page().runJavaScript("""
-                (function() {
-                    function checkCompleteAndClick() {
+            code_val = json.dumps(getattr(self, '_browser_user_code', None) or "")
+            hint_val = json.dumps(getattr(self, '_browser_login_hint', None) or "")
+            js_code = f"""
+                (function() {{
+                    var targetCode = {code_val};
+                    var targetHint = {hint_val};
+
+                    function tryFillCodeAndHint() {{
+                        if (targetCode) {{
+                            var otc = document.querySelector('#otc, input[name="otc"], input#user_code, input[name="user_code"]');
+                            if (otc && otc.offsetParent !== null && !otc.value) {{
+                                otc.value = targetCode;
+                                otc.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                otc.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                var nextBtn = document.querySelector('#idSIButton9, input[type=submit], button[type=submit]');
+                                if (nextBtn && nextBtn.offsetParent !== null) {{
+                                    setTimeout(function() {{ nextBtn.click(); }}, 250);
+                                }}
+                            }}
+                        }}
+                        if (targetHint) {{
+                            var email = document.querySelector('input[type="email"], input[name="loginfmt"]');
+                            if (email && email.offsetParent !== null && !email.value) {{
+                                email.value = targetHint;
+                                email.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                email.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            }}
+                        }}
+                    }}
+
+                    function checkCompleteAndClick() {{
+                        tryFillCodeAndHint();
                         var bodyText = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : "";
                         var completeEl = document.querySelector('#message_Complete, #idDiv_RemoteConnect_Success');
                         if (
@@ -5137,29 +5184,31 @@ class LauncherGUI(QMainWindow):
                             bodyText.indexOf("you have now logged in") !== -1 ||
                             bodyText.indexOf("you can close this window") !== -1 ||
                             bodyText.indexOf("you can now close this window") !== -1
-                        ) {
+                        ) {{
                             console.log("AGY_LOGIN_PAGE_COMPLETE");
                             return;
-                        }
+                        }}
 
-                        // Do not auto-click Next if a visible empty email or password input is waiting for the user
-                        var visibleInputs = document.querySelectorAll('input[type="email"], input[name="loginfmt"], input[type="password"], input[name="passwd"]');
-                        for (var i = 0; i < visibleInputs.length; i++) {
+                        // Do not auto-click Next if a visible empty email, password, or code input is waiting for the user
+                        var visibleInputs = document.querySelectorAll('input[type="email"], input[name="loginfmt"], input[type="password"], input[name="passwd"], input#otc, input[name="otc"]');
+                        for (var i = 0; i < visibleInputs.length; i++) {{
                             var inp = visibleInputs[i];
-                            if (inp.offsetParent !== null && !inp.value) {
+                            if (inp.offsetParent !== null && !inp.value) {{
                                 return;
-                            }
-                        }
+                            }}
+                        }}
 
                         var btn = document.querySelector('#idSIButton9, #acceptButton, [data-testid="appConsentPrimaryButton"], input[type=submit], button[type=submit]');
-                        if (btn && btn.offsetParent !== null && btn.value !== 'Cancel' && btn.innerText !== 'Cancel') {
+                        if (btn && btn.offsetParent !== null && btn.value !== 'Cancel' && btn.innerText !== 'Cancel') {{
                             btn.click();
-                        }
-                    }
-                    setTimeout(checkCompleteAndClick, 400);
-                    setTimeout(checkCompleteAndClick, 1000);
-                })();
-            """)
+                        }}
+                    }}
+                    setTimeout(checkCompleteAndClick, 300);
+                    setTimeout(checkCompleteAndClick, 800);
+                    setTimeout(checkCompleteAndClick, 1600);
+                }})();
+            """
+            self.browser.page().runJavaScript(js_code)
 
     def on_browser_url_changed(self, url):
         url_str = url.toString()

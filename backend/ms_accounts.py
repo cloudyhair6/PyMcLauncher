@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Microsoft & Minecraft Java Account Authentication Manager (ms_accounts.py)
 
@@ -5,21 +6,21 @@ Can be used both as a standalone tool or as a module for PyMcLauncher.
 Only requires utils.py (or can even run standalone without it).
 
 Supported Sign-in Methods:
-  1. Windows Security Popup (--wam / --windows-popup):
+  1. Windows Security Popup (--wam / --windows-popup) [Windows 10/11 only]:
      Uses native Windows Web Account Manager (WAM) broker via MSAL.
      Sign in with Windows Hello, PIN, or pre-linked Windows accounts without typing passwords.
   2. Web Browser (--browser):
      Opens your default web browser (Chrome, Edge, Firefox, etc.) for standard Microsoft OAuth.
-  3. Device Code Link (--device / --device-code):
+  3. Device Code Link (--device / --device-code) [Cross-platform, default on macOS/Linux]:
      Generates a one-time code, copies it to clipboard, and opens https://www.microsoft.com/link.
 
 Usage:
-  python ms_accounts.py
-  python ms_accounts.py --wam
-  python ms_accounts.py --browser
-  python ms_accounts.py --device
-  python ms_accounts.py --list-accounts
-  python ms_accounts.py --json --wam --login-hint user@outlook.com
+  python3 ms_accounts.py
+  python3 ms_accounts.py --device
+  python3 ms_accounts.py --wam
+  python3 ms_accounts.py --browser
+  python3 ms_accounts.py --list-accounts
+  python3 ms_accounts.py --json --profile default_account
 """
 
 import argparse
@@ -309,12 +310,14 @@ class PurePythonAuthFlow:
 
         direct_url = res.get("verification_uri", "https://www.microsoft.com/link")
         code = res["user_code"]
+        remote_connect_url = f"https://login.live.com/oauth20_remoteconnect.srf?otc={code}"
         msg = f"To sign in, use a web browser to open the page {direct_url} and enter the code {code} to authenticate."
 
         if self.is_json:
             pending_payload = {
                 "status": "pending_login",
-                "verification_uri": direct_url,
+                "verification_uri": remote_connect_url,
+                "portal_uri": direct_url,
                 "user_code": code,
                 "message": msg,
             }
@@ -516,9 +519,14 @@ class PurePythonAuthFlow:
 
         self._last_msa_was_interactive = True
         if self.auth_method == "wam":
-            return self._msal_broker_token()
+            if sys.platform == "win32":
+                return self._msal_broker_token()
+            return self._device_code_live_auth()
         elif self.auth_method == "browser":
-            return self._msal_browser_token()
+            try:
+                return self._msal_browser_token()
+            except Exception:
+                return self._device_code_live_auth()
         return self._device_code_live_auth()
 
     # --- Xbox Live Tokens ---
@@ -800,22 +808,39 @@ def main():
             print("\nPyMcLauncher Microsoft Sign-In")
             print("================================")
             print("Select sign-in method:")
-            print("  [1] Windows Security Popup (PIN / Windows Hello)")
-            print("  [2] Web Browser (Opens default browser)")
-            print("  [3] Device Code Link (microsoft.com/link)")
-            try:
-                choice = input("\nEnter choice [1-3] (Default: 1): ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return
-            if choice == "2":
-                method = "browser"
-            elif choice == "3":
-                method = "device"
+            if sys.platform == "win32":
+                print("  [1] Windows Security Popup (PIN / Windows Hello)")
+                print("  [2] Web Browser (Opens default browser)")
+                print("  [3] Device Code Link (microsoft.com/link)")
+                try:
+                    choice = input("\nEnter choice [1-3] (Default: 1): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return
+                if choice == "2":
+                    method = "browser"
+                elif choice == "3":
+                    method = "device"
+                else:
+                    method = "wam"
             else:
-                method = "wam"
+                print("  [1] Device Code Link (microsoft.com/link) (Recommended)")
+                print("  [2] Web Browser (OAuth)")
+                try:
+                    choice = input("\nEnter choice [1-2] (Default: 1): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return
+                if choice == "2":
+                    method = "browser"
+                else:
+                    method = "device"
         else:
-            method = "wam"
+            method = "wam" if sys.platform == "win32" else "device"
+
+    # WAM is Windows-only; on macOS/Linux gracefully fall back to device code flow
+    if sys.platform != "win32" and method == "wam":
+        method = "device"
 
     _pkg_dir = Path(__file__).resolve().parent
     _root_dir = _pkg_dir.parent if _pkg_dir.name == "backend" else _pkg_dir
