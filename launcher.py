@@ -3740,7 +3740,7 @@ class LauncherGUI(QMainWindow):
             wam_id = selected_win_acc.get("wam_account_id") or selected_win_acc.get("cid")
             if wam_id:
                 cmd_args.extend(["--wam-id", str(wam_id)])
-        elif sys.platform != "win32":
+        else:
             cmd_args.extend(["--device"])
 
         self.process = QProcess()
@@ -4301,7 +4301,7 @@ class LauncherGUI(QMainWindow):
             wam_id = selected_win_acc.get("wam_account_id") or selected_win_acc.get("cid")
             if wam_id:
                 cmd_args.extend(["--wam-id", str(wam_id)])
-        elif sys.platform != "win32":
+        else:
             cmd_args.extend(["--device"])
 
         self.process = QProcess()
@@ -4870,8 +4870,28 @@ class LauncherGUI(QMainWindow):
         self.browser_window.setFixedSize(600, 750)
         
         self.browser_central = QWidget()
-        self.browser_layout = QGridLayout(self.browser_central)
+        main_layout = QVBoxLayout(self.browser_central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        if user_code:
+            code_banner = QWidget()
+            code_banner.setStyleSheet("background-color: #0078D7; color: white;")
+            banner_layout = QHBoxLayout(code_banner)
+            banner_layout.setContentsMargins(12, 8, 12, 8)
+            banner_lbl = QLabel(f"Code: <b><font size='+1'>{user_code}</font></b>  (Copied to clipboard - paste if prompted)")
+            banner_lbl.setStyleSheet("color: white; font-size: 13px;")
+            banner_layout.addWidget(banner_lbl, stretch=1)
+            copy_btn = QPushButton("Copy Code")
+            copy_btn.setStyleSheet("background-color: white; color: #0078D7; font-weight: bold; border-radius: 4px; padding: 4px 12px;")
+            copy_btn.clicked.connect(lambda: QGuiApplication.clipboard().setText(user_code))
+            banner_layout.addWidget(copy_btn)
+            main_layout.addWidget(code_banner)
+
+        view_container = QWidget()
+        self.browser_layout = QGridLayout(view_container)
         self.browser_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(view_container, stretch=1)
 
         self._webauthn_js_active = False
         self._webauthn_os_active = False
@@ -5176,12 +5196,13 @@ class LauncherGUI(QMainWindow):
                     function checkCompleteAndClick() {{
                         tryFillCodeAndHint();
                         var bodyText = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : "";
-                        var completeEl = document.querySelector('#message_Complete, #idDiv_RemoteConnect_Success');
+                        var completeEl = document.querySelector('#message_Complete, #idDiv_RemoteConnect_Success, #idDiv_RemoteConnect_SuccessTitle');
                         if (
                             completeEl ||
                             bodyText.indexOf("you have signed in") !== -1 ||
                             bodyText.indexOf("you're signed in") !== -1 ||
                             bodyText.indexOf("you have now logged in") !== -1 ||
+                            bodyText.indexOf("all done") !== -1 ||
                             bodyText.indexOf("you can close this window") !== -1 ||
                             bodyText.indexOf("you can now close this window") !== -1
                         ) {{
@@ -5203,9 +5224,16 @@ class LauncherGUI(QMainWindow):
                             btn.click();
                         }}
                     }}
-                    setTimeout(checkCompleteAndClick, 300);
-                    setTimeout(checkCompleteAndClick, 800);
-                    setTimeout(checkCompleteAndClick, 1600);
+
+                    var checkCount = 0;
+                    var timer = setInterval(function() {{
+                        checkCount++;
+                        checkCompleteAndClick();
+                        if (checkCount >= 25) {{
+                            clearInterval(timer);
+                        }}
+                    }}, 400);
+                    checkCompleteAndClick();
                 }})();
             """
             self.browser.page().runJavaScript(js_code)

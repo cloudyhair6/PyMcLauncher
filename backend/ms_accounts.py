@@ -310,14 +310,12 @@ class PurePythonAuthFlow:
 
         direct_url = res.get("verification_uri", "https://www.microsoft.com/link")
         code = res["user_code"]
-        remote_connect_url = f"https://login.live.com/oauth20_remoteconnect.srf?otc={code}"
         msg = f"To sign in, use a web browser to open the page {direct_url} and enter the code {code} to authenticate."
 
         if self.is_json:
             pending_payload = {
                 "status": "pending_login",
-                "verification_uri": remote_connect_url,
-                "portal_uri": direct_url,
+                "verification_uri": direct_url,
                 "user_code": code,
                 "message": msg,
             }
@@ -518,15 +516,8 @@ class PurePythonAuthFlow:
                     pass
 
         self._last_msa_was_interactive = True
-        if self.auth_method == "wam":
-            if sys.platform == "win32":
-                return self._msal_broker_token()
-            return self._device_code_live_auth()
-        elif self.auth_method == "browser":
-            try:
-                return self._msal_browser_token()
-            except Exception:
-                return self._device_code_live_auth()
+        if self.auth_method == "wam" and sys.platform == "win32":
+            return self._msal_broker_token()
         return self._device_code_live_auth()
 
     # --- Xbox Live Tokens ---
@@ -650,9 +641,9 @@ class PurePythonAuthFlow:
             if isinstance(cached_xsts, dict) and _check_iso_valid(cached_xsts.get("expiresOn")):
                 return cached_xsts
 
-        # Fast path for MSAL tokens (Windows broker / browser interactive)
-        if self.auth_method in ("wam", "browser"):
-            msal_tok = self._msal_broker_token() if self.auth_method == "wam" else self._msal_browser_token()
+        # Fast path for MSAL tokens (Windows broker only on Windows)
+        if self.auth_method == "wam" and sys.platform == "win32":
+            msal_tok = self._msal_broker_token()
             ut = self._get_xbl_user_token("d=" + msal_tok)
             return self._get_xsts_token(ut, None, None, relying_party)
 
@@ -798,9 +789,7 @@ def main():
     method = args.method
     if args.wam_flag:
         method = "wam"
-    elif args.browser_flag:
-        method = "browser"
-    elif args.device_flag:
+    elif args.browser_flag or args.device_flag:
         method = "device"
     elif method == "auto":
         # Interactive CLI prompt if run directly in a terminal
@@ -810,31 +799,24 @@ def main():
             print("Select sign-in method:")
             if sys.platform == "win32":
                 print("  [1] Windows Security Popup (PIN / Windows Hello)")
-                print("  [2] Web Browser (Opens default browser)")
-                print("  [3] Device Code Link (microsoft.com/link)")
-                try:
-                    choice = input("\nEnter choice [1-3] (Default: 1): ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    return
-                if choice == "2":
-                    method = "browser"
-                elif choice == "3":
-                    method = "device"
-                else:
-                    method = "wam"
-            else:
-                print("  [1] Device Code Link (microsoft.com/link) (Recommended)")
-                print("  [2] Web Browser (OAuth)")
+                print("  [2] Web Browser / Device Link (Opens default browser to microsoft.com/link)")
                 try:
                     choice = input("\nEnter choice [1-2] (Default: 1): ").strip()
                 except (EOFError, KeyboardInterrupt):
                     print()
                     return
                 if choice == "2":
-                    method = "browser"
-                else:
                     method = "device"
+                else:
+                    method = "wam"
+            else:
+                print("  [1] Web Browser / Device Link (Opens default browser to microsoft.com/link)")
+                try:
+                    choice = input("\nEnter choice [1] (Default: 1): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return
+                method = "device"
         else:
             method = "wam" if sys.platform == "win32" else "device"
 
