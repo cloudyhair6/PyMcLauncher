@@ -9,16 +9,19 @@ Supported Sign-in Methods:
   1. Windows Security Popup (--wam / --windows-popup) [Windows 10/11 only]:
      Uses native Windows Web Account Manager (WAM) broker via MSAL.
      Sign in with Windows Hello, PIN, or pre-linked Windows accounts without typing passwords.
-  2. Web Browser (--browser):
-     Opens your default web browser (Chrome, Edge, Firefox, etc.) for standard Microsoft OAuth.
-  3. Device Code Link (--device / --device-code) [Cross-platform, default on macOS/Linux]:
-     Generates a one-time code, copies it to clipboard, and opens https://www.microsoft.com/link.
+  2. Built-in Popup Window (--popup) [Cross-platform, default on macOS/Linux]:
+     Opens a built-in Python Microsoft sign-in popup window (OAuth2 desktop flow, no device code).
+  3. Default Web Browser (--browser) [Cross-platform]:
+     Opens your default web browser (Chrome, Edge, Safari, Firefox) to microsoft.com/link with the code pre-filled.
+  4. Device Code Link (--device / --device-code) [Cross-platform]:
+     Generates a one-time device code link (https://www.microsoft.com/link?otc=...) and copies the code to clipboard.
 
 Usage:
   python3 ms_accounts.py
-  python3 ms_accounts.py --device
   python3 ms_accounts.py --wam
+  python3 ms_accounts.py --popup
   python3 ms_accounts.py --browser
+  python3 ms_accounts.py --device
   python3 ms_accounts.py --list-accounts
   python3 ms_accounts.py --json --profile default_account
 """
@@ -37,6 +40,7 @@ import sys
 import time
 import urllib.parse
 import uuid
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -67,6 +71,8 @@ except ImportError:
 # Constants matching Minecraft official launcher and Titles.MinecraftNintendoSwitch
 NINTENDO_SWITCH_TITLE_ID = "00000000441cc96b"
 AZURE_APP_CLIENT_ID = "00000000402b5328"  # Minecraft Official Launcher Client ID
+LIVE_AUTH_URL = "https://login.live.com/oauth20_authorize.srf"
+LIVE_DESKTOP_REDIRECT = "https://login.live.com/oauth20_desktop.srf"
 LIVE_TOKEN_URL = "https://login.live.com/oauth20_token.srf"
 LIVE_DEVICE_CODE_URL = "https://login.live.com/oauth20_connect.srf"
 LIVE_SCOPE = "service::user.auth.xboxlive.com::MBI_SSL"
@@ -232,6 +238,143 @@ def _check_iso_valid(iso_str: str) -> bool:
         return False
 
 
+_QT_PROFILE_KEEPALIVE = []
+
+
+class _QtPopupUnavailable(RuntimeError):
+    """Raised when PyQt6 / PyQt6-WebEngine cannot be loaded for the standalone popup."""
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Copy text to the OS clipboard cleanly on Windows, macOS, and Linux."""
+    clean = (text or "").strip()
+    if not clean:
+        return False
+    try:
+        if sys.platform == "darwin":
+            res = subprocess.run(["pbcopy"], input=clean.encode("utf-8"), check=False)
+            return res.returncode == 0
+        if os.name == "nt":
+            res = subprocess.run(["clip"], input=clean.encode("utf-16-le"), check=False)
+            if res.returncode == 0:
+                return True
+            subprocess.run(f"echo {clean}| clip", shell=True, check=False)
+            return True
+        for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]):
+            try:
+                res = subprocess.run(cmd, input=clean.encode("utf-8"), check=False)
+                if res.returncode == 0:
+                    return True
+            except FileNotFoundError:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def _open_system_browser(url: str) -> bool:
+    """Open URL in the user's default system web browser cleanly."""
+    try:
+        if sys.platform == "darwin":
+            res = subprocess.run(["open", url], check=False)
+            if res.returncode == 0:
+                return True
+        elif os.name == "nt":
+            os.startfile(url)
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(webbrowser.open(url, new=1, autoraise=True))
+    except Exception:
+        return False
+
+
+def _open_qt_oauth_popup(auth_url: str, redirect_prefix: str = LIVE_DESKTOP_REDIRECT) -> str:
+    """Open a built-in Qt WebEngine popup window for direct Microsoft OAuth login."""
+    try:
+        from PyQt6.QtCore import QEventLoop, QTimer, QUrl
+        from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+        from PyQt6.QtWebEngineWidgets import QWebEngineView
+        from PyQt6.QtWidgets import QApplication, QMainWindow
+    except Exception as exc:
+        raise _QtPopupUnavailable(str(exc)) from exc
+
+    existing_app = QApplication.instance()
+    owns_app = existing_app is None
+    app = existing_app or QApplication([sys.argv[0] or "ms_accounts.py"])
+    loop = None if owns_app else QEventLoop()
+
+    profile = QWebEngineProfile()
+    _QT_PROFILE_KEEPALIVE.append(profile)
+    page = QWebEnginePage(profile)
+    view = QWebEngineView()
+    view.setPage(page)
+
+    state = {"url": "", "done": False}
+
+    class _PopupWindow(QMainWindow):
+        def closeEvent(self, event):
+            if not state["done"]:
+                state["done"] = True
+                _teardown()
+            super().closeEvent(event)
+
+    win = _PopupWindow()
+    win.setWindowTitle("Microsoft Sign-In - PyMcLauncher")
+    win.resize(540, 700)
+    win.setCentralWidget(view)
+
+    def _quit_loop():
+        if owns_app:
+            app.quit()
+        elif loop is not None:
+            loop.quit()
+
+    def _teardown():
+        try:
+            win.hide()
+        except Exception:
+            pass
+        try:
+            view.setPage(None)
+            page.deleteLater()
+            view.deleteLater()
+        except Exception:
+            pass
+        QTimer.singleShot(50, _quit_loop)
+
+    def _handle_url(qurl):
+        if state["done"]:
+            return
+        url_str = qurl.toString()
+        parsed = urllib.parse.urlparse(url_str)
+        target_parsed = urllib.parse.urlparse(redirect_prefix)
+        if parsed.netloc.lower() == target_parsed.netloc.lower() and parsed.path.rstrip("/") == target_parsed.path.rstrip("/"):
+            params = urllib.parse.parse_qs(parsed.query)
+            if not params and parsed.fragment:
+                params = urllib.parse.parse_qs(parsed.fragment)
+            if "code" in params or "error" in params:
+                state["url"] = url_str
+                state["done"] = True
+                QTimer.singleShot(0, _teardown)
+
+    view.urlChanged.connect(_handle_url)
+    win.show()
+    win.raise_()
+    win.activateWindow()
+    view.setUrl(QUrl(auth_url))
+
+    if owns_app:
+        app.exec()
+    else:
+        loop.exec()
+
+    if not state["url"]:
+        raise RuntimeError("Popup sign-in was cancelled.")
+    return state["url"]
+
+
 class PurePythonAuthFlow:
     """Manages the authentication chain from Microsoft -> Xbox Live -> XSTS -> Minecraft."""
 
@@ -244,6 +387,7 @@ class PurePythonAuthFlow:
         auth_method: str = "auto",
         wam_id: str = None,
         hwnd: int = 0,
+        ipc_popup: bool = False,
     ):
         self.profile = profile
         self.cache_dir = cache_dir
@@ -252,6 +396,7 @@ class PurePythonAuthFlow:
         self.auth_method = auth_method.lower() if auth_method else "auto"
         self.wam_id = wam_id
         self.hwnd = hwnd
+        self.ipc_popup = ipc_popup
 
         self.signer = PurePythonXboxSigner()
         self.session = requests.Session()
@@ -277,16 +422,28 @@ class PurePythonAuthFlow:
             "valid": valid,
             "access_token": token.get("access_token"),
             "refresh_token": token.get("refresh_token"),
+            "client_id": token.get("client_id") or NINTENDO_SWITCH_TITLE_ID,
+            "auth_method": token.get("auth_method"),
         }
 
-    def _save_live_token(self, token_data: dict):
+    def _save_live_token(self, token_data: dict, client_id: str = None, auth_method: str = None):
+        existing = self.live_cache.get_cached().get("token") or {}
         d = dict(token_data)
         d["obtainedOn"] = int(time.time() * 1000)
+        d["client_id"] = client_id or existing.get("client_id") or NINTENDO_SWITCH_TITLE_ID
+        if auth_method:
+            d["auth_method"] = auth_method
+        elif existing.get("auth_method"):
+            d["auth_method"] = existing["auth_method"]
+        elif self.auth_method and self.auth_method != "auto":
+            d["auth_method"] = self.auth_method
         self.live_cache.set_cached_partial({"token": d})
 
-    def _refresh_live_token(self, refresh_token: str) -> str:
+    def _refresh_live_token(self, refresh_token: str, client_id: str = None) -> str:
+        existing = self.live_cache.get_cached().get("token") or {}
+        cid = client_id or existing.get("client_id") or NINTENDO_SWITCH_TITLE_ID
         body = {
-            "client_id": NINTENDO_SWITCH_TITLE_ID,
+            "client_id": cid,
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "scope": LIVE_SCOPE,
@@ -294,28 +451,110 @@ class PurePythonAuthFlow:
         resp = self.session.post(LIVE_TOKEN_URL, data=body, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        self._save_live_token(data)
+        self._save_live_token(data, client_id=cid, auth_method=existing.get("auth_method"))
         return data["access_token"]
 
-    def _device_code_live_auth(self) -> str:
+    def _popup_live_oauth(self) -> str:
+        """Sign in directly inside a Python Qt WebEngine popup window (OAuth2 desktop code flow)."""
+        params = {
+            "client_id": AZURE_APP_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": LIVE_DESKTOP_REDIRECT,
+            "scope": LIVE_SCOPE,
+        }
+        if self.login_hint:
+            params["login_hint"] = self.login_hint
+        else:
+            params["prompt"] = "select_account"
+        auth_url = f"{LIVE_AUTH_URL}?{urllib.parse.urlencode(params)}"
+
+        if self.ipc_popup:
+            pending_payload = {
+                "status": "pending_oauth_popup",
+                "auth_url": auth_url,
+                "redirect_prefix": LIVE_DESKTOP_REDIRECT,
+            }
+            if self.login_hint:
+                pending_payload["login_hint"] = self.login_hint
+            print(json.dumps(pending_payload), flush=True)
+            raw_line = sys.stdin.readline()
+            if not raw_line:
+                raise RuntimeError("Popup sign-in was cancelled.")
+            raw_line = raw_line.strip()
+            try:
+                msg = json.loads(raw_line)
+            except json.JSONDecodeError:
+                msg = {"redirect_url": raw_line}
+            if isinstance(msg, dict) and msg.get("error"):
+                raise RuntimeError(f"Popup sign-in failed: {msg.get('error')}")
+            redirect_url = msg.get("redirect_url", "") if isinstance(msg, dict) else str(msg)
+        else:
+            if not self.is_json:
+                print("\nOpening built-in Microsoft Sign-In popup window...", flush=True)
+            try:
+                redirect_url = _open_qt_oauth_popup(auth_url, LIVE_DESKTOP_REDIRECT)
+            except _QtPopupUnavailable as e:
+                if not self.is_json:
+                    print(f"[!] Built-in popup unavailable ({e}). Falling back to default web browser...")
+                return self._device_code_live_auth(open_browser=True)
+
+        parsed = urllib.parse.urlparse(redirect_url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if not qs and parsed.fragment:
+            qs = urllib.parse.parse_qs(parsed.fragment)
+        if "error" in qs:
+            err = qs.get("error", ["unknown_error"])[0]
+            desc = qs.get("error_description", [""])[0]
+            raise RuntimeError(f"Microsoft sign-in failed ({err}): {desc}" if desc else f"Microsoft sign-in failed: {err}")
+
+        code = (qs.get("code") or [None])[0]
+        if not code:
+            raise RuntimeError("No authorization code was returned from Microsoft sign-in.")
+
+        token_resp = self.session.post(
+            LIVE_TOKEN_URL,
+            data={
+                "client_id": AZURE_APP_CLIENT_ID,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": LIVE_DESKTOP_REDIRECT,
+                "scope": LIVE_SCOPE,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=15,
+        )
+        token_resp.raise_for_status()
+        token_data = token_resp.json()
+        if "access_token" not in token_data:
+            raise RuntimeError(f"Failed to exchange authorization code: {token_data}")
+        self._save_live_token(token_data, client_id=AZURE_APP_CLIENT_ID, auth_method="popup")
+        return token_data["access_token"]
+
+    def _device_code_live_auth(self, open_browser: bool = False) -> str:
         body = {
             "client_id": NINTENDO_SWITCH_TITLE_ID,
             "scope": LIVE_SCOPE,
-            "response_type": "code",
+            "response_type": "device_code",
         }
         resp = self.session.post(LIVE_DEVICE_CODE_URL, data=body, timeout=15)
         resp.raise_for_status()
         res = resp.json()
         cookies = resp.cookies
 
-        direct_url = res.get("verification_uri", "https://www.microsoft.com/link")
+        base_url = res.get("verification_uri", "https://www.microsoft.com/link")
         code = res["user_code"]
-        msg = f"To sign in, use a web browser to open the page {direct_url} and enter the code {code} to authenticate."
+        prefill_url = f"{base_url}{'&' if '?' in base_url else '?'}otc={urllib.parse.quote(code)}"
+        msg = f"To sign in, open {prefill_url} (or {base_url} and enter code {code}) to authenticate."
+
+        copied = _copy_to_clipboard(code)
+        if open_browser:
+            _open_system_browser(prefill_url)
 
         if self.is_json:
             pending_payload = {
-                "status": "pending_login",
-                "verification_uri": direct_url,
+                "status": "pending_browser_login" if open_browser else "pending_login",
+                "verification_uri": prefill_url,
+                "portal_uri": base_url,
                 "user_code": code,
                 "message": msg,
             }
@@ -323,26 +562,15 @@ class PurePythonAuthFlow:
                 pending_payload["login_hint"] = self.login_hint
             print(json.dumps(pending_payload), flush=True)
         else:
-            print("\nOpening your web browser...", flush=True)
-            print(f"---> [COPIED] Authentication Code: {code}", flush=True)
-            print("---> The code has been copied to your clipboard. Paste it into the page!", flush=True)
-            print(f"\n{msg}", flush=True)
-            try:
-                if sys.platform == "darwin":
-                    subprocess.run(["pbcopy"], input=code.strip().encode("utf-8"), check=False)
-                    subprocess.run(["open", direct_url], check=False)
-                elif os.name == "nt":
-                    subprocess.run(f"echo {code} | clip", shell=True)
-                    os.startfile(direct_url)
-                else:
-                    import webbrowser
-                    try:
-                        subprocess.run(["xclip", "-selection", "clipboard"], input=code.strip().encode("utf-8"), check=False)
-                    except Exception:
-                        pass
-                    webbrowser.open(direct_url)
-            except Exception:
-                pass
+            if open_browser:
+                print("\nOpened your default web browser to Microsoft sign-in:", flush=True)
+                print(f"  {prefill_url}", flush=True)
+            else:
+                print("\nOpen the following link in any browser:", flush=True)
+                print(f"  {prefill_url}", flush=True)
+            copy_note = " (copied to clipboard)" if copied else ""
+            print(f"  Code: {code}{copy_note}", flush=True)
+            print("Waiting for you to complete sign-in...", flush=True)
 
         interval = min(int(res.get("interval", 5)), 2)
         expires_in = int(res.get("expires_in", 900))
@@ -371,7 +599,11 @@ class PurePythonAuthFlow:
                     f"Failed to acquire authorization code ({poll_data.get('error')}): {poll_data.get('error_description')}"
                 )
             if "access_token" in poll_data:
-                self._save_live_token(poll_data)
+                self._save_live_token(
+                    poll_data,
+                    client_id=NINTENDO_SWITCH_TITLE_ID,
+                    auth_method=("browser" if open_browser else "device"),
+                )
                 return poll_data["access_token"]
 
         raise RuntimeError("Authentication timed out waiting for user login.")
@@ -406,15 +638,18 @@ class PurePythonAuthFlow:
         scopes = ["XboxLive.signin"]
         hint = (self.login_hint or "").strip().lower()
         res = None
-        try:
-            for acct in app.get_accounts():
-                if not hint or str(acct.get("username", "")).lower() == hint:
-                    res = app.acquire_token_silent(scopes, account=acct)
-                    if res and "access_token" in res:
-                        break
-                    res = None
-        except Exception:
-            res = None
+        if hint or self.wam_id:
+            try:
+                for acct in app.get_accounts():
+                    acct_user = str(acct.get("username", "")).lower()
+                    acct_id = str(acct.get("home_account_id", "") or "")
+                    if (hint and acct_user == hint) or (self.wam_id and acct_id == str(self.wam_id)):
+                        res = app.acquire_token_silent(scopes, account=acct)
+                        if res and "access_token" in res:
+                            break
+                        res = None
+            except Exception:
+                res = None
 
         if not res:
             hwnd = self.hwnd or 0
@@ -428,6 +663,7 @@ class PurePythonAuthFlow:
                 scopes,
                 parent_window_handle=hwnd or app.CONSOLE_WINDOW_HANDLE,
                 login_hint=self.login_hint or None,
+                prompt=None if self.login_hint else "select_account",
             )
 
         _persist()
@@ -439,86 +675,46 @@ class PurePythonAuthFlow:
         email = claims.get("preferred_username") or claims.get("email") or self.login_hint
         if email:
             self.obtained_msa_email = email
-        return res["access_token"]
-
-    def _msal_browser_token(self) -> str:
-        """Sign in via the default web browser (OAuth loopback) using MSAL."""
-        import msal
-
-        cache_file = self.cache_dir.parent.parent / "msal_cache.bin"
-        token_cache = msal.SerializableTokenCache()
+        acct_info = res.get("account") if isinstance(res.get("account"), dict) else {}
+        wam_acc_id = acct_info.get("home_account_id") or claims.get("oid") or claims.get("sub")
+        if wam_acc_id:
+            self.obtained_wam_account_id = str(wam_acc_id)
         try:
-            if cache_file.exists():
-                token_cache.deserialize(cache_file.read_text(encoding="utf-8"))
+            self.live_cache.set_cached_partial({
+                "token": {
+                    "auth_method": "wam",
+                    "client_id": AZURE_APP_CLIENT_ID,
+                    "obtainedOn": int(time.time() * 1000),
+                    "expires_in": int(res.get("expires_in", 3600)),
+                    "wam_account_id": self.obtained_wam_account_id,
+                    "msa_email": self.obtained_msa_email,
+                }
+            })
         except Exception:
             pass
-
-        def _persist():
-            try:
-                if token_cache.has_state_changed:
-                    cache_file.parent.mkdir(parents=True, exist_ok=True)
-                    cache_file.write_text(token_cache.serialize(), encoding="utf-8")
-            except Exception:
-                pass
-
-        app = msal.PublicClientApplication(
-            AZURE_APP_CLIENT_ID,
-            authority="https://login.microsoftonline.com/consumers",
-            enable_broker_on_windows=False,
-            token_cache=token_cache,
-        )
-        scopes = ["XboxLive.signin"]
-        hint = (self.login_hint or "").strip().lower()
-        res = None
-        try:
-            for acct in app.get_accounts():
-                if not hint or str(acct.get("username", "")).lower() == hint:
-                    res = app.acquire_token_silent(scopes, account=acct)
-                    if res and "access_token" in res:
-                        break
-                    res = None
-        except Exception:
-            res = None
-
-        if not res:
-            if not self.is_json:
-                print("\nOpening your default web browser for Microsoft sign-in...")
-            self._last_msa_was_interactive = True
-            res = app.acquire_token_interactive(
-                scopes,
-                login_hint=self.login_hint or None,
-                prompt="select_account" if not self.login_hint else None,
-            )
-
-        _persist()
-        if not res or "access_token" not in res:
-            raise RuntimeError(
-                f"Browser sign-in failed: {(res or {}).get('error_description') or (res or {}).get('error') or 'cancelled'}"
-            )
-        claims = res.get("id_token_claims") or {}
-        email = claims.get("preferred_username") or claims.get("email") or self.login_hint
-        if email:
-            self.obtained_msa_email = email
         return res["access_token"]
 
     def get_msa_token(self, force_refresh: bool = False) -> str:
         self._last_msa_was_interactive = False
+        if self.auth_method == "wam" and sys.platform == "win32":
+            return self._msal_broker_token()
+
         cached = self._get_live_cached_tokens()
         if cached:
-            raw_tok_entry = self.live_cache.get_cached().get("token") or {}
-            has_extra = bool(raw_tok_entry.get("extra_tokens"))
-            if cached["valid"] and cached["access_token"] and not force_refresh and (self.auth_method != "wam" or has_extra):
+            if cached["valid"] and cached["access_token"] and not force_refresh:
                 return cached["access_token"]
             if cached["refresh_token"]:
                 try:
-                    return self._refresh_live_token(cached["refresh_token"])
+                    return self._refresh_live_token(cached["refresh_token"], cached.get("client_id"))
                 except Exception:
                     pass
 
         self._last_msa_was_interactive = True
-        if self.auth_method == "wam" and sys.platform == "win32":
-            return self._msal_broker_token()
-        return self._device_code_live_auth()
+        if self.auth_method == "popup":
+            return self._popup_live_oauth()
+        if self.auth_method == "browser":
+            return self._device_code_live_auth(open_browser=True)
+        return self._device_code_live_auth(open_browser=False)
 
     # --- Xbox Live Tokens ---
     def _xbl_base_headers(self, signature: str, contract_version: str = "1") -> dict:
@@ -588,6 +784,31 @@ class PurePythonAuthFlow:
         self.xbl_cache.set_cached_partial({"deviceToken": ret})
         return ret["Token"]
 
+    def _get_xbl_title_token(self, msa_token: str, device_token: str) -> str:
+        last_resp = None
+        for rps_ticket in self._rps_ticket_candidates(msa_token):
+            payload = {
+                "Properties": {
+                    "AuthMethod": "RPS",
+                    "DeviceToken": device_token,
+                    "RpsTicket": rps_ticket,
+                    "SiteName": "user.auth.xboxlive.com",
+                    "ProofKey": self.signer.jwk,
+                },
+                "RelyingParty": "http://auth.xboxlive.com",
+                "TokenType": "JWT",
+            }
+            body = json.dumps(payload, separators=(",", ":"))
+            sig = self.signer.sign_xbox_request(XBL_TITLE_AUTH_URL, "", body)
+            headers = self._xbl_base_headers(sig, contract_version="1")
+            resp = self.session.post(XBL_TITLE_AUTH_URL, headers=headers, data=body, timeout=15)
+            last_resp = resp
+            if resp.ok:
+                ret = resp.json()
+                self.xbl_cache.set_cached_partial({"titleToken": ret})
+                return ret["Token"]
+        last_resp.raise_for_status()
+
     def _get_xsts_token(
         self,
         user_token: str,
@@ -647,13 +868,33 @@ class PurePythonAuthFlow:
             ut = self._get_xbl_user_token("d=" + msal_tok)
             return self._get_xsts_token(ut, None, None, relying_party)
 
-        # Standard / device-code flow
+        # Popup OAuth (00000000402b5328) or Device/Browser flow (00000000441cc96b)
         for attempt in range(2):
             try:
                 msa_token = self.get_msa_token(force_refresh=(attempt > 0 or force_refresh))
+                cached_tok = self.live_cache.get_cached().get("token") or {}
+                is_desktop_oauth = (
+                    self.auth_method == "popup"
+                    or cached_tok.get("auth_method") == "popup"
+                    or cached_tok.get("client_id") == AZURE_APP_CLIENT_ID
+                )
                 ut = self._get_xbl_user_token(msa_token)
-                dt = self._get_xbl_device_token()
-                return self._get_xsts_token(ut, dt, None, relying_party)
+                if is_desktop_oauth:
+                    try:
+                        return self._get_xsts_token(ut, None, None, relying_party)
+                    except Exception as xsts_err:
+                        if any(msg in str(xsts_err) for msg in XBOX_LIVE_ERRORS.values()):
+                            raise
+                        dt = self._get_xbl_device_token("Win32")
+                        return self._get_xsts_token(ut, dt, None, relying_party)
+
+                dt = self._get_xbl_device_token("Nintendo")
+                tt = None
+                try:
+                    tt = self._get_xbl_title_token(msa_token, dt)
+                except Exception:
+                    tt = None
+                return self._get_xsts_token(ut, dt, tt, relying_party)
             except Exception:
                 if attempt == 1 or getattr(self, "_last_msa_was_interactive", False):
                     raise
@@ -753,12 +994,14 @@ def main():
     # Login Method Flags
     parser.add_argument(
         "--method",
-        choices=["auto", "wam", "browser", "device"],
+        choices=["auto", "wam", "popup", "browser", "device"],
         default="auto",
-        help="Sign-in method: wam (Windows Security popup), browser (web browser OAuth), device (device code link).",
+        help="Sign-in method: wam (Windows Security popup), popup (built-in Qt window), browser (default browser), device (device code link).",
     )
-    parser.add_argument("--wam", "--windows-popup", dest="wam_flag", action="store_true", help="Use Windows Security PIN/Hello popup.")
-    parser.add_argument("--browser", dest="browser_flag", action="store_true", help="Open default web browser for OAuth login.")
+    parser.add_argument("--wam", "--windows-popup", dest="wam_flag", action="store_true", help="Use Windows Security PIN/Hello popup (Windows only).")
+    parser.add_argument("--popup", dest="popup_flag", action="store_true", help="Use built-in Python Microsoft sign-in popup window.")
+    parser.add_argument("--ipc-popup", dest="ipc_popup", action="store_true", help="Delegate popup window display to parent GUI via JSON/stdin.")
+    parser.add_argument("--browser", dest="browser_flag", action="store_true", help="Open default web browser to pre-filled microsoft.com/link.")
     parser.add_argument("--device", "--device-code", dest="device_flag", action="store_true", help="Use device code flow (microsoft.com/link).")
 
     parser.add_argument("--wam-id", default=None, help="Optional Windows WebAccount ID.")
@@ -784,45 +1027,6 @@ def main():
         else:
             print("Account discovery requires utils.py.")
         return
-
-    # Determine auth method
-    method = args.method
-    if args.wam_flag:
-        method = "wam"
-    elif args.browser_flag or args.device_flag:
-        method = "device"
-    elif method == "auto":
-        # Interactive CLI prompt if run directly in a terminal
-        if not args.json and sys.stdin.isatty():
-            print("\nPyMcLauncher Microsoft Sign-In")
-            print("================================")
-            print("Select sign-in method:")
-            if sys.platform == "win32":
-                print("  [1] Windows Security Popup (PIN / Windows Hello)")
-                print("  [2] Web Browser / Device Link (Opens default browser to microsoft.com/link)")
-                try:
-                    choice = input("\nEnter choice [1-2] (Default: 1): ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    return
-                if choice == "2":
-                    method = "device"
-                else:
-                    method = "wam"
-            else:
-                print("  [1] Web Browser / Device Link (Opens default browser to microsoft.com/link)")
-                try:
-                    choice = input("\nEnter choice [1] (Default: 1): ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    return
-                method = "device"
-        else:
-            method = "wam" if sys.platform == "win32" else "device"
-
-    # WAM is Windows-only; on macOS/Linux gracefully fall back to device code flow
-    if sys.platform != "win32" and method == "wam":
-        method = "device"
 
     _pkg_dir = Path(__file__).resolve().parent
     _root_dir = _pkg_dir.parent if _pkg_dir.name == "backend" else _pkg_dir
@@ -855,9 +1059,76 @@ def main():
                 print('{"status": "already_logged_out"}')
         return
 
+    # Determine auth method
+    method = args.method
+    explicit_wam = bool(args.wam_flag or args.method == "wam")
+    if args.wam_flag:
+        method = "wam"
+    elif args.popup_flag:
+        method = "popup"
+    elif args.browser_flag:
+        method = "browser"
+    elif args.device_flag:
+        method = "device"
+    elif method == "auto":
+        # Interactive CLI prompt if run directly in a terminal
+        if not args.json and sys.stdin.isatty():
+            print("\nPyMcLauncher Microsoft Sign-In")
+            print("================================")
+            print("Select sign-in method:")
+            if sys.platform == "win32":
+                print("  [1] Windows Security Popup (PIN / Windows Hello)")
+                print("  [2] Popup Window (Built-in Microsoft sign-in window)")
+                print("  [3] Default Web Browser (Opens your default browser)")
+                try:
+                    choice = input("\nEnter choice [1-3] (Default: 1): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return
+                if choice == "2":
+                    method = "popup"
+                elif choice == "3":
+                    method = "browser"
+                else:
+                    method = "wam"
+            else:
+                print("  [1] Popup Window (Built-in Microsoft sign-in window)")
+                print("  [2] Default Web Browser (Opens your default browser)")
+                print("  [3] Device Code Link (Manual link & code)")
+                try:
+                    choice = input("\nEnter choice [1-3] (Default: 1): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return
+                if choice == "2":
+                    method = "browser"
+                elif choice == "3":
+                    method = "device"
+                else:
+                    method = "popup"
+        else:
+            saved_tok = JsonCacheStore(cache_dir / "live-tokens.json").get_cached().get("token")
+            saved_method = saved_tok.get("auth_method") if isinstance(saved_tok, dict) else None
+            if saved_method in ("wam", "popup", "browser", "device") and (saved_method != "wam" or sys.platform == "win32"):
+                method = saved_method
+            else:
+                method = "wam" if sys.platform == "win32" else "popup"
+
+    # WAM is Windows-only
+    if sys.platform != "win32" and method == "wam":
+        if explicit_wam:
+            msg = "Windows Security Popup (--wam) is only available on Windows."
+            if args.json:
+                print(json.dumps({"error": "Unsupported platform", "details": msg}))
+            else:
+                print(f"\n❌ {msg}")
+            sys.exit(1)
+        method = "popup"
+
     if not args.json:
         method_names = {
             "wam": "Windows Security native popup",
+            "popup": "Built-in Python popup window",
             "browser": "Default web browser",
             "device": "Device code link",
         }
@@ -872,6 +1143,7 @@ def main():
             auth_method=method,
             wam_id=args.wam_id,
             hwnd=args.hwnd,
+            ipc_popup=args.ipc_popup,
         )
         mc_token, mc_profile = authflow.get_minecraft_java_token()
 

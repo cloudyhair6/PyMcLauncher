@@ -3741,7 +3741,9 @@ class LauncherGUI(QMainWindow):
             if wam_id:
                 cmd_args.extend(["--wam-id", str(wam_id)])
         else:
-            cmd_args.extend(["--device"])
+            cmd_args.extend(["--popup", "--ipc-popup"])
+            if self._pending_login_hint:
+                cmd_args.extend(["--login-hint", self._pending_login_hint])
 
         self.process = QProcess()
         self.process.setProgram(get_python_cli_executable())
@@ -4302,7 +4304,9 @@ class LauncherGUI(QMainWindow):
             if wam_id:
                 cmd_args.extend(["--wam-id", str(wam_id)])
         else:
-            cmd_args.extend(["--device"])
+            cmd_args.extend(["--popup", "--ipc-popup"])
+            if self._pending_login_hint:
+                cmd_args.extend(["--login-hint", self._pending_login_hint])
 
         self.process = QProcess()
         self.process.setProgram(get_python_cli_executable())
@@ -4328,7 +4332,16 @@ class LauncherGUI(QMainWindow):
                 self.log(f"AUTH: {line}")
                 continue
 
-            if obj.get("status") == "pending_login":
+            if obj.get("status") == "pending_oauth_popup":
+                url = obj.get("auth_url")
+                hint = obj.get("login_hint") or getattr(self, "_pending_login_hint", None)
+                self.log("[System] Waiting for user to complete Microsoft login in popup window...")
+                self.open_browser(url, login_hint=hint, mode="oauth_popup")
+            elif obj.get("status") == "pending_browser_login":
+                code = obj.get("user_code")
+                url = obj.get("verification_uri")
+                self.log(f"[System] Opened default web browser for sign-in ({url}). Code: {code}")
+            elif obj.get("status") == "pending_login":
                 url = obj.get("verification_uri")
                 code = obj.get("user_code")
                 hint = obj.get("login_hint") or getattr(self, "_pending_login_hint", None)
@@ -4342,7 +4355,7 @@ class LauncherGUI(QMainWindow):
                     except Exception:
                         pass
                 self.log("[System] Waiting for user to complete Microsoft login in popup window...")
-                self.open_browser(url, login_hint=hint, user_code=code)
+                self.open_browser(url, login_hint=hint, user_code=code, mode="device_code")
             elif "mc_username" in obj:
                 if getattr(self, "_pending_login_hint", None) and not obj.get("msa_email"):
                     obj["msa_email"] = self._pending_login_hint
@@ -4836,7 +4849,7 @@ class LauncherGUI(QMainWindow):
         self.update_ui_state()
 
     # --- Browser Window Code (from old GUI) ---
-    def open_browser(self, url, login_hint: Optional[str] = None, user_code: Optional[str] = None):
+    def open_browser(self, url, login_hint: Optional[str] = None, user_code: Optional[str] = None, mode: str = "device_code"):
         class LoginBrowserWindow(QMainWindow):
             def __init__(self, parent_launcher):
                 super().__init__()
@@ -4851,16 +4864,27 @@ class LauncherGUI(QMainWindow):
                 self.parent_launcher._cleanup_browser()
                 
                 if (
-                    getattr(self.parent_launcher, 'is_just_logging_in', False)
+                    (
+                        getattr(self.parent_launcher, 'is_just_logging_in', False)
+                        or getattr(self.parent_launcher, 'is_authenticating', False)
+                    )
                     and not getattr(self.parent_launcher, '_login_succeeded', False)
                     and not getattr(self.parent_launcher, '_browser_auth_done', False)
                 ):
-                    if getattr(self.parent_launcher, 'process', None):
-                        self.parent_launcher.process.kill()
+                    proc = getattr(self.parent_launcher, 'process', None)
+                    if proc:
+                        try:
+                            if getattr(self.parent_launcher, '_browser_mode', '') == 'oauth_popup':
+                                proc.write(b'{"error": "cancelled"}\n')
+                                proc.closeWriteChannel()
+                        except Exception:
+                            pass
+                        proc.kill()
                 super().closeEvent(event)
 
         self._browser_login_hint = (login_hint or "").strip() or None
         self._browser_user_code = (user_code or "").strip() or None
+        self._browser_mode = mode or "device_code"
         self._browser_auth_done = False
         self.browser_window = LoginBrowserWindow(self)
         if user_code:
@@ -4913,17 +4937,27 @@ class LauncherGUI(QMainWindow):
         from utils import get_active_profile_id
         import os
         active_id = get_active_profile_id()
-        profile_path = os.path.abspath(f".cache/{active_id}/browser_cache")
-        os.makedirs(profile_path, exist_ok=True)
-        
+
         if not hasattr(self, '_profile_cache'):
             self._profile_cache = {}
-        if active_id not in self._profile_cache:
-            p = QWebEngineProfile(active_id)
-            p.setPersistentStoragePath(profile_path)
-            p.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
-            self._profile_cache[active_id] = p
-        self.web_profile = self._profile_cache[active_id]
+        if not self._browser_login_hint:
+            # Off-the-record profile so prior sessions cannot silently log in the wrong user
+            if "__ephemeral__" not in self._profile_cache:
+                self._profile_cache["__ephemeral__"] = QWebEngineProfile()
+            self.web_profile = self._profile_cache["__ephemeral__"]
+            try:
+                self.web_profile.cookieStore().deleteAllCookies()
+            except Exception:
+                pass
+        else:
+            profile_path = os.path.abspath(f".cache/{active_id}/browser_cache")
+            os.makedirs(profile_path, exist_ok=True)
+            if active_id not in self._profile_cache:
+                p = QWebEngineProfile(active_id)
+                p.setPersistentStoragePath(profile_path)
+                p.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+                self._profile_cache[active_id] = p
+            self.web_profile = self._profile_cache[active_id]
         
         from PyQt6.QtWebEngineCore import QWebEngineScript
         script = QWebEngineScript()
@@ -5219,9 +5253,18 @@ class LauncherGUI(QMainWindow):
                             }}
                         }}
 
-                        var btn = document.querySelector('#idSIButton9, #acceptButton, [data-testid="appConsentPrimaryButton"], input[type=submit], button[type=submit]');
-                        if (btn && btn.offsetParent !== null && btn.value !== 'Cancel' && btn.innerText !== 'Cancel') {{
-                            btn.click();
+                        var consentBtn = document.querySelector('#acceptButton, [data-testid="appConsentPrimaryButton"]');
+                        if (consentBtn && consentBtn.offsetParent !== null) {{
+                            consentBtn.click();
+                            return;
+                        }}
+
+                        var isKmsiPage = Boolean(document.querySelector('#KmsiDescription, #idDiv_Kmsi, input[name="DontShowAgain"]'));
+                        if (isKmsiPage) {{
+                            var yesBtn = document.querySelector('#idSIButton9, input[type=submit], button[type=submit]');
+                            if (yesBtn && yesBtn.offsetParent !== null && yesBtn.value !== 'Cancel' && yesBtn.innerText !== 'Cancel') {{
+                                yesBtn.click();
+                            }}
                         }}
                     }}
 
@@ -5239,9 +5282,29 @@ class LauncherGUI(QMainWindow):
             self.browser.page().runJavaScript(js_code)
 
     def on_browser_url_changed(self, url):
+        import urllib.parse
         url_str = url.toString()
-        if "login.live.com/undefined" in url_str or "oauth20_desktop.srf" in url_str:
+        parsed = urllib.parse.urlparse(url_str)
+        is_desktop_cb = (
+            parsed.netloc.lower() == "login.live.com"
+            and parsed.path.rstrip("/") == "/oauth20_desktop.srf"
+        )
+        qs_params = urllib.parse.parse_qs(parsed.query)
+        if not qs_params and parsed.fragment:
+            qs_params = urllib.parse.parse_qs(parsed.fragment)
+        has_oauth_result = is_desktop_cb and ("code" in qs_params or "error" in qs_params)
+
+        if has_oauth_result or "login.live.com/undefined" in url_str:
+            if getattr(self, "_browser_auth_done", False):
+                return
             self._browser_auth_done = True
+            if getattr(self, "_browser_mode", "") == "oauth_popup" and getattr(self, "process", None):
+                try:
+                    payload = (json.dumps({"redirect_url": url_str}) + "\n").encode("utf-8")
+                    self.process.write(payload)
+                    self.process.closeWriteChannel()
+                except Exception:
+                    pass
             if self.browser_window:
                 self.browser_window.hide()
             self.step_progress_bar.setVisible(True)
