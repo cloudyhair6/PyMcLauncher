@@ -1,22 +1,58 @@
 {
     "Minecraft Launcher for PC": {
-        "Files": [
-            "setup-start.bat",
-            "setup-start.command",
-            "setup-start.sh",
-            "launcher.py",
-            "requirements.txt",
-            "README.md",
-            "backend/",
-            "images/"
-        ],
-        "Update Ignore Files": [
-            ".cache/",
-            "__pycache__/",
-            "minecraft_downloads/",
-            "launcher_config.json",
-            "updater_config.json"
-        ],
-        "Message": "Run the setup-start.bat file first, it will tell you what to do next!"
+        "win": {
+            "Files": [
+                "setup-start.bat",
+                "launcher.py",
+                "backend/requirements.txt",
+                "backend/",
+                "images/"
+            ],
+            "Update Ignore Files": [
+                ".cache/",
+                "__pycache__/",
+                "minecraft_downloads/",
+                "launcher_config.json",
+                "updater_config.json"
+            ],
+            "Message": "Run the setup-start.bat file first, it will tell you what to do next!"
+        },
+        "macos": {
+            "Files": [
+                "setup-start.command",
+                "setup-start.sh",
+                "launcher.py",
+                "backend/requirements.txt",
+                "backend/",
+                "images/"
+            ],
+            "Update Ignore Files": [
+                ".cache/",
+                "__pycache__/",
+                "minecraft_downloads/",
+                "launcher_config.json",
+                "updater_config.json"
+            ],
+            "Message": "Run the setup-start.command file first, it will tell you what to do next!"
+        },
+        "other": {
+            "Files": [
+                "setup-start.bat",
+                "setup-start.command",
+                "setup-start.sh",
+                "launcher.py",
+                "backend/requirements.txt",
+                "backend/",
+                "images/"
+            ],
+            "Update Ignore Files": [
+                ".cache/",
+                "__pycache__/",
+                "minecraft_downloads/",
+                "launcher_config.json",
+                "updater_config.json"
+            ],
+            "Message": "Run either the setup-start.sh or setup-start.command (optimised for macos) or run the setup-start.bat (optimised for windows)!"
+        }
     }
 }

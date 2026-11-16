@@ -3,8 +3,13 @@
 # Ensure script runs from its directory regardless of where it was launched
 cd "$(dirname "$0")"
 
+OS_NAME="$(uname -s 2>/dev/null || echo Unknown)"
 echo "=========================================="
-echo "         PyMcLauncher for macOS           "
+if [ "$OS_NAME" = "Darwin" ]; then
+    echo "         PyMcLauncher for macOS           "
+else
+    echo "         PyMcLauncher for Linux / Unix    "
+fi
 echo "=========================================="
 
 # Check for Python 3 installation
@@ -15,7 +20,7 @@ elif command -v python &>/dev/null && python -c "import sys; sys.exit(0 if sys.v
 else
     echo ""
     echo "[Error] Python 3 was not found on your system."
-    echo "Please install Python 3 from https://www.python.org/downloads/macos/ or via Homebrew (brew install python)."
+    echo "Please install Python 3 from https://www.python.org/downloads/ or via your package manager."
     echo ""
     read -n 1 -s -r -p "Press any key to exit..."
     echo ""
@@ -24,12 +29,14 @@ fi
 
 echo "[*] Using Python: $($PYTHON_BIN --version 2>&1)"
 
-# Automatically run Install Certificates.command on macOS if present
-PY_VER=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)
-CERT_CMD="/Applications/Python ${PY_VER}/Install Certificates.command"
-if [ -f "$CERT_CMD" ]; then
-    echo "[*] Checking macOS SSL certificates..."
-    /bin/sh "$CERT_CMD" 2>/dev/null || true
+if [ "$OS_NAME" = "Darwin" ]; then
+    # Automatically run Install Certificates.command on macOS if present
+    PY_VER=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)
+    CERT_CMD="/Applications/Python ${PY_VER}/Install Certificates.command"
+    if [ -f "$CERT_CMD" ]; then
+        echo "[*] Checking macOS SSL certificates..."
+        /bin/sh "$CERT_CMD" 2>/dev/null || true
+    fi
 fi
 
 # Upgrade pip to ensure support for modern pre-compiled wheel tags
@@ -40,15 +47,15 @@ echo "[*] Ensuring pip is up to date..."
 echo "[*] Installing dependencies (preferring pre-compiled binary wheels)..."
 INSTALL_OK=0
 
-if "$PYTHON_BIN" -m pip install --prefer-binary -r requirements.txt; then
+if "$PYTHON_BIN" -m pip install --prefer-binary -r backend/requirements.txt; then
     INSTALL_OK=1
-elif "$PYTHON_BIN" -m pip install --prefer-binary -r requirements.txt --break-system-packages; then
+elif "$PYTHON_BIN" -m pip install --prefer-binary -r backend/requirements.txt --break-system-packages; then
     INSTALL_OK=1
-elif "$PYTHON_BIN" -m pip install --prefer-binary --user -r requirements.txt; then
+elif "$PYTHON_BIN" -m pip install --prefer-binary --user -r backend/requirements.txt; then
     INSTALL_OK=1
 fi
 
-if [ $INSTALL_OK -ne 1 ]; then
+if [ $INSTALL_OK -ne 1 ] && [ "$OS_NAME" = "Darwin" ]; then
     echo "[*] Applying targeted package fallback for macOS Big Sur..."
     # 1. Install pure Python core dependencies first
     "$PYTHON_BIN" -m pip install requests minecraft-launcher-lib nbt nbtlib certifi msal --quiet 2>/dev/null || \
@@ -63,7 +70,7 @@ fi
 if ! "$PYTHON_BIN" -c "import requests" 2>/dev/null; then
     echo ""
     echo "[!] Critical module 'requests' is not installed."
-    echo "Please check your network connection and run: $PYTHON_BIN -m pip install -r requirements.txt"
+    echo "Please check your network connection and run: $PYTHON_BIN -m pip install -r backend/requirements.txt"
     echo ""
     read -n 1 -s -r -p "Press any key to exit..."
     echo ""

@@ -40,11 +40,11 @@ echo "[*] Ensuring pip is up to date..."
 echo "[*] Installing dependencies (preferring pre-compiled binary wheels)..."
 INSTALL_OK=0
 
-if "$PYTHON_BIN" -m pip install --prefer-binary -r requirements.txt; then
+if "$PYTHON_BIN" -m pip install --prefer-binary -r backend/requirements.txt; then
     INSTALL_OK=1
-elif "$PYTHON_BIN" -m pip install --prefer-binary -r requirements.txt --break-system-packages; then
+elif "$PYTHON_BIN" -m pip install --prefer-binary -r backend/requirements.txt --break-system-packages; then
     INSTALL_OK=1
-elif "$PYTHON_BIN" -m pip install --prefer-binary --user -r requirements.txt; then
+elif "$PYTHON_BIN" -m pip install --prefer-binary --user -r backend/requirements.txt; then
     INSTALL_OK=1
 fi
 
@@ -63,7 +63,7 @@ fi
 if ! "$PYTHON_BIN" -c "import requests" 2>/dev/null; then
     echo ""
     echo "[!] Critical module 'requests' is not installed."
-    echo "Please check your network connection and run: $PYTHON_BIN -m pip install -r requirements.txt"
+    echo "Please check your network connection and run: $PYTHON_BIN -m pip install -r backend/requirements.txt"
     echo ""
     read -n 1 -s -r -p "Press any key to exit..."
     echo ""

@@ -8,8 +8,8 @@ Usage:
 Features:
 - Fetches available download options from the latest release of cloudyhair6/PyMcLauncher.
 - Presents a graphical checkbox menu to choose options (supports PyQt6, PyQt5, or native Tkinter fallback).
-- Downloads all selected files with concurrent downloads and a progress bar.
-- Generates updater_config.json so the launcher and built-in auto-updater work seamlessly.
+- Downloads all selected platform files with concurrent downloads and a progress bar.
+- Combines updater state inside launcher_config.json (under "updater") so the launcher and auto-updater work seamlessly.
 - Self-deletion: If this installer script itself is NOT listed in the selected download options,
   it automatically removes itself from disk after a successful installation.
 """
@@ -30,7 +30,9 @@ from pathlib import Path
 OWNER = "cloudyhair6"
 REPO = "PyMcLauncher"
 USER_AGENT = "Python-Latest-Version-Detector"
-CONFIG_FILE = "updater_config.json"
+CONFIG_FILE = "launcher_config.json"
+LEGACY_UPDATER_CONFIG_FILE = "updater_config.json"
+DEFAULT_OPTION = "Minecraft Launcher for PC"
 
 
 # --- GitHub API & Network Helpers ---
@@ -433,6 +435,145 @@ def download_file_content(path, tag):
     return None
 
 
+def get_platform_key():
+    """Return normalized platform key used by download_options.json ('win', 'macos', or 'other')."""
+    if sys.platform == "win32" or os.name == "nt":
+        return "win"
+    if sys.platform == "darwin":
+        return "macos"
+    return "other"
+
+
+def resolve_option_platform_data(opt_data, platform_key=None):
+    """Resolve Files, Update Ignore Files, and Message for nested platform or legacy flat options."""
+    plat = platform_key or get_platform_key()
+    empty = {"Files": [], "Update Ignore Files": [], "Message": None}
+    if isinstance(opt_data, list):
+        return {"Files": list(opt_data), "Update Ignore Files": [], "Message": None}
+    if not isinstance(opt_data, dict):
+        return empty
+
+    target = opt_data
+    if any(k in opt_data for k in ("win", "macos", "other")):
+        target = opt_data.get(plat)
+        if not isinstance(target, dict):
+            for fallback_k in ("other", "macos", "win"):
+                if isinstance(opt_data.get(fallback_k), dict):
+                    target = opt_data[fallback_k]
+                    break
+        if not isinstance(target, dict):
+            return empty
+
+    files = list(target.get("Files") or [])
+    ignores = list(target.get("Update Ignore Files") or [])
+    msg = target.get("Message")
+    return {
+        "Files": files,
+        "Update Ignore Files": ignores,
+        "Message": str(msg).strip() if msg else None,
+    }
+
+
+def collect_options_plan(download_options, selected_opts=None, platform_key=None):
+    """Collect deduplicated Files, Update Ignore Files, and Messages for selected options."""
+    if not isinstance(download_options, dict) or not download_options:
+        return [], [], []
+
+    chosen = [opt for opt in (selected_opts or []) if opt in download_options]
+    if not chosen:
+        chosen = [DEFAULT_OPTION] if DEFAULT_OPTION in download_options else [next(iter(download_options.keys()))]
+
+    paths = []
+    ignore_files = []
+    messages = []
+    for opt in chosen:
+        resolved = resolve_option_platform_data(download_options[opt], platform_key=platform_key)
+        for p in resolved["Files"]:
+            if p not in paths:
+                paths.append(p)
+        for ig in resolved["Update Ignore Files"]:
+            if ig not in ignore_files:
+                ignore_files.append(ig)
+        msg = resolved.get("Message")
+        if msg and msg not in messages:
+            messages.append(msg)
+    return paths, ignore_files, messages
+
+
+def _load_json_dict(path):
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+    except Exception:
+        pass
+    return {}
+
+
+def load_updater_state(install_dir):
+    """Load updater state from launcher_config.json['updater'] with legacy updater_config.json migration."""
+    cfg_path = os.path.join(install_dir, CONFIG_FILE)
+    legacy_path = os.path.join(install_dir, LEGACY_UPDATER_CONFIG_FILE)
+
+    launcher_cfg = _load_json_dict(cfg_path)
+    updater = launcher_cfg.get("updater")
+    if isinstance(updater, dict) and updater:
+        return dict(updater)
+
+    # Fallback to root keys if manually merged, or legacy updater_config.json
+    if any(k in launcher_cfg for k in ("current_version", "selected_options", "install_dir")):
+        return {
+            "current_version": launcher_cfg.get("current_version"),
+            "selected_options": launcher_cfg.get("selected_options", [DEFAULT_OPTION]),
+            "install_dir": launcher_cfg.get("install_dir", install_dir),
+        }
+
+    legacy_cfg = _load_json_dict(legacy_path)
+    if legacy_cfg:
+        save_updater_state(
+            install_dir,
+            legacy_cfg.get("current_version", "v1.7"),
+            legacy_cfg.get("selected_options", [DEFAULT_OPTION]),
+        )
+        return legacy_cfg
+    return {}
+
+
+def save_updater_state(install_dir, current_version, selected_options):
+    """Save updater state under launcher_config.json['updater'] without clobbering launcher settings."""
+    os.makedirs(install_dir, exist_ok=True)
+    cfg_path = os.path.join(install_dir, CONFIG_FILE)
+    legacy_path = os.path.join(install_dir, LEGACY_UPDATER_CONFIG_FILE)
+
+    launcher_cfg = _load_json_dict(cfg_path)
+    launcher_cfg["updater"] = {
+        "current_version": current_version,
+        "selected_options": list(selected_options),
+        "install_dir": install_dir,
+    }
+    tmp_path = cfg_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(launcher_cfg, f, indent=4)
+        os.replace(tmp_path, cfg_path)
+    except Exception:
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(launcher_cfg, f, indent=4)
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    if os.path.exists(legacy_path):
+        try:
+            os.remove(legacy_path)
+        except Exception:
+            pass
+
+
 def resolve_files_to_download(paths, tree_objects, ignore_files=None):
     ignore_set = {Path(ig).as_posix().strip("/").lower() for ig in (ignore_files or [])}
     files = []
@@ -648,22 +789,20 @@ def _run_qt_gui(QtModule):
         def __init__(self, selected_opts):
             super().__init__()
             self.selected_opts = selected_opts
+            self.resolved_paths = []
+            self.resolved_files = []
+            self.resolved_messages = []
 
         def run(self):
             try:
-                paths = []
-                ignore_files = []
-                for opt in self.selected_opts:
-                    opt_data = download_options[opt]
-                    if isinstance(opt_data, dict):
-                        paths.extend(opt_data.get("Files", []))
-                        ignore_files.extend(opt_data.get("Update Ignore Files", []))
-                    elif isinstance(opt_data, list):
-                        paths.extend(opt_data)
+                paths, ignore_files, messages = collect_options_plan(download_options, self.selected_opts)
+                self.resolved_paths = list(paths)
+                self.resolved_messages = list(messages)
 
                 self.progress_sig.emit(0, 1, "Fetching repository file tree...")
                 tree = get_repo_tree(latest_version)
                 files = resolve_files_to_download(paths, tree, ignore_files=ignore_files)
+                self.resolved_files = list(files)
 
                 if not files:
                     self.finished_sig.emit(False, "No matching files found in repository to download.")
@@ -673,17 +812,7 @@ def _run_qt_gui(QtModule):
                     self.progress_sig.emit(cur, total, f"Downloading: {fp}")
 
                 perform_download_concurrently(files, latest_version, install_dir, on_prog)
-
-                # Save updater_config.json
-                cfg_path = os.path.join(install_dir, CONFIG_FILE)
-                cfg_data = {
-                    "current_version": latest_version,
-                    "selected_options": self.selected_opts,
-                    "install_dir": install_dir,
-                }
-                with open(cfg_path, "w", encoding="utf-8") as f:
-                    json.dump(cfg_data, f, indent=4)
-
+                save_updater_state(install_dir, latest_version, self.selected_opts)
                 self.finished_sig.emit(True, "")
             except Exception as e:
                 self.finished_sig.emit(False, str(e))
@@ -716,17 +845,16 @@ def _run_qt_gui(QtModule):
             pbar.setValue(100)
             status_lbl.setText("Installation completed successfully!")
 
-            # Check if this script itself was in the download options
+            # Check if this script itself was in the resolved download files
             this_script_name = os.path.basename(os.path.abspath(__file__)).lower()
-            all_downloaded_names = []
-            for opt in selected:
-                opt_data = download_options[opt]
-                f_list = opt_data.get("Files", []) if isinstance(opt_data, dict) else opt_data
-                for f in f_list:
-                    all_downloaded_names.append(os.path.basename(f).lower())
-
+            all_downloaded_names = {os.path.basename(f).lower() for f in (worker.resolved_paths + worker.resolved_files)}
             should_delete_self = this_script_name not in all_downloaded_names
 
+            msg_note = (
+                "\n\n" + "\n".join(worker.resolved_messages)
+                if worker.resolved_messages
+                else ""
+            )
             del_msg = (
                 "\n\nNote: Because this installer is not part of the downloaded files, it will now delete itself."
                 if should_delete_self
@@ -736,7 +864,7 @@ def _run_qt_gui(QtModule):
             QtWidgets.QMessageBox.information(
                 win,
                 "Installation Complete",
-                f"PyMcLauncher ({latest_version}) has been installed successfully!{del_msg}",
+                f"PyMcLauncher ({latest_version}) has been installed successfully!{msg_note}{del_msg}",
             )
 
             win.close()
@@ -825,15 +953,7 @@ def _run_tkinter_gui():
 
             def worker_task(selected_list, ver_str, opts_dict, dest_dir):
                 try:
-                    paths = []
-                    ignore_files = []
-                    for opt in selected_list:
-                        opt_data = opts_dict.get(opt, {})
-                        if isinstance(opt_data, dict):
-                            paths.extend(opt_data.get("Files", []))
-                            ignore_files.extend(opt_data.get("Update Ignore Files", []))
-                        elif isinstance(opt_data, list):
-                            paths.extend(opt_data)
+                    paths, ignore_files, messages = collect_options_plan(opts_dict, selected_list)
 
                     tree = get_repo_tree(ver_str)
                     files = resolve_files_to_download(paths, tree, ignore_files=ignore_files)
@@ -847,20 +967,13 @@ def _run_tkinter_gui():
                         root.after(0, lambda p=pct, s=short_fp: (pbar.config(value=p), lbl_status.config(text=f"Downloading: {s}")))
 
                     perform_download_concurrently(files, ver_str, dest_dir, on_prog)
-
-                    cfg_path = os.path.join(dest_dir, CONFIG_FILE)
-                    cfg_data = {
-                        "current_version": ver_str,
-                        "selected_options": selected_list,
-                        "install_dir": dest_dir,
-                    }
-                    with open(cfg_path, "w", encoding="utf-8") as f:
-                        json.dump(cfg_data, f, indent=4)
+                    save_updater_state(dest_dir, ver_str, selected_list)
 
                     this_script = os.path.basename(os.path.abspath(__file__)).lower()
-                    all_names = [os.path.basename(f).lower() for f in files]
+                    all_names = {os.path.basename(f).lower() for f in (paths + files)}
                     should_delete = this_script not in all_names
 
+                    msg_note = ("\n\n" + "\n".join(messages)) if messages else ""
                     del_note = (
                         "\n\nNote: Because this installer is not part of the downloaded files, it will now delete itself."
                         if should_delete
@@ -868,7 +981,7 @@ def _run_tkinter_gui():
                     )
 
                     def on_done():
-                        messagebox.showinfo("Success", f"PyMcLauncher ({ver_str}) installed successfully!{del_note}")
+                        messagebox.showinfo("Success", f"PyMcLauncher ({ver_str}) installed successfully!{msg_note}{del_note}")
                         root.destroy()
                         if should_delete:
                             schedule_self_deletion()
@@ -924,50 +1037,42 @@ def run_update_check(install_dir=None, relaunch_script=None):
     if not install_dir:
         install_dir = os.path.dirname(os.path.abspath(__file__))
     install_dir = os.path.abspath(install_dir)
-    cfg_file = os.path.join(install_dir, CONFIG_FILE)
-    cfg = {}
-    if os.path.exists(cfg_file):
-        try:
-            with open(cfg_file, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-        except Exception:
-            pass
+    cfg = load_updater_state(install_dir)
+    selected_opts = cfg.get("selected_options", [DEFAULT_OPTION])
 
-    selected_opts = cfg.get("selected_options", ["PC App only (comes with development soon will without)"])
     ver = get_latest_version()
     if not ver:
         return
     download_options = fetch_download_options(ver)
     if not download_options:
         return
-    paths = []
-    ignore_files = []
-    for opt in selected_opts:
-        if opt in download_options:
-            opt_data = download_options[opt]
-            if isinstance(opt_data, dict):
-                paths.extend(opt_data.get("Files", []))
-                ignore_files.extend(opt_data.get("Update Ignore Files", []))
-            elif isinstance(opt_data, list):
-                paths.extend(opt_data)
 
+    paths, ignore_files, messages = collect_options_plan(download_options, selected_opts)
     tree = get_repo_tree(ver)
     files = resolve_files_to_download(paths, tree, ignore_files=ignore_files)
     if not files:
         return
 
     perform_download_concurrently(files, ver, install_dir)
-    cfg["current_version"] = ver
-    cfg["selected_options"] = selected_opts
-    cfg["install_dir"] = install_dir
-    with open(cfg_file, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=4)
+    save_updater_state(install_dir, ver, selected_opts)
+    for msg in messages:
+        print(f"[Info] {msg}", flush=True)
 
-    if relaunch_script:
+    target_relaunch = relaunch_script
+    if not target_relaunch:
+        plat = get_platform_key()
+        if plat == "win":
+            target_relaunch = "setup-start.bat"
+        elif plat == "macos":
+            target_relaunch = "setup-start.command"
+        else:
+            target_relaunch = "setup-start.sh"
+
+    if target_relaunch:
         candidate_dirs = [install_dir, os.path.dirname(install_dir), os.getcwd()]
         launched = False
         for cdir in candidate_dirs:
-            sp = os.path.join(cdir, relaunch_script)
+            sp = os.path.join(cdir, target_relaunch)
             if os.path.exists(sp):
                 if os.name != "nt" and (sp.endswith(".command") or sp.endswith(".sh")):
                     try:

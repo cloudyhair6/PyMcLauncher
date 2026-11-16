@@ -53,13 +53,13 @@ If you prefer to install dependencies and run the launcher from a terminal:
 
 ### On Windows (Command Prompt / PowerShell)
 ```cmd
-pip install -r requirements.txt
+pip install -r backend\requirements.txt
 python launcher.py
 ```
 
 ### On macOS / Linux (Terminal)
 ```bash
-python3 -m pip install -r requirements.txt
+python3 -m pip install -r backend/requirements.txt
 python3 launcher.py
 ```
 
@@ -91,6 +91,8 @@ python3 launcher.py
   - `download_assets.py` — Minecraft asset index and sound/texture downloader.
   - `extract_source_code.py` — CFR Java decompiler integration.
   - `ms_accounts.py` — Microsoft and Xbox Live authentication.
+  - `launcher_update.py` — Built-in updater and requirements verification.
+  - `requirements.txt` — Python package requirements.
   - `utils.py` — Platform utilities, config management, and shortcut creators.
 - `images/` — Launcher icons, logos, and UI assets.
 

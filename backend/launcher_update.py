@@ -50,17 +50,28 @@ except ImportError:
 OWNER = "cloudyhair6"
 REPO = "PyMcLauncher"
 USER_AGENT = "Python-Latest-Version-Detector"
-DEFAULT_OPTION = "PC App only (comes with development soon will without)"
+DEFAULT_OPTION = "Minecraft Launcher for PC"
 
 _pkg_dir = Path(__file__).resolve().parent
 ROOT_DIR = _pkg_dir.parent if _pkg_dir.name == "backend" else _pkg_dir
-CONFIG_FILE = "updater_config.json"
+CONFIG_FILE = "launcher_config.json"
+LEGACY_CONFIG_FILE = "updater_config.json"
 CONFIG_PATH = ROOT_DIR / CONFIG_FILE
-REQUIREMENTS_PATH = ROOT_DIR / "requirements.txt"
+LEGACY_CONFIG_PATH = ROOT_DIR / LEGACY_CONFIG_FILE
+REQUIREMENTS_PATH = ROOT_DIR / "backend" / "requirements.txt"
+LEGACY_REQUIREMENTS_PATH = ROOT_DIR / "requirements.txt"
 CACHE_DIR = ROOT_DIR / ".cache"
 PENDING_PATH = CACHE_DIR / "update_pending.json"
 REQ_HASH_PATH = CACHE_DIR / "requirements.sha256"
 INSTALLER_PATH = ROOT_DIR / "installer.py"
+
+
+def _get_requirements_path() -> Path:
+    if REQUIREMENTS_PATH.exists():
+        return REQUIREMENTS_PATH
+    if LEGACY_REQUIREMENTS_PATH.exists():
+        return LEGACY_REQUIREMENTS_PATH
+    return REQUIREMENTS_PATH
 
 _certs_ensured = False
 
@@ -351,20 +362,86 @@ def _http_get(url: str, timeout: int = 15):
     return url, data
 
 
-def load_config() -> dict:
-    if CONFIG_PATH.exists():
+def _read_json_dict(path: Path) -> dict:
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_updater_config(updater_cfg: dict, install_dir: str | Path | None = None):
+    """Save updater state under launcher_config.json['updater'] without clobbering launcher settings."""
+    base = Path(install_dir) if install_dir else ROOT_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    cfg_path = base / CONFIG_FILE
+    legacy_path = base / LEGACY_CONFIG_FILE
+
+    full_cfg = _read_json_dict(cfg_path)
+    full_cfg["updater"] = {
+        "current_version": str(updater_cfg.get("current_version") or "v1.7"),
+        "selected_options": list(updater_cfg.get("selected_options") or [DEFAULT_OPTION]),
+        "install_dir": str(updater_cfg.get("install_dir") or base),
+    }
+    tmp_path = cfg_path.with_suffix(".json.tmp")
+    try:
+        tmp_path.write_text(json.dumps(full_cfg, indent=4), encoding="utf-8")
+        os.replace(tmp_path, cfg_path)
+    except Exception:
+        cfg_path.write_text(json.dumps(full_cfg, indent=4), encoding="utf-8")
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
+    if legacy_path.exists():
         try:
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+            legacy_path.unlink()
         except Exception:
             pass
+
+
+def load_config(install_dir: str | Path | None = None) -> dict:
+    """Load updater config from launcher_config.json['updater'], migrating legacy updater_config.json."""
+    base = Path(install_dir) if install_dir else ROOT_DIR
+    cfg_path = base / CONFIG_FILE
+    legacy_path = base / LEGACY_CONFIG_FILE
+
+    full_cfg = _read_json_dict(cfg_path)
+    updater = full_cfg.get("updater")
+    if isinstance(updater, dict) and updater:
+        return dict(updater)
+
+    if any(k in full_cfg for k in ("current_version", "selected_options", "install_dir")):
+        migrated = {
+            "current_version": str(full_cfg.get("current_version") or "v1.7"),
+            "selected_options": list(full_cfg.get("selected_options") or [DEFAULT_OPTION]),
+            "install_dir": str(full_cfg.get("install_dir") or base),
+        }
+        save_updater_config(migrated, base)
+        return migrated
+
+    legacy_cfg = _read_json_dict(legacy_path)
+    if legacy_cfg:
+        migrated = {
+            "current_version": str(legacy_cfg.get("current_version") or "v1.7"),
+            "selected_options": list(legacy_cfg.get("selected_options") or [DEFAULT_OPTION]),
+            "install_dir": str(legacy_cfg.get("install_dir") or base),
+        }
+        save_updater_config(migrated, base)
+        return migrated
 
     default_cfg = {
         "current_version": "v1.7",
         "selected_options": [DEFAULT_OPTION],
-        "install_dir": str(ROOT_DIR),
+        "install_dir": str(base),
     }
     try:
-        CONFIG_PATH.write_text(json.dumps(default_cfg, indent=4), encoding="utf-8")
+        save_updater_config(default_cfg, base)
     except Exception:
         pass
     return default_cfg
@@ -377,7 +454,7 @@ def get_current_version() -> str:
         ver = "v1.7"
         cfg["current_version"] = ver
         try:
-            CONFIG_PATH.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
+            save_updater_config(cfg)
         except Exception:
             pass
     return str(ver)
@@ -480,6 +557,71 @@ def download_file_content(path: str, tag: str):
         if content is not None:
             return content
     return None
+
+
+def get_platform_key() -> str:
+    """Return normalized platform key used by download_options.json ('win', 'macos', or 'other')."""
+    if sys.platform == "win32" or os.name == "nt":
+        return "win"
+    if sys.platform == "darwin":
+        return "macos"
+    return "other"
+
+
+def resolve_option_platform_data(opt_data, platform_key: str | None = None) -> dict:
+    """Resolve Files, Update Ignore Files, and Message for nested platform or legacy flat options."""
+    plat = platform_key or get_platform_key()
+    empty = {"Files": [], "Update Ignore Files": [], "Message": None}
+    if isinstance(opt_data, list):
+        return {"Files": list(opt_data), "Update Ignore Files": [], "Message": None}
+    if not isinstance(opt_data, dict):
+        return empty
+
+    target = opt_data
+    if any(k in opt_data for k in ("win", "macos", "other")):
+        target = opt_data.get(plat)
+        if not isinstance(target, dict):
+            for fallback_k in ("other", "macos", "win"):
+                if isinstance(opt_data.get(fallback_k), dict):
+                    target = opt_data[fallback_k]
+                    break
+        if not isinstance(target, dict):
+            return empty
+
+    files = list(target.get("Files") or [])
+    ignores = list(target.get("Update Ignore Files") or [])
+    msg = target.get("Message")
+    return {
+        "Files": files,
+        "Update Ignore Files": ignores,
+        "Message": str(msg).strip() if msg else None,
+    }
+
+
+def collect_options_plan(download_options, selected_opts=None, platform_key: str | None = None):
+    """Collect deduplicated Files, Update Ignore Files, and Messages for selected options."""
+    if not isinstance(download_options, dict) or not download_options:
+        return [], [], []
+
+    chosen = [opt for opt in (selected_opts or []) if opt in download_options]
+    if not chosen:
+        chosen = [DEFAULT_OPTION] if DEFAULT_OPTION in download_options else [next(iter(download_options.keys()))]
+
+    paths = []
+    ignore_files = []
+    messages = []
+    for opt in chosen:
+        resolved = resolve_option_platform_data(download_options[opt], platform_key=platform_key)
+        for p in resolved["Files"]:
+            if p not in paths:
+                paths.append(p)
+        for ig in resolved["Update Ignore Files"]:
+            if ig not in ignore_files:
+                ignore_files.append(ig)
+        msg = resolved.get("Message")
+        if msg and msg not in messages:
+            messages.append(msg)
+    return paths, ignore_files, messages
 
 
 def resolve_files_to_download(paths, tree_objects, ignore_files=None):
@@ -597,14 +739,7 @@ def run_update_check(install_dir=None, relaunch_script=None):
     if not install_dir:
         install_dir = str(ROOT_DIR)
     install_dir = os.path.abspath(install_dir)
-    cfg_file = os.path.join(install_dir, CONFIG_FILE)
-    cfg = {}
-    if os.path.exists(cfg_file):
-        try:
-            with open(cfg_file, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-        except Exception:
-            pass
+    cfg = load_config(install_dir)
 
     selected_opts = cfg.get("selected_options", [DEFAULT_OPTION])
     ver = get_latest_version()
@@ -614,28 +749,33 @@ def run_update_check(install_dir=None, relaunch_script=None):
     if not download_options:
         return
 
-    paths = []
-    ignore_files = []
-    for opt in selected_opts:
-        if opt in download_options:
-            opt_data = download_options[opt]
-            if isinstance(opt_data, dict):
-                paths.extend(opt_data.get("Files", []))
-                ignore_files.extend(opt_data.get("Update Ignore Files", []))
-            elif isinstance(opt_data, list):
-                paths.extend(opt_data)
-
+    paths, ignore_files, messages = collect_options_plan(download_options, selected_opts)
     tree = get_repo_tree(ver)
     files = resolve_files_to_download(paths, tree, ignore_files=ignore_files)
     if not files:
         return
 
     perform_download_concurrently(files, ver, install_dir)
-    cfg["current_version"] = ver
-    cfg["selected_options"] = selected_opts
-    cfg["install_dir"] = install_dir
-    with open(cfg_file, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=4)
+    save_updater_config(
+        {
+            "current_version": ver,
+            "selected_options": selected_opts,
+            "install_dir": install_dir,
+        },
+        install_dir=install_dir,
+    )
+
+    if messages:
+        for msg in messages:
+            print(f"[Info] {msg}", flush=True)
+        pending_file = Path(install_dir) / ".cache" / "update_pending.json"
+        try:
+            pending_data = _read_json_dict(pending_file)
+            pending_data["messages"] = messages
+            pending_file.parent.mkdir(parents=True, exist_ok=True)
+            pending_file.write_text(json.dumps(pending_data), encoding="utf-8")
+        except Exception:
+            pass
 
     target_script = relaunch_script or detect_relaunch_script(install_dir)
     _launch_relaunch_target(install_dir, target_script)
@@ -703,10 +843,11 @@ def _marker_matches(marker_str: str) -> bool:
 # --- Requirements Verification ---
 def _read_requirements() -> list[str]:
     reqs = []
-    if not REQUIREMENTS_PATH.exists():
+    req_path = _get_requirements_path()
+    if not req_path.exists():
         return reqs
     try:
-        for line in REQUIREMENTS_PATH.read_text(encoding="utf-8").splitlines():
+        for line in req_path.read_text(encoding="utf-8").splitlines():
             line = line.split("#", 1)[0].strip()
             if not line or line.startswith("-"):
                 continue
@@ -724,7 +865,7 @@ def _read_requirements() -> list[str]:
 
 def requirements_hash() -> str:
     try:
-        return hashlib.sha256(REQUIREMENTS_PATH.read_bytes()).hexdigest()
+        return hashlib.sha256(_get_requirements_path().read_bytes()).hexdigest()
     except Exception:
         return ""
 
@@ -766,7 +907,7 @@ def find_unsatisfied_requirements() -> list[str]:
 
 
 def requirements_need_install() -> tuple[bool, list[str]]:
-    if not REQUIREMENTS_PATH.exists():
+    if not _get_requirements_path().exists():
         return False, []
 
     reasons = []
@@ -783,7 +924,7 @@ def requirements_need_install() -> tuple[bool, list[str]]:
 
     curr_hash = requirements_hash()
     if stored_hash and stored_hash != curr_hash:
-        reasons.append("requirements.txt has been modified")
+        reasons.append("backend/requirements.txt has been modified")
     elif not stored_hash and not reasons:
         # First time running and all requirements are already met
         mark_requirements_installed()
@@ -834,11 +975,12 @@ class _ChangelogThread(QThread):
 class ChangelogDialog(QDialog):
     """Displays commit descriptions between two versions in Markdown format."""
 
-    def __init__(self, parent, old_version: str, new_version: str, for_confirmation: bool = False):
+    def __init__(self, parent, old_version: str, new_version: str, for_confirmation: bool = False, extra_messages: list[str] | None = None):
         super().__init__(parent)
         self.for_confirmation = for_confirmation
         self.old_version = old_version
         self.new_version = new_version
+        self.extra_messages = [str(m).strip() for m in (extra_messages or []) if str(m).strip()]
 
         title = f"Version Changes ({old_version} -> {new_version})" if for_confirmation else "What's New in Update"
         self.setWindowTitle(title)
@@ -850,9 +992,9 @@ class ChangelogDialog(QDialog):
 
         self.browser = QTextBrowser()
         self.browser.setOpenExternalLinks(True)
-        self.browser.setMarkdown(
+        self.browser.setMarkdown(self._compose_markdown(
             f"## Version Changes: `{old_version}` -> `{new_version}`\n\n_Loading commit descriptions from GitHub..._"
-        )
+        ))
         layout.addWidget(self.browser, stretch=1)
 
         btn_layout = QHBoxLayout()
@@ -877,12 +1019,18 @@ class ChangelogDialog(QDialog):
         layout.addLayout(btn_layout)
 
         self._thread = _ChangelogThread(old_version, new_version, self)
-        self._thread.result.connect(self.browser.setMarkdown)
+        self._thread.result.connect(lambda md: self.browser.setMarkdown(self._compose_markdown(md)))
         self._thread.start()
+
+    def _compose_markdown(self, body_md: str) -> str:
+        if not self.extra_messages:
+            return body_md
+        notes = "\n\n".join(f"> **Note:** {msg}" for msg in self.extra_messages)
+        return f"{body_md.rstrip()}\n\n---\n\n{notes}\n"
 
 
 class RequirementsInstallDialog(QDialog):
-    """Executes pip install -r requirements.txt with a live progress bar and log viewer."""
+    """Executes pip install -r backend/requirements.txt with a live progress bar and log viewer."""
 
     def __init__(self, parent, reasons: list[str]):
         super().__init__(parent)
@@ -946,7 +1094,7 @@ class RequirementsInstallDialog(QDialog):
                 "--prefer-binary",
                 "--progress-bar", "off",
                 "--disable-pip-version-check",
-                "-r", str(REQUIREMENTS_PATH),
+                "-r", str(_get_requirements_path()),
             ],
         )
 
@@ -1045,8 +1193,9 @@ class UpdateController:
 
         old_ver = data.get("from")
         new_ver = data.get("to")
+        messages = data.get("messages") if isinstance(data.get("messages"), list) else None
         if old_ver and new_ver:
-            dlg = ChangelogDialog(self.launcher, old_ver, new_ver, for_confirmation=False)
+            dlg = ChangelogDialog(self.launcher, old_ver, new_ver, for_confirmation=False, extra_messages=messages)
             dlg.exec()
 
     def _check_version(self):
@@ -1151,7 +1300,7 @@ Examples:
 """
     )
     parser.add_argument("--check", action="store_true", help="Check for available releases on GitHub")
-    parser.add_argument("--requirements", action="store_true", help="Check installed Python packages against requirements.txt")
+    parser.add_argument("--requirements", action="store_true", help="Check installed Python packages against backend/requirements.txt")
     parser.add_argument("--version", action="store_true", help="Display current launcher version")
     parser.add_argument("--update-check", action="store_true", help="Perform silent update check and download")
     parser.add_argument("--relaunch", type=str, default=None, help="Script to relaunch after updating")
@@ -1177,7 +1326,7 @@ Examples:
             for m in missing:
                 print(f"  - {m}")
         else:
-            print("[OK] All packages in requirements.txt are installed.")
+            print("[OK] All packages in backend/requirements.txt are installed.")
 
     if args.check:
         cur = get_current_version()
