@@ -1169,66 +1169,125 @@ def fetch_player_textures(profile_id, uuid, gamerpic_url=None, progress_callback
     else:
         if progress_callback: progress_callback(40, "Loading cached textures...")
 
-    if not js_path.exists():
+    if not js_path.exists() or js_path.stat().st_size < 10000:
         if progress_callback: progress_callback(75, "Setting up 3D skin viewer...")
-        try:
-            r = requests.get("https://unpkg.com/skinview3d@3.0.0/bundles/skinview3d.bundle.js", timeout=5)
-            if r.status_code == 200:
-                with open(js_path, "wb") as f:
-                    f.write(r.content)
-        except Exception as e:
-            print(f"Failed to download skinview3d: {e}")
+        bundle_urls = [
+            "https://unpkg.com/skinview3d@3.0.0/bundles/skinview3d.bundle.js",
+            "https://cdn.jsdelivr.net/npm/skinview3d@3.0.0/bundles/skinview3d.bundle.js",
+        ]
+        for b_url in bundle_urls:
+            try:
+                r = requests.get(b_url, timeout=12)
+                if r.status_code == 200 and len(r.content) > 10000:
+                    with open(js_path, "wb") as f:
+                        f.write(r.content)
+                    break
+            except Exception as e:
+                print(f"Failed to download skinview3d from {b_url}: {e}")
 
     if progress_callback: progress_callback(100, "Profile ready")
 
-    # Generate skin_viewer.html (always ensure latest HTML with proper null cape handling)
-    html_content = """<!DOCTYPE html>
+    # Generate skin_viewer.html (supports live background color sync & responsive WebGL resize)
+    html_content = r"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <title>Skin Viewer</title>
     <style>
-        body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
-        #skin_container { width: 100vw; height: 100vh; }
+        html, body { width: 100%; height: 100%; margin: 0; padding: 0; background: transparent; overflow: hidden; }
+        #skin_container { width: 100%; height: 100%; display: block; }
+        #skin_container canvas { display: block; width: 100%; height: 100%; }
     </style>
 </head>
 <body>
 <div id="skin_container"></div>
 <script src="../skinview3d.bundle.js"></script>
 <script>
-    const urlParams = new URLSearchParams(window.location.search);
-    const skin = urlParams.get('skin');
-    const cape = urlParams.get('cape');
-    const model = urlParams.get('model') || 'classic';
-    const backEq = urlParams.get('back') || 'cape';
-    
-    let skinViewer = new skinview3d.SkinViewer({
-        canvas: document.createElement("canvas"),
-        width: window.innerWidth,
-        height: window.innerHeight
-    });
-    if (skin) {
-        skinViewer.loadSkin(skin, { model: model === 'classic' ? 'default' : model });
-    }
-    
-    window.hasCapeLoaded = Boolean(cape);
-    if (cape) {
-        skinViewer.loadCape(cape, { backEquipment: backEq });
-    } else {
-        skinViewer.loadCape(null);
-        if (skinViewer.playerObject) {
-            skinViewer.playerObject.backEquipment = null;
-            if (skinViewer.playerObject.cape) skinViewer.playerObject.cape.visible = false;
-            if (skinViewer.playerObject.elytra) skinViewer.playerObject.elytra.visible = false;
-        }
-    }
-    
-    skinViewer.camera.position.set(-20, 10, 40);
-    skinViewer.controls.enableZoom = false;
-    skinViewer.controls.enablePan = false;
-    document.getElementById("skin_container").appendChild(skinViewer.canvas);
+    (function() {
+        const urlParams = new URLSearchParams(window.location.search);
+        const skin = urlParams.get('skin');
+        const cape = urlParams.get('cape');
+        const model = urlParams.get('model') || 'classic';
+        const backEq = urlParams.get('back') || 'cape';
+        const rawBg = (urlParams.get('bg') || 'transparent').trim();
 
-    window.skinViewer = skinViewer;
+        function sanitizeBg(val) {
+            if (!val || val === 'transparent') return 'transparent';
+            if (/^#[0-9a-fA-F]{3,8}$/.test(val)) return val;
+            if (/^rgba?\([0-9.,\s]+\)$/.test(val)) return val;
+            return 'transparent';
+        }
+
+        window.setViewerBackground = function(color) {
+            const safe = sanitizeBg((color || '').trim());
+            document.documentElement.style.backgroundColor = safe;
+            document.body.style.backgroundColor = safe;
+        };
+
+        window.setViewerBackground(rawBg);
+
+        function initViewer() {
+            if (typeof skinview3d === 'undefined' || !skinview3d.SkinViewer) {
+                console.error('skinview3d library failed to load.');
+                return;
+            }
+            const container = document.getElementById('skin_container');
+            const rect = container.getBoundingClientRect();
+            const initW = Math.max(Math.round(rect.width || window.innerWidth || 0), 200);
+            const initH = Math.max(Math.round(rect.height || window.innerHeight || 0), 180);
+
+            const skinViewer = new skinview3d.SkinViewer({
+                canvas: document.createElement("canvas"),
+                width: initW,
+                height: initH
+            });
+            skinViewer.background = null;
+
+            if (skin) {
+                skinViewer.loadSkin(skin, { model: model === 'classic' ? 'default' : model });
+            }
+
+            window.hasCapeLoaded = Boolean(cape);
+            if (cape) {
+                skinViewer.loadCape(cape, { backEquipment: backEq });
+            } else {
+                skinViewer.loadCape(null);
+                if (skinViewer.playerObject) {
+                    skinViewer.playerObject.backEquipment = null;
+                    if (skinViewer.playerObject.cape) skinViewer.playerObject.cape.visible = false;
+                    if (skinViewer.playerObject.elytra) skinViewer.playerObject.elytra.visible = false;
+                }
+            }
+
+            skinViewer.camera.position.set(-20, 10, 40);
+            skinViewer.controls.enableZoom = false;
+            skinViewer.controls.enablePan = false;
+            container.appendChild(skinViewer.canvas);
+            window.skinViewer = skinViewer;
+
+            window.__syncViewerSize = function() {
+                const r = container.getBoundingClientRect();
+                const w = Math.max(Math.round(r.width || window.innerWidth || 0), 1);
+                const h = Math.max(Math.round(r.height || window.innerHeight || 0), 1);
+                if (w > 1 && h > 1 && window.skinViewer && typeof window.skinViewer.setSize === 'function') {
+                    window.skinViewer.setSize(w, h);
+                }
+            };
+
+            window.addEventListener('resize', window.__syncViewerSize);
+            if (typeof ResizeObserver !== 'undefined') {
+                new ResizeObserver(window.__syncViewerSize).observe(container);
+            }
+            requestAnimationFrame(window.__syncViewerSize);
+            setTimeout(window.__syncViewerSize, 120);
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initViewer);
+        } else {
+            initViewer();
+        }
+    })();
 </script>
 </body>
 </html>"""

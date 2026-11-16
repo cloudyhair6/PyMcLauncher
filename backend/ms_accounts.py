@@ -249,6 +249,144 @@ class _SwitchToBrowserRequested(RuntimeError):
     """Raised when the user opts to continue Microsoft sign-in in their default browser."""
 
 
+def build_webauthn_js_hook(auto_fallback_ms: int = 0) -> str:
+    """Build injected JS hook wrapping navigator.credentials.get/create.
+
+    Tracks interactive WebAuthn lifecycle via console messages, exposes
+    window.__agy_abort_webauthn(reason) to fall back to password entry cleanly,
+    and optionally rejects with a standard NotAllowedError DOMException after
+    auto_fallback_ms if no Qt WebAuthn UX dialog opened.
+    """
+    delay_ms = max(0, int(auto_fallback_ms or 0))
+    return f"""
+        (function() {{
+            if (window.__agy_webauthn_hooked) return;
+            window.__agy_webauthn_hooked = true;
+            if (typeof window.__agy_webauthn_ux_active !== "boolean") {{
+                window.__agy_webauthn_ux_active = false;
+            }}
+
+            const rawLog = (window.console && window.console.log) ? window.console.log.bind(window.console) : function() {{}};
+            const rawWarn = (window.console && window.console.warn) ? window.console.warn.bind(window.console) : rawLog;
+            const autoFallbackMs = {delay_ms};
+
+            function notify(tag) {{
+                try {{ rawLog(tag); }} catch (e) {{}}
+                try {{ rawWarn(tag); }} catch (e) {{}}
+            }}
+
+            function makeNotAllowedError(msg) {{
+                const text = msg || "Passkey prompt could not be opened on this device.";
+                try {{
+                    return new DOMException(text, "NotAllowedError");
+                }} catch (e) {{
+                    const fallback = new Error(text);
+                    fallback.name = "NotAllowedError";
+                    return fallback;
+                }}
+            }}
+
+            function normalizeError(err) {{
+                if (err && typeof DOMException !== "undefined" && err instanceof DOMException) {{
+                    return err;
+                }}
+                if (err && err.name && (err.name === "NotAllowedError" || err.name === "AbortError" || err.name === "NotSupportedError" || err.name === "SecurityError")) {{
+                    return err;
+                }}
+                return makeNotAllowedError(err && err.message ? String(err.message) : String(err || "Passkey unavailable"));
+            }}
+
+            function wrapWebAuthn(origFn) {{
+                if (!origFn || origFn.__agy_wrapped) return origFn;
+                const wrapped = function(options) {{
+                    const self = this;
+                    const callArgs = arguments;
+                    const isConditional = Boolean(options && options.mediation === "conditional");
+                    if (!isConditional) {{
+                        window.__agy_webauthn_ux_active = false;
+                        notify("AGY_WEBAUTHN_START");
+                    }}
+
+                    return new Promise(function(resolve, reject) {{
+                        let settled = false;
+                        let timerId = null;
+
+                        function finish(fn, value) {{
+                            if (settled) return;
+                            settled = true;
+                            if (timerId !== null) {{
+                                clearTimeout(timerId);
+                                timerId = null;
+                            }}
+                            if (window.__agy_abort_webauthn === abortCurrent) {{
+                                window.__agy_abort_webauthn = null;
+                            }}
+                            fn(value);
+                        }}
+
+                        function abortCurrent(reason) {{
+                            if (!isConditional) {{
+                                notify("AGY_WEBAUTHN_CANCEL");
+                            }}
+                            finish(reject, makeNotAllowedError(reason));
+                        }}
+
+                        if (!isConditional) {{
+                            window.__agy_abort_webauthn = abortCurrent;
+                            if (autoFallbackMs > 0) {{
+                                timerId = setTimeout(function() {{
+                                    if (!settled && !window.__agy_webauthn_ux_active) {{
+                                        notify("AGY_WEBAUTHN_AUTO_FALLBACK");
+                                        abortCurrent("Passkey prompt could not open in the embedded window. Use your password or open in your default browser.");
+                                    }}
+                                }}, autoFallbackMs);
+                            }}
+                        }}
+
+                        try {{
+                            const resPromise = origFn.apply(self, callArgs);
+                            if (resPromise && typeof resPromise.then === "function") {{
+                                resPromise.then(function(res) {{
+                                    if (!isConditional) notify("AGY_WEBAUTHN_SUCCESS");
+                                    finish(resolve, res);
+                                }}, function(err) {{
+                                    if (!isConditional) notify("AGY_WEBAUTHN_CANCEL");
+                                    finish(reject, normalizeError(err));
+                                }});
+                            }} else {{
+                                if (!isConditional) notify("AGY_WEBAUTHN_SUCCESS");
+                                finish(resolve, resPromise);
+                            }}
+                        }} catch (err) {{
+                            if (!isConditional) notify("AGY_WEBAUTHN_CANCEL");
+                            finish(reject, normalizeError(err));
+                        }}
+                    }});
+                }};
+                wrapped.__agy_wrapped = true;
+                return wrapped;
+            }}
+
+            if (typeof CredentialsContainer !== "undefined" && CredentialsContainer.prototype) {{
+                if (CredentialsContainer.prototype.get) {{
+                    CredentialsContainer.prototype.get = wrapWebAuthn(CredentialsContainer.prototype.get);
+                }}
+                if (CredentialsContainer.prototype.create) {{
+                    CredentialsContainer.prototype.create = wrapWebAuthn(CredentialsContainer.prototype.create);
+                }}
+            }}
+            if (navigator.credentials) {{
+                if (navigator.credentials.get) {{
+                    navigator.credentials.get = wrapWebAuthn(navigator.credentials.get);
+                }}
+                if (navigator.credentials.create) {{
+                    navigator.credentials.create = wrapWebAuthn(navigator.credentials.create);
+                }}
+            }}
+        }})();
+    """
+
+
 def attach_webauthn_ux_handler(
     page,
     parent_window=None,
@@ -388,7 +526,7 @@ def attach_webauthn_ux_handler(
             self.primary_btn.clicked.connect(self._handle_primary)
             btn_layout.addWidget(self.primary_btn)
 
-            self.cancel_btn = QPushButton("Cancel")
+            self.cancel_btn = QPushButton("Use Password")
             self.cancel_btn.clicked.connect(self._cancel_request)
             btn_layout.addWidget(self.cancel_btn)
 
@@ -439,6 +577,13 @@ def attach_webauthn_ux_handler(
                     req.cancel()
                 except RuntimeError:
                     pass
+            try:
+                page.runJavaScript(
+                    "window.__agy_webauthn_ux_active = false;"
+                    "window.__agy_abort_webauthn && window.__agy_abort_webauthn('Passkey cancelled to use password.');"
+                )
+            except RuntimeError:
+                pass
             self.close()
 
         def _switch_to_browser(self):
@@ -455,6 +600,13 @@ def attach_webauthn_ux_handler(
                         req.cancel()
                     except RuntimeError:
                         pass
+                try:
+                    page.runJavaScript(
+                        "window.__agy_webauthn_ux_active = false;"
+                        "window.__agy_abort_webauthn && window.__agy_abort_webauthn('Passkey prompt closed.');"
+                    )
+                except RuntimeError:
+                    pass
             super().closeEvent(event)
 
     def _close_dialog():
@@ -477,15 +629,30 @@ def attach_webauthn_ux_handler(
             controller["dialog"] = dlg
         return dlg
 
+    def _sync_ux_flag(ux_active: bool):
+        try:
+            page.runJavaScript(f"window.__agy_webauthn_ux_active = {'true' if ux_active else 'false'};")
+        except RuntimeError:
+            pass
+
     def _sync_state(state):
         req = controller.get("request")
         if req is None:
+            _sync_ux_flag(False)
             return
         try:
             rp = req.relyingPartyId() or "Microsoft"
         except RuntimeError:
+            _sync_ux_flag(False)
             _close_dialog()
             return
+
+        ux_active = state in (
+            state_values["select_account"],
+            state_values["collect_pin"],
+            state_values["finish_token"],
+        )
+        _sync_ux_flag(ux_active)
 
         if callable(on_state_update):
             try:
@@ -621,7 +788,7 @@ def _open_qt_oauth_popup(auth_url: str, redirect_prefix: str = LIVE_DESKTOP_REDI
     """Open a built-in Qt WebEngine popup window for direct Microsoft OAuth login."""
     try:
         from PyQt6.QtCore import QEventLoop, QTimer, QUrl
-        from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+        from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineScript
         from PyQt6.QtWebEngineWidgets import QWebEngineView
         from PyQt6.QtWidgets import (
             QApplication,
@@ -647,11 +814,44 @@ def _open_qt_oauth_popup(auth_url: str, redirect_prefix: str = LIVE_DESKTOP_REDI
         profile.cookieStore().deleteAllCookies()
     except Exception:
         pass
-    page = QWebEnginePage(profile)
-    view = QWebEngineView()
-    view.setPage(page)
+
+    hook_script = QWebEngineScript()
+    hook_script.setSourceCode(build_webauthn_js_hook(auto_fallback_ms=3500 if os.name != "nt" else 0))
+    hook_script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+    hook_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+    hook_script.setRunsOnSubFrames(True)
+    hook_script.setName("webauthn_hook_v2")
+    for existing_s in list(profile.scripts().toList()):
+        if existing_s.name() in ("webauthn_hook", "webauthn_hook_v2"):
+            profile.scripts().remove(existing_s)
+    profile.scripts().insert(hook_script)
 
     state = {"url": "", "done": False, "switch_browser": False}
+
+    class _PopupWebPage(QWebEnginePage):
+        def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
+            if message == "AGY_WEBAUTHN_START":
+                use_pwd_btn.setVisible(True)
+                helper_lbl.setText(
+                    "Passkey check active. If no prompt opens, click 'Use Password' or 'Open in Default Browser'."
+                )
+                helper_lbl.setStyleSheet("color: #d4d4d4; font-size: 12px;")
+                return
+            if message in ("AGY_WEBAUTHN_AUTO_FALLBACK", "AGY_WEBAUTHN_CANCEL"):
+                use_pwd_btn.setVisible(False)
+                helper_lbl.setText(
+                    "Passkey couldn't open here. Choose Password / Other ways to sign in below, or click 'Open in Default Browser'."
+                )
+                helper_lbl.setStyleSheet("color: #ffd479; font-size: 12px; font-weight: bold;")
+                return
+            if message == "AGY_WEBAUTHN_SUCCESS":
+                use_pwd_btn.setVisible(False)
+                return
+            super().javaScriptConsoleMessage(level, message, lineNumber, sourceID)
+
+    page = _PopupWebPage(profile)
+    view = QWebEngineView()
+    view.setPage(page)
 
     class _PopupWindow(QMainWindow):
         def closeEvent(self, event):
@@ -673,13 +873,23 @@ def _open_qt_oauth_popup(auth_url: str, redirect_prefix: str = LIVE_DESKTOP_REDI
     helper_bar.setStyleSheet("background-color: #252526; border-bottom: 1px solid #3c3c3c;")
     helper_layout = QHBoxLayout(helper_bar)
     helper_layout.setContentsMargins(10, 6, 10, 6)
+    helper_layout.setSpacing(8)
     helper_lbl = QLabel(
         "Using a phone/iCloud passkey? Click 'Open in Default Browser'."
         if sys.platform != "win32"
         else "Trouble with Passkey or Sign-In?"
     )
+    helper_lbl.setWordWrap(True)
     helper_lbl.setStyleSheet("color: #d4d4d4; font-size: 12px;")
     helper_layout.addWidget(helper_lbl, stretch=1)
+
+    use_pwd_btn = QPushButton("Use Password")
+    use_pwd_btn.setVisible(False)
+    use_pwd_btn.setStyleSheet(
+        "background-color: #4a4a4d; color: white; font-weight: bold; "
+        "border-radius: 4px; padding: 4px 10px; font-size: 12px;"
+    )
+    helper_layout.addWidget(use_pwd_btn)
 
     switch_btn = QPushButton("Open in Default Browser")
     switch_btn.setStyleSheet(
@@ -711,6 +921,16 @@ def _open_qt_oauth_popup(auth_url: str, redirect_prefix: str = LIVE_DESKTOP_REDI
             pass
         QTimer.singleShot(50, _quit_loop)
 
+    def _trigger_use_password():
+        use_pwd_btn.setVisible(False)
+        try:
+            page.runJavaScript(
+                "window.__agy_webauthn_ux_active = false;"
+                "window.__agy_abort_webauthn && window.__agy_abort_webauthn('Switched to password sign-in.');"
+            )
+        except RuntimeError:
+            pass
+
     def _trigger_switch_browser():
         if state["done"]:
             return
@@ -718,6 +938,7 @@ def _open_qt_oauth_popup(auth_url: str, redirect_prefix: str = LIVE_DESKTOP_REDI
         state["done"] = True
         QTimer.singleShot(0, _teardown)
 
+    use_pwd_btn.clicked.connect(_trigger_use_password)
     switch_btn.clicked.connect(_trigger_switch_browser)
 
     attach_webauthn_ux_handler(

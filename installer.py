@@ -965,16 +965,27 @@ def run_update_check(install_dir=None, relaunch_script=None):
 
     if relaunch_script:
         candidate_dirs = [install_dir, os.path.dirname(install_dir), os.getcwd()]
+        launched = False
         for cdir in candidate_dirs:
             sp = os.path.join(cdir, relaunch_script)
             if os.path.exists(sp):
+                if os.name != "nt" and (sp.endswith(".command") or sp.endswith(".sh")):
+                    try:
+                        os.chmod(sp, 0o755)
+                    except Exception:
+                        pass
                 if os.name == "nt":
                     subprocess.Popen(["cmd.exe", "/c", sp], cwd=cdir, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
                 elif sys.platform == "darwin":
-                    subprocess.Popen(["open", sp], cwd=cdir)
+                    subprocess.Popen(["open", sp], cwd=cdir, start_new_session=True)
                 else:
-                    subprocess.Popen(["bash", sp], cwd=cdir)
+                    subprocess.Popen(["bash", sp], cwd=cdir, start_new_session=True)
+                launched = True
                 break
+        if not launched:
+            launcher_py = os.path.join(install_dir, "launcher.py")
+            if os.path.exists(launcher_py):
+                subprocess.Popen([sys.executable, launcher_py], cwd=install_dir, start_new_session=(os.name != "nt"))
 
 
 if __name__ == "__main__":

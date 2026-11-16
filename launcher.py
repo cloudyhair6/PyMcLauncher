@@ -229,6 +229,238 @@ def image_to_ico(source_path: str, ico_name: str) -> Optional[Path]:
     return _save_qimage_as_ico(img, out_ico) or ensure_default_minecraft_ico()
 
 
+DEFAULT_PERSONALISATION = {
+    "theme": "system",  # "system", "light", "dark"
+    "show_3d_skin": True,
+    "show_change_skin_btn": True,
+    "show_java_profile": True,
+    "show_xbox_profile": True,
+    "show_locator_bar": True,
+}
+
+
+def load_personalisation_options(config: Optional[dict] = None) -> dict:
+    """Load personalisation & theme settings with legacy player_data_options compatibility."""
+    cfg = config if isinstance(config, dict) else load_launcher_config()
+    merged = dict(DEFAULT_PERSONALISATION)
+    legacy = cfg.get("player_data_options")
+    if isinstance(legacy, dict):
+        merged.update({k: legacy[k] for k in legacy if k in DEFAULT_PERSONALISATION})
+    pers = cfg.get("personalisation")
+    if isinstance(pers, dict):
+        merged.update({k: pers[k] for k in pers if k in DEFAULT_PERSONALISATION})
+    theme = str(merged.get("theme", "system")).lower()
+    if theme not in ("system", "light", "dark"):
+        merged["theme"] = "system"
+    else:
+        merged["theme"] = theme
+    return merged
+
+
+def save_personalisation_options(options: dict, config: Optional[dict] = None):
+    """Persist personalisation & theme settings while syncing legacy player_data_options keys."""
+    cfg = config if isinstance(config, dict) else load_launcher_config()
+    clean = dict(DEFAULT_PERSONALISATION)
+    for k in DEFAULT_PERSONALISATION:
+        if k in options:
+            clean[k] = options[k]
+    cfg["personalisation"] = clean
+    cfg["player_data_options"] = {
+        k: bool(clean.get(k, True))
+        for k in (
+            "show_3d_skin",
+            "show_change_skin_btn",
+            "show_java_profile",
+            "show_xbox_profile",
+            "show_locator_bar",
+        )
+    }
+    save_launcher_config(cfg)
+
+
+def detect_os_dark_mode() -> bool:
+    """Detect whether the host OS currently uses Dark Mode."""
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            ) as key:
+                val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                return int(val) == 0
+        except Exception:
+            pass
+    elif sys.platform == "darwin":
+        try:
+            import subprocess
+            res = subprocess.run(
+                ["defaults", "read", "-g", "AppleInterfaceStyle"],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+            )
+            if res.returncode == 0 and "dark" in res.stdout.lower():
+                return True
+            if res.returncode != 0:
+                return False
+        except Exception:
+            pass
+
+    app = QApplication.instance()
+    if app is not None:
+        try:
+            hints = app.styleHints()
+            if hasattr(hints, "colorScheme") and hasattr(Qt, "ColorScheme"):
+                return hints.colorScheme() == Qt.ColorScheme.Dark
+        except Exception:
+            pass
+    return False
+
+
+def get_effective_is_dark(mode: Optional[str] = None) -> bool:
+    """Resolve effective dark/light state from explicit mode or saved personalisation."""
+    theme = (mode or load_personalisation_options().get("theme", "system")).lower()
+    if theme == "dark":
+        return True
+    if theme == "light":
+        return False
+    return detect_os_dark_mode()
+
+
+def _build_dark_palette() -> QPalette:
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window, QColor("#1e1e1e"))
+    pal.setColor(QPalette.ColorRole.WindowText, QColor("#eaeaea"))
+    pal.setColor(QPalette.ColorRole.Base, QColor("#252526"))
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor("#2d2d30"))
+    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#252526"))
+    pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#eaeaea"))
+    pal.setColor(QPalette.ColorRole.Text, QColor("#eaeaea"))
+    pal.setColor(QPalette.ColorRole.Button, QColor("#2d2d30"))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor("#eaeaea"))
+    pal.setColor(QPalette.ColorRole.BrightText, QColor("#ffffff"))
+    pal.setColor(QPalette.ColorRole.Link, QColor("#4da6ff"))
+    pal.setColor(QPalette.ColorRole.Highlight, QColor("#0078d7"))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    if hasattr(QPalette.ColorRole, "PlaceholderText"):
+        pal.setColor(QPalette.ColorRole.PlaceholderText, QColor("#8a8a8a"))
+    for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
+        pal.setColor(QPalette.ColorGroup.Disabled, role, QColor("#777777"))
+    return pal
+
+
+def _build_light_palette() -> QPalette:
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window, QColor("#f0f0f0"))
+    pal.setColor(QPalette.ColorRole.WindowText, QColor("#111111"))
+    pal.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor("#f7f7f7"))
+    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#ffffdc"))
+    pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#111111"))
+    pal.setColor(QPalette.ColorRole.Text, QColor("#111111"))
+    pal.setColor(QPalette.ColorRole.Button, QColor("#e6e6e6"))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor("#111111"))
+    pal.setColor(QPalette.ColorRole.BrightText, QColor("#ffffff"))
+    pal.setColor(QPalette.ColorRole.Link, QColor("#0066cc"))
+    pal.setColor(QPalette.ColorRole.Highlight, QColor("#0078d7"))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    if hasattr(QPalette.ColorRole, "PlaceholderText"):
+        pal.setColor(QPalette.ColorRole.PlaceholderText, QColor("#777777"))
+    for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
+        pal.setColor(QPalette.ColorGroup.Disabled, role, QColor("#888888"))
+    return pal
+
+
+def get_theme_window_bg_hex(is_dark: Optional[bool] = None) -> str:
+    """Return concrete window background color hex so embedded WebEngine views match cleanly."""
+    dark = get_effective_is_dark() if is_dark is None else bool(is_dark)
+    if dark:
+        return "#1e1e1e"
+    app = QApplication.instance()
+    if app is not None:
+        try:
+            col = app.palette().color(QPalette.ColorRole.Window)
+            if col.isValid() and (col.red() + col.green() + col.blue()) > 380:
+                return col.name()
+        except Exception:
+            pass
+    return "#ececec" if sys.platform == "darwin" else "#f0f0f0"
+
+
+def apply_launcher_theme(mode: Optional[str] = None) -> bool:
+    """Apply Light, Dark, or System-matched Qt style and palette globally; returns is_dark."""
+    pref = (mode or load_personalisation_options().get("theme", "system")).lower()
+    is_dark = get_effective_is_dark(pref)
+    app = QApplication.instance()
+    if app is None:
+        return is_dark
+
+    if is_dark:
+        app.setStyle("Fusion")
+        app.setPalette(_build_dark_palette())
+        app.setStyleSheet(
+            "QToolTip { color: #eaeaea; background-color: #252526; border: 1px solid #454545; } "
+            "QGroupBox { border: 1px solid #3c3c3c; border-radius: 4px; margin-top: 8px; padding-top: 6px; } "
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
+        )
+    else:
+        if sys.platform == "win32":
+            app.setStyle("windowsvista")
+            app.setPalette(app.style().standardPalette())
+        elif sys.platform == "darwin" and pref == "light" and detect_os_dark_mode():
+            # Force light controls via Fusion even when macOS system appearance is dark
+            app.setStyle("Fusion")
+            app.setPalette(_build_light_palette())
+        else:
+            if sys.platform == "darwin":
+                app.setStyle("macintosh")
+            else:
+                app.setStyle("Fusion")
+            app.setPalette(app.style().standardPalette())
+        app.setStyleSheet("")
+
+    try:
+        hints = app.styleHints()
+        if hasattr(hints, "setColorScheme") and hasattr(Qt, "ColorScheme"):
+            if pref == "system" and hasattr(hints, "unsetColorScheme"):
+                hints.unsetColorScheme()
+            else:
+                hints.setColorScheme(Qt.ColorScheme.Dark if is_dark else Qt.ColorScheme.Light)
+    except Exception:
+        pass
+
+    return is_dark
+
+
+def _configure_skin_webview(web_view: QWebEngineView, bg_hex: Optional[str] = None):
+    """Configure QWebEngineView with file:// texture access, WebGL, and theme-matched background."""
+    profile = web_view.page().profile() if web_view.page() else QWebEngineProfile.defaultProfile()
+    page = CustomWebPage(profile, web_view)
+    web_view.setPage(page)
+    try:
+        from PyQt6.QtWebEngineCore import QWebEngineSettings
+        settings = web_view.settings()
+        for attr_name in (
+            "LocalContentCanAccessFileUrls",
+            "LocalContentCanAccessRemoteUrls",
+            "WebGLEnabled",
+            "Accelerated2dCanvasEnabled",
+            "JavascriptEnabled",
+        ):
+            attr = getattr(QWebEngineSettings.WebAttribute, attr_name, None)
+            if attr is not None:
+                settings.setAttribute(attr, True)
+    except Exception:
+        pass
+    resolved_bg = bg_hex or get_theme_window_bg_hex()
+    try:
+        page.setBackgroundColor(QColor(resolved_bg))
+    except Exception:
+        pass
+    return page, resolved_bg
+
+
 class CreateShortcutDialog(QDialog):
     """Dialog to create a Desktop shortcut or pin to Start Menu for a version, world/Quick Play, or profile."""
     def __init__(self, launcher_gui: 'LauncherGUI'):
@@ -924,10 +1156,12 @@ class VersionOptionsDialog(QDialog):
         
         any_game_running = bool(parent and len(getattr(parent, 'running_instances', [])) > 0)
 
+        is_dark_theme = get_effective_is_dark()
+
         # Delete All Downloads button
         if has_any_downloads():
             self.delete_all_btn = QPushButton("Delete All Downloads")
-            self.delete_all_btn.setStyleSheet("color: red; font-weight: bold;")
+            self.delete_all_btn.setStyleSheet(f"color: {'#ff6b6b' if is_dark_theme else 'red'}; font-weight: bold;")
             self.delete_all_btn.clicked.connect(self.on_delete_all_clicked)
             if any_game_running:
                 self.delete_all_btn.setEnabled(False)
@@ -937,7 +1171,7 @@ class VersionOptionsDialog(QDialog):
         # Delete Source Folder button
         if has_any_source():
             self.delete_src_btn = QPushButton("Delete Source Folder")
-            self.delete_src_btn.setStyleSheet("color: #cc4400; font-weight: bold;")
+            self.delete_src_btn.setStyleSheet(f"color: {'#ff944d' if is_dark_theme else '#cc4400'}; font-weight: bold;")
             self.delete_src_btn.clicked.connect(self.on_delete_source_clicked)
             if any_game_running:
                 self.delete_src_btn.setEnabled(False)
@@ -1185,9 +1419,8 @@ class ChangeSkinDialog(QDialog):
             
         # Background: 3D preview overlaying the whole window
         self.web_view = QWebEngineView(self)
-        self.web_view.setPage(CustomWebPage(self.web_view))
         self.web_view.setGeometry(0, 0, 350, 520)
-        self.web_view.page().setBackgroundColor(Qt.GlobalColor.transparent)
+        _configure_skin_webview(self.web_view)
         
         # Right side: Options container overlay
         self.options_container = QWidget(self)
@@ -1388,6 +1621,11 @@ class ChangeSkinDialog(QDialog):
             self.toggle_spinning(self.spin_cb.isChecked())
         else:
             from utils import get_active_profile_id
+            bg_hex = get_theme_window_bg_hex()
+            try:
+                self.web_view.page().setBackgroundColor(QColor(bg_hex))
+            except Exception:
+                pass
             base_url = QUrl.fromLocalFile(str(Path(f".cache/{get_active_profile_id()}/skin_viewer.html").absolute()))
             query = QUrlQuery()
             if s_path: query.addQueryItem("skin", s_path)
@@ -1395,6 +1633,7 @@ class ChangeSkinDialog(QDialog):
             query.addQueryItem("model", model)
             query.addQueryItem("back", back_eq)
             query.addQueryItem("offset_x", "150")
+            query.addQueryItem("bg", bg_hex)
             base_url.setQuery(query)
             
             self.web_view.load(base_url)
@@ -1404,8 +1643,28 @@ class ChangeSkinDialog(QDialog):
             
     def _on_preview_loaded(self, ok):
         if ok:
+            try:
+                self.web_view.page().runJavaScript("window.__syncViewerSize && window.__syncViewerSize();")
+            except RuntimeError:
+                pass
             self.change_animation()
             self.toggle_spinning(self.spin_cb.isChecked())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if getattr(self, "web_view", None) and self.web_view.page():
+            QTimer.singleShot(40, lambda: self.web_view.page().runJavaScript("window.__syncViewerSize && window.__syncViewerSize();") if getattr(self, "web_view", None) and self.web_view.page() else None)
+
+    def done(self, result):
+        if getattr(self, "web_view", None):
+            try:
+                page = self.web_view.page()
+                self.web_view.setPage(None)
+                if page:
+                    page.deleteLater()
+            except Exception:
+                pass
+        super().done(result)
         
     def save_clicked(self):
         access_token = self.auth_data.get('mc_access_token')
@@ -1861,70 +2120,81 @@ class LocatorBarWidget(QWidget):
                     arrow_draw_y = y_offset + 6 * bg_scale
                     painter.drawPixmap(arrow_draw_x, arrow_draw_y, self.arrow_down_pixmap, src_rect.x(), src_rect.y(), src_rect.width(), src_rect.height())
 
-class PlayerDataOptionsDialog(QDialog):
+class PersonalisationDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Player Data Options")
-        self.setFixedSize(300, 250)
-        self.setStyleSheet(parent.styleSheet() if parent else "")
+        self.setWindowTitle("Personalisation")
+        self.setMinimumSize(340, 290)
         layout = QVBoxLayout(self)
-        
+        layout.setSpacing(10)
+
         self.config = load_launcher_config()
-        self.options = self.config.get("player_data_options", {
-            "show_3d_skin": True,
-            "show_change_skin_btn": True,
-            "show_java_profile": True,
-            "show_xbox_profile": True,
-            "show_locator_bar": True
-        })
-        
+        self.options = load_personalisation_options(self.config)
+
+        theme_row = QHBoxLayout()
+        theme_label = QLabel("Theme:")
+        theme_label.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("Auto (Follow System)", "system")
+        self.theme_combo.addItem("Light Mode", "light")
+        self.theme_combo.addItem("Dark Mode", "dark")
+        current_theme = self.options.get("theme", "system")
+        t_idx = self.theme_combo.findData(current_theme)
+        if t_idx >= 0:
+            self.theme_combo.setCurrentIndex(t_idx)
+        theme_row.addWidget(theme_label)
+        theme_row.addWidget(self.theme_combo, stretch=1)
+        layout.addLayout(theme_row)
+
         self.checkboxes = {}
-        
+
         options_map = [
             ("show_3d_skin", "Show 3D Skin Render"),
             ("show_change_skin_btn", "Show Change Skin/Cape Button"),
             ("show_java_profile", "Show Java Profile Info"),
             ("show_xbox_profile", "Show Xbox Profile Info"),
-            ("show_locator_bar", "Show Locator Bar")
+            ("show_locator_bar", "Show Locator Bar"),
         ]
-        
+
         for key, label in options_map:
             cb = QCheckBox(label)
-            cb.setChecked(self.options.get(key, True))
+            cb.setChecked(bool(self.options.get(key, True)))
             layout.addWidget(cb)
             self.checkboxes[key] = cb
-            
+
+        layout.addStretch(1)
+
         btn_layout = QHBoxLayout()
         save_btn = QPushButton("Save")
+        save_btn.setDefault(True)
         save_btn.clicked.connect(self.save_and_close)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        
+
         btn_layout.addWidget(save_btn)
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
-        
+
     def save_and_close(self):
+        self.options["theme"] = self.theme_combo.currentData() or "system"
         for key, cb in self.checkboxes.items():
             self.options[key] = cb.isChecked()
-            
-        self.config["player_data_options"] = self.options
-        save_launcher_config(self.config)
+
+        save_personalisation_options(self.options, self.config)
         self.accept()
+
+
+PlayerDataOptionsDialog = PersonalisationDialog
+
 
 class ProfileBannerWidget(QWidget):
     def __init__(self, auth_data, parent=None, progress_callback=None):
         super().__init__(parent)
         self.auth_data = auth_data
-        
+
         self.config = load_launcher_config()
-        self.options = self.config.get("player_data_options", {
-            "show_3d_skin": True,
-            "show_change_skin_btn": True,
-            "show_java_profile": True,
-            "show_xbox_profile": True,
-            "show_locator_bar": True
-        })
+        self.options = load_personalisation_options(self.config)
+        self.gs_label = None
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 5)
@@ -1934,6 +2204,7 @@ class ProfileBannerWidget(QWidget):
 
         # 1. Fetch textures and generate HTML
         textures = fetch_player_textures(get_active_profile_id(), auth_data.get('mc_uuid'), auth_data.get('xbox_gamerpic_url'), progress_callback)
+        self._textures = textures
 
         # 2. Left: 3D Skin Renderer and Change Skin button
         self.left_widget = QWidget()
@@ -1942,29 +2213,16 @@ class ProfileBannerWidget(QWidget):
         left_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
 
         self.web_view = QWebEngineView()
-        
-        # Use CustomWebPage to silence warnings
-        try:
-            self.custom_page = CustomWebPage(self.web_view.page().profile(), self.web_view)
-            self.web_view.setPage(self.custom_page)
-        except Exception:
-            pass
-            
         self.web_view.setFixedSize(200, 180)
-        self.web_view.page().setBackgroundColor(Qt.GlobalColor.transparent)
+        self.custom_page, _ = _configure_skin_webview(self.web_view)
+
         self.html_url = textures.get('html_url')
+        self._skin_loaded = False
+        self._skin_retry_done = False
         if self.html_url:
-            if self.options.get("show_3d_skin", True):
-                from PyQt6.QtCore import QUrlQuery
-                base_url = QUrl.fromLocalFile(self.html_url)
-                query = QUrlQuery()
-                if textures.get('skin'):
-                    query.addQueryItem("skin", textures.get('skin'))
-                if textures.get('cape'):
-                    query.addQueryItem("cape", textures.get('cape'))
-                base_url.setQuery(query)
-                self.web_view.load(base_url)
             self.web_view.loadFinished.connect(self._on_load_finished)
+            if self.options.get("show_3d_skin", True):
+                self._load_skin_viewer()
         self.web_view.setVisible(self.options.get("show_3d_skin", True))
         left_layout.addWidget(self.web_view)
 
@@ -1978,15 +2236,15 @@ class ProfileBannerWidget(QWidget):
 
         top_layout.addWidget(self.left_widget)
 
-        # 3. Center: Minecraft Username & Options
+        # 3. Center: Minecraft Username & Personalisation
         self.center_widget = QWidget()
         center_layout = QVBoxLayout(self.center_widget)
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
 
-        self.options_btn = QPushButton("Player Data Options")
-        self.options_btn.setFixedSize(130, 24)
-        self.options_btn.clicked.connect(self.open_player_data_options)
+        self.options_btn = QPushButton("Personalisation")
+        self.options_btn.setFixedSize(135, 26)
+        self.options_btn.clicked.connect(self.open_personalisation)
         
         btn_layout = QHBoxLayout()
         btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2077,10 +2335,9 @@ class ProfileBannerWidget(QWidget):
                 gs_logo.setPixmap(gs_logo_pix)
                 gs_row.addWidget(gs_logo)
             
-            gs_label = QLabel(gamerscore_val)
-            gs_label.setFont(QFont("Segoe UI", 10))
-            gs_label.setStyleSheet("color: #666666;")
-            gs_row.addWidget(gs_label)
+            self.gs_label = QLabel(gamerscore_val)
+            self.gs_label.setFont(QFont("Segoe UI", 10))
+            gs_row.addWidget(self.gs_label)
             xbox_info_layout.addLayout(gs_row)
             
         presence = auth_data.get('xbox_presence_state', 'Offline')
@@ -2130,6 +2387,65 @@ class ProfileBannerWidget(QWidget):
         )
         self.locator_bar.setVisible(self.options.get("show_locator_bar", True))
         main_layout.addWidget(self.locator_bar)
+        self.apply_theme(get_effective_is_dark())
+
+    def _load_skin_viewer(self):
+        if not self.html_url or not getattr(self, "web_view", None):
+            return
+        from PyQt6.QtCore import QUrlQuery
+        bg_hex = get_theme_window_bg_hex()
+        try:
+            self.web_view.page().setBackgroundColor(QColor(bg_hex))
+        except Exception:
+            pass
+        base_url = QUrl.fromLocalFile(self.html_url)
+        query = QUrlQuery()
+        textures = getattr(self, "_textures", {}) or {}
+        if textures.get("skin"):
+            query.addQueryItem("skin", textures["skin"])
+        if textures.get("cape"):
+            query.addQueryItem("cape", textures["cape"])
+        query.addQueryItem("bg", bg_hex)
+        base_url.setQuery(query)
+        self._skin_loaded = True
+        self.web_view.load(base_url)
+
+    def apply_theme(self, is_dark: bool):
+        secondary = "#b0b0b0" if is_dark else "#666666"
+        presence_color = "#c0c0c0" if is_dark else "#555555"
+        if getattr(self, "waypoint_status_label", None):
+            self.waypoint_status_label.setStyleSheet(f"color: {secondary};")
+        if getattr(self, "gs_label", None):
+            self.gs_label.setStyleSheet(f"color: {secondary};")
+        if getattr(self, "status_label_text", None):
+            self.status_label_text.setStyleSheet(f"color: {presence_color};")
+
+        bg_hex = get_theme_window_bg_hex(is_dark)
+        if getattr(self, "web_view", None) and self.web_view.page():
+            try:
+                self.web_view.page().setBackgroundColor(QColor(bg_hex))
+            except Exception:
+                pass
+            if getattr(self, "_skin_loaded", False):
+                try:
+                    self.web_view.page().runJavaScript(
+                        f"window.setViewerBackground && window.setViewerBackground('{bg_hex}');"
+                        "window.__syncViewerSize && window.__syncViewerSize();"
+                    )
+                except RuntimeError:
+                    pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if getattr(self, "web_view", None) and self.web_view.isVisible() and self.web_view.page():
+            QTimer.singleShot(
+                60,
+                lambda: (
+                    self.web_view.page().runJavaScript("window.__syncViewerSize && window.__syncViewerSize();")
+                    if getattr(self, "web_view", None) and self.web_view.page()
+                    else None
+                ),
+            )
 
     def minimumSizeHint(self):
         return self.sizeHint()
@@ -2165,19 +2481,37 @@ class ProfileBannerWidget(QWidget):
             w = max(w, 200 + text_w + 40 + 180)
         return QtCore.QSize(w, total_h)
 
-
-    def open_player_data_options(self):
-        dialog = PlayerDataOptionsDialog(self)
+    def open_personalisation(self):
+        dialog = PersonalisationDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.config = load_launcher_config()
-            self.options = self.config.get("player_data_options", {})
+            self.options = load_personalisation_options(self.config)
+            win = self.window()
+            if hasattr(win, "apply_theme"):
+                win.apply_theme()
+            else:
+                self.apply_theme(get_effective_is_dark())
             self.update_visibility()
-            
+
+    def open_player_data_options(self):
+        self.open_personalisation()
+
     def update_visibility(self):
         show_skin = self.options.get("show_3d_skin", True)
+        if show_skin and not getattr(self, "_skin_loaded", False):
+            self._load_skin_viewer()
         if self.web_view.isVisible() != show_skin:
             self.web_view.setVisible(show_skin)
-            
+        if show_skin and self.web_view.page():
+            QTimer.singleShot(
+                50,
+                lambda: (
+                    self.web_view.page().runJavaScript("window.__syncViewerSize && window.__syncViewerSize();")
+                    if getattr(self, "web_view", None) and self.web_view.page()
+                    else None
+                ),
+            )
+
         if hasattr(self, 'skin_spacer'):
             from PyQt6.QtWidgets import QSizePolicy
             self.skin_spacer.changeSize(1, -30 if show_skin else 0, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
@@ -2189,7 +2523,7 @@ class ProfileBannerWidget(QWidget):
         self.locator_bar.setVisible(self.options.get("show_locator_bar", True))
         if hasattr(self, 'waypoint_status_label') and self.waypoint_status_label:
             self.waypoint_status_label.setVisible(self.options.get("show_locator_bar", True))
-        
+
         window = self.window()
         if hasattr(window, 'update_window_size'):
             window.update_window_size()
@@ -2201,19 +2535,28 @@ class ProfileBannerWidget(QWidget):
                 self.web_view.setPage(None)
                 if page:
                     page.deleteLater()
-            except:
+            except Exception:
                 pass
 
     def _on_load_finished(self, ok):
-        if ok:
+        bg_hex = get_theme_window_bg_hex()
+        if not ok:
+            if not getattr(self, "_skin_retry_done", False) and self.options.get("show_3d_skin", True):
+                self._skin_retry_done = True
+                QTimer.singleShot(250, self._load_skin_viewer)
+            return
+
+        if getattr(self, "web_view", None) and self.web_view.page():
             config = load_launcher_config()
             anim = config.get("main_animation", "idle")
             spin = config.get("main_spin", True)
-            
+
             js = get_animation_js(anim)
             spin_val = 'true' if spin else 'false'
-            spin_js = f"""
+            sync_js = f"""
             (function() {{
+                if (window.setViewerBackground) window.setViewerBackground('{bg_hex}');
+                if (window.__syncViewerSize) window.__syncViewerSize();
                 function applySpin() {{
                     if (window.skinViewer && window.skinViewer.playerObject) {{
                         window.skinViewer.autoRotate = {spin_val};
@@ -2224,9 +2567,9 @@ class ProfileBannerWidget(QWidget):
                 applySpin();
             }})();
             """
-            
-            self.web_view.page().runJavaScript(js)
-            self.web_view.page().runJavaScript(spin_js)
+            self.web_view.page().runJavaScript(sync_js)
+            if js:
+                self.web_view.page().runJavaScript(js)
 
     def open_change_skin_dialog(self):
         dialog = ChangeSkinDialog(self)
@@ -2319,8 +2662,9 @@ class AccountSwitchDialog(QDialog):
         label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         layout.addWidget(label)
         
+        border_col = "#3c3c3c" if get_effective_is_dark() else "#ccc"
         self.list_widget = QListWidget()
-        self.list_widget.setStyleSheet("QListWidget::item { padding: 10px; border-bottom: 1px solid #ccc; } QListWidget::item:selected { background-color: #0078D7; color: white; }")
+        self.list_widget.setStyleSheet(f"QListWidget::item {{ padding: 10px; border-bottom: 1px solid {border_col}; }} QListWidget::item:selected {{ background-color: #0078D7; color: white; }}")
         self.list_widget.setIconSize(QtCore.QSize(40, 40))
         layout.addWidget(self.list_widget)
         
@@ -2438,9 +2782,10 @@ class WindowsLinkedAccountsDialog(QDialog):
         header_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         layout.addWidget(header_lbl)
 
+        border_col = "#3c3c3c" if get_effective_is_dark() else "#ccc"
         self.list_widget = QListWidget()
         self.list_widget.setStyleSheet(
-            "QListWidget::item { padding: 10px; border-bottom: 1px solid #ccc; } "
+            f"QListWidget::item {{ padding: 10px; border-bottom: 1px solid {border_col}; }} "
             "QListWidget::item:selected { background-color: #0078D7; color: white; }"
         )
         self.list_widget.setIconSize(QtCore.QSize(32, 32))
@@ -3176,6 +3521,23 @@ class LauncherGUI(QMainWindow):
         except Exception as e:
             print(f"[Warning] Update checker unavailable: {e}")
 
+        self.apply_theme()
+
+    def apply_theme(self):
+        is_dark = apply_launcher_theme()
+        if getattr(self, "warning_label", None):
+            warn_col = "#ffb347" if is_dark else "#cc8800"
+            self.warning_label.setStyleSheet(f"color: {warn_col}; font-style: italic;")
+        if getattr(self, "stop_button", None):
+            stop_col = "#ff6b6b" if is_dark else "#cc0000"
+            self.stop_button.setStyleSheet(f"color: {stop_col}; font-weight: bold;")
+        if getattr(self, "banner_widget", None) and hasattr(self.banner_widget, "apply_theme"):
+            self.banner_widget.apply_theme(is_dark)
+        if getattr(self, "update_controller", None) and hasattr(self.update_controller, "apply_theme"):
+            self.update_controller.apply_theme(is_dark)
+        if getattr(self, "running_instances", None) and hasattr(self, "update_instances_ui"):
+            self.update_instances_ui()
+
     def open_create_shortcut_dialog(self):
         dlg = CreateShortcutDialog(self)
         dlg.exec()
@@ -3441,7 +3803,8 @@ class LauncherGUI(QMainWindow):
                 row_layout.addWidget(logs_btn)
 
                 stop_btn = QPushButton("Stop Game")
-                stop_btn.setStyleSheet("color: #cc0000; font-weight: bold;")
+                stop_col = "#ff6b6b" if get_effective_is_dark() else "#cc0000"
+                stop_btn.setStyleSheet(f"color: {stop_col}; font-weight: bold;")
                 stop_btn.setFixedWidth(100)
                 stop_btn.clicked.connect(lambda checked=False, target_inst=inst: self.stop_instance(target_inst))
                 row_layout.addWidget(stop_btn)
@@ -4953,6 +5316,14 @@ class LauncherGUI(QMainWindow):
         self.browser_helper_label.setWordWrap(True)
         self.browser_helper_label.setStyleSheet("color: #d4d4d4; font-size: 12px;")
         helper_layout.addWidget(self.browser_helper_label, stretch=1)
+        self.browser_use_pwd_btn = QPushButton("Use Password")
+        self.browser_use_pwd_btn.setVisible(False)
+        self.browser_use_pwd_btn.setStyleSheet(
+            "background-color: #4a4a4d; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 5px 12px; font-size: 12px;"
+        )
+        self.browser_use_pwd_btn.clicked.connect(self._abort_webauthn_for_password)
+        helper_layout.addWidget(self.browser_use_pwd_btn)
         open_ext_btn = QPushButton("Open in Default Browser")
         open_ext_btn.setStyleSheet(
             "background-color: #0078D7; color: white; font-weight: bold; "
@@ -5009,66 +5380,9 @@ class LauncherGUI(QMainWindow):
             self.web_profile = self._profile_cache[active_id]
         
         from PyQt6.QtWebEngineCore import QWebEngineScript
+        from ms_accounts import build_webauthn_js_hook
         script = QWebEngineScript()
-        script.setSourceCode("""
-        (function() {
-            if (window.__agy_webauthn_hooked) return;
-            window.__agy_webauthn_hooked = true;
-
-            const rawLog = (window.console && window.console.log) ? window.console.log.bind(window.console) : function() {};
-            const rawWarn = (window.console && window.console.warn) ? window.console.warn.bind(window.console) : rawLog;
-            function notify(tag) {
-                try { rawLog(tag); } catch (e) {}
-                try { rawWarn(tag); } catch (e) {}
-            }
-
-            function wrapWebAuthn(origFn) {
-                if (!origFn || origFn.__agy_wrapped) return origFn;
-                const wrapped = function(options) {
-                    const isConditional = Boolean(options && options.mediation === "conditional");
-                    if (!isConditional) {
-                        notify("AGY_WEBAUTHN_START");
-                    }
-                    try {
-                        const resPromise = origFn.apply(this, arguments);
-                        if (resPromise && typeof resPromise.then === "function") {
-                            return resPromise.then(function(res) {
-                                if (!isConditional) notify("AGY_WEBAUTHN_SUCCESS");
-                                return res;
-                            }).catch(function(err) {
-                                if (!isConditional) notify("AGY_WEBAUTHN_CANCEL");
-                                throw err;
-                            });
-                        }
-                        if (!isConditional) notify("AGY_WEBAUTHN_CANCEL");
-                        return resPromise;
-                    } catch (err) {
-                        if (!isConditional) notify("AGY_WEBAUTHN_CANCEL");
-                        throw err;
-                    }
-                };
-                wrapped.__agy_wrapped = true;
-                return wrapped;
-            }
-
-            if (typeof CredentialsContainer !== "undefined" && CredentialsContainer.prototype) {
-                if (CredentialsContainer.prototype.get) {
-                    CredentialsContainer.prototype.get = wrapWebAuthn(CredentialsContainer.prototype.get);
-                }
-                if (CredentialsContainer.prototype.create) {
-                    CredentialsContainer.prototype.create = wrapWebAuthn(CredentialsContainer.prototype.create);
-                }
-            }
-            if (navigator.credentials) {
-                if (navigator.credentials.get) {
-                    navigator.credentials.get = wrapWebAuthn(navigator.credentials.get);
-                }
-                if (navigator.credentials.create) {
-                    navigator.credentials.create = wrapWebAuthn(navigator.credentials.create);
-                }
-            }
-        })();
-        """)
+        script.setSourceCode(build_webauthn_js_hook(auto_fallback_ms=3500 if os.name != "nt" else 0))
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
         script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
         script.setRunsOnSubFrames(True)
@@ -5098,26 +5412,35 @@ class LauncherGUI(QMainWindow):
                     QApplication.processEvents()
                     return
                 if message == "AGY_WEBAUTHN_START":
+                    btn = getattr(self.parent_gui, "browser_use_pwd_btn", None)
+                    if btn:
+                        btn.setVisible(True)
                     if os.name == "nt":
                         self.parent_gui._set_webauthn_loading(js_active=True)
                     else:
                         self.parent_gui._set_browser_helper_notice(
-                            "Passkey / security key check active. If no prompt opens, choose 'Other ways to sign in' below or click 'Open in Default Browser'.",
+                            "Passkey / security key check active. If no prompt opens, click 'Use Password' above or 'Open in Default Browser'.",
                             warning=False,
                         )
                     return
                 if message == "AGY_WEBAUTHN_SUCCESS":
+                    btn = getattr(self.parent_gui, "browser_use_pwd_btn", None)
+                    if btn:
+                        btn.setVisible(False)
                     if os.name == "nt":
                         self.parent_gui._webauthn_completed = True
                         self.parent_gui._set_webauthn_loading(js_active=True)
                         QTimer.singleShot(6000, self.parent_gui._clear_stuck_webauthn_loading)
                     return
-                if message in ("AGY_WEBAUTHN_END", "AGY_WEBAUTHN_CANCEL"):
+                if message in ("AGY_WEBAUTHN_AUTO_FALLBACK", "AGY_WEBAUTHN_END", "AGY_WEBAUTHN_CANCEL"):
+                    btn = getattr(self.parent_gui, "browser_use_pwd_btn", None)
+                    if btn:
+                        btn.setVisible(False)
                     self.parent_gui._webauthn_completed = False
                     self.parent_gui._set_webauthn_loading(js_active=False)
                     if os.name != "nt":
                         self.parent_gui._set_browser_helper_notice(
-                            "Passkey couldn't complete in the embedded window. Click 'Other ways to sign in' below, or click 'Open in Default Browser'.",
+                            "Passkey couldn't open in the embedded window. Choose 'Other ways to sign in' / Password below, or click 'Open in Default Browser'.",
                             warning=True,
                         )
                     return
@@ -5161,6 +5484,23 @@ class LauncherGUI(QMainWindow):
         self.loading_widget.raise_()
         QTimer.singleShot(8000, self._clear_stuck_initial_loading)
         self.browser_window.show()
+
+    def _abort_webauthn_for_password(self):
+        btn = getattr(self, "browser_use_pwd_btn", None)
+        if btn:
+            try:
+                btn.setVisible(False)
+            except RuntimeError:
+                pass
+        page = getattr(self, "web_page", None)
+        if page:
+            try:
+                page.runJavaScript(
+                    "window.__agy_webauthn_ux_active = false;"
+                    "window.__agy_abort_webauthn && window.__agy_abort_webauthn('Switched to password sign-in.');"
+                )
+            except RuntimeError:
+                pass
 
     def _set_browser_helper_notice(self, text: str, warning: bool = False):
         lbl = getattr(self, "browser_helper_label", None)
@@ -5471,10 +5811,7 @@ if __name__ == '__main__':
 
     os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
     app = QApplication(sys.argv)
-    
-    # Force the use of the native Windows UX theme engine (comctl32.dll) on Windows
-    if sys.platform == "win32":
-        app.setStyle("windowsvista")
+    apply_launcher_theme()
     try:
         app.setWindowIcon(get_pymclauncher_icon())
     except Exception:
