@@ -993,6 +993,7 @@ class PurePythonAuthFlow:
         wam_id: str = None,
         hwnd: int = 0,
         ipc_popup: bool = False,
+        silent_only: bool = False,
     ):
         self.profile = profile
         self.cache_dir = cache_dir
@@ -1002,6 +1003,7 @@ class PurePythonAuthFlow:
         self.wam_id = wam_id
         self.hwnd = hwnd
         self.ipc_popup = ipc_popup
+        self.silent_only = bool(silent_only)
 
         self.signer = PurePythonXboxSigner()
         self.session = requests.Session()
@@ -1011,6 +1013,7 @@ class PurePythonAuthFlow:
         self.mca_cache = JsonCacheStore(cache_dir / "mca-tokens.json")
 
         self._last_msa_was_interactive = False
+        self._cached_wam_access_token = None
         self.obtained_wam_account_id = None
         self.obtained_msa_email = self.login_hint
 
@@ -1219,8 +1222,11 @@ class PurePythonAuthFlow:
 
         raise RuntimeError("Authentication timed out waiting for user login.")
 
-    def _msal_broker_token(self) -> str:
+    def _msal_broker_token(self, force_refresh: bool = False) -> str:
         """Sign in via Windows WebAccountManager broker popup using MSAL."""
+        if self._cached_wam_access_token and not force_refresh:
+            return self._cached_wam_access_token
+
         import msal
         import ctypes
 
@@ -1247,15 +1253,24 @@ class PurePythonAuthFlow:
             token_cache=token_cache,
         )
         scopes = ["XboxLive.signin"]
-        hint = (self.login_hint or "").strip().lower()
+        saved_tok = self.live_cache.get_cached().get("token")
+        if not isinstance(saved_tok, dict):
+            saved_tok = {}
+
+        hint = (self.login_hint or self.obtained_msa_email or "").strip().lower()
+        target_wam_id = self.wam_id or self.obtained_wam_account_id
+        if self.silent_only:
+            hint = hint or str(saved_tok.get("msa_email") or "").strip().lower()
+            target_wam_id = target_wam_id or saved_tok.get("wam_account_id")
+
         res = None
-        if hint or self.wam_id:
+        if hint or target_wam_id:
             try:
                 for acct in app.get_accounts():
                     acct_user = str(acct.get("username", "")).lower()
                     acct_id = str(acct.get("home_account_id", "") or "")
-                    if (hint and acct_user == hint) or (self.wam_id and acct_id == str(self.wam_id)):
-                        res = app.acquire_token_silent(scopes, account=acct)
+                    if (hint and acct_user == hint) or (target_wam_id and acct_id == str(target_wam_id)):
+                        res = app.acquire_token_silent(scopes, account=acct, force_refresh=force_refresh)
                         if res and "access_token" in res:
                             break
                         res = None
@@ -1263,6 +1278,8 @@ class PurePythonAuthFlow:
                 res = None
 
         if not res:
+            if self.silent_only:
+                raise RuntimeError("Silent Windows token refresh failed (interactive popup suppressed).")
             hwnd = self.hwnd or 0
             if not hwnd:
                 try:
@@ -1273,8 +1290,8 @@ class PurePythonAuthFlow:
             res = app.acquire_token_interactive(
                 scopes,
                 parent_window_handle=hwnd or app.CONSOLE_WINDOW_HANDLE,
-                login_hint=self.login_hint or None,
-                prompt=None if self.login_hint else "select_account",
+                login_hint=(self.login_hint or self.obtained_msa_email) or None,
+                prompt=None if (self.login_hint or self.obtained_msa_email) else "select_account",
             )
 
         _persist()
@@ -1283,7 +1300,7 @@ class PurePythonAuthFlow:
                 f"Windows sign-in failed: {(res or {}).get('error_description') or (res or {}).get('error') or 'cancelled'}"
             )
         claims = res.get("id_token_claims") or {}
-        email = claims.get("preferred_username") or claims.get("email") or self.login_hint
+        email = claims.get("preferred_username") or claims.get("email") or self.login_hint or self.obtained_msa_email
         if email:
             self.obtained_msa_email = email
         acct_info = res.get("account") if isinstance(res.get("account"), dict) else {}
@@ -1303,12 +1320,13 @@ class PurePythonAuthFlow:
             })
         except Exception:
             pass
+        self._cached_wam_access_token = res["access_token"]
         return res["access_token"]
 
     def get_msa_token(self, force_refresh: bool = False) -> str:
         self._last_msa_was_interactive = False
         if self.auth_method == "wam" and sys.platform == "win32":
-            return self._msal_broker_token()
+            return self._msal_broker_token(force_refresh=force_refresh)
 
         cached = self._get_live_cached_tokens()
         if cached:
@@ -1319,6 +1337,9 @@ class PurePythonAuthFlow:
                     return self._refresh_live_token(cached["refresh_token"], cached.get("client_id"))
                 except Exception:
                     pass
+
+        if self.silent_only:
+            raise RuntimeError("Silent token refresh failed (interactive sign-in suppressed).")
 
         self._last_msa_was_interactive = True
         if self.auth_method == "popup":
@@ -1475,7 +1496,7 @@ class PurePythonAuthFlow:
 
         # Fast path for MSAL tokens (Windows broker only on Windows)
         if self.auth_method == "wam" and sys.platform == "win32":
-            msal_tok = self._msal_broker_token()
+            msal_tok = self._msal_broker_token(force_refresh=(force_refresh and not self._last_msa_was_interactive))
             ut = self._get_xbl_user_token("d=" + msal_tok)
             return self._get_xsts_token(ut, None, None, relying_party)
 
@@ -1617,6 +1638,7 @@ def main():
 
     parser.add_argument("--wam-id", default=None, help="Optional Windows WebAccount ID.")
     parser.add_argument("--hwnd", type=int, default=0, help="Optional parent window handle.")
+    parser.add_argument("--silent", "--non-interactive", dest="silent_only", action="store_true", help="Refresh using cached tokens only without showing any login UI.")
     parser.add_argument("--list-accounts", action="store_true", help="List all Microsoft accounts linked to Windows and exit.")
     args = parser.parse_args()
 
@@ -1755,6 +1777,7 @@ def main():
             wam_id=args.wam_id,
             hwnd=args.hwnd,
             ipc_popup=args.ipc_popup,
+            silent_only=args.silent_only,
         )
         mc_token, mc_profile = authflow.get_minecraft_java_token()
 

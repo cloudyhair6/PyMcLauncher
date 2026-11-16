@@ -2762,7 +2762,7 @@ class WindowsLinkedAccountsDialog(QDialog):
     with Windows and asks whether the user wants to log in with one of them or proceed
     to the other login method.
     """
-    def __init__(self, linked_accounts: List[Dict], parent=None):
+    def __init__(self, linked_accounts: List[Dict], parent=None, header_text: Optional[str] = None):
         super().__init__(parent)
         self.setWindowTitle("Microsoft Accounts Linked with Windows")
         self.setFixedSize(440, 360)
@@ -2775,8 +2775,10 @@ class WindowsLinkedAccountsDialog(QDialog):
         layout.setSpacing(10)
 
         header_lbl = QLabel(
-            "The following Microsoft account(s) are currently linked with Windows.\n"
-            "Would you like to log in with one of these accounts?"
+            header_text or (
+                "The following Microsoft account(s) are currently linked with Windows.\n"
+                "Would you like to log in with one of these accounts?"
+            )
         )
         header_lbl.setWordWrap(True)
         header_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
@@ -3503,11 +3505,11 @@ class LauncherGUI(QMainWindow):
         if self._startup_args:
             self.apply_startup_args(self._startup_args)
 
-        # Start a silent background refresh to update skin/presence
+        # Start a silent background refresh to update skin/presence (never show interactive login popups on startup)
         if is_logged_in and not is_expired:
             self.refresh_process = QProcess()
             self.refresh_process.setProgram(get_python_cli_executable())
-            self.refresh_process.setArguments([get_script_path("ms_accounts.py"), "--json", "--profile", get_active_profile_id()])
+            self.refresh_process.setArguments([get_script_path("ms_accounts.py"), "--json", "--silent", "--profile", get_active_profile_id()])
             self.refresh_process.readyReadStandardOutput.connect(self.handle_refresh_stdout)
             self.refresh_process.start()
 
@@ -3655,6 +3657,12 @@ class LauncherGUI(QMainWindow):
             self._pipeline_worker.cancel()
             self._pipeline_worker.wait(1000)
         self._cleanup_browser()
+        bw = getattr(self, 'banner_widget', None)
+        if bw and hasattr(bw, 'cleanup'):
+            try:
+                bw.cleanup()
+            except Exception:
+                pass
         self._kill_qprocess_tree(getattr(self, 'process', None))
         for inst in list(getattr(self, 'running_instances', [])):
             if inst.get('window_timer'):
@@ -4022,11 +4030,9 @@ class LauncherGUI(QMainWindow):
                 self._force_new_login = True
                 self.do_login()
 
-    def _prompt_windows_linked_accounts(self) -> tuple:
+    def _prompt_windows_linked_accounts(self, header_text: Optional[str] = None) -> tuple:
         """
-        Check for Microsoft accounts currently linked with Windows and ask the user
-        if they want to log in with one of those accounts before proceeding to the
-        other login method.
+        Show Microsoft accounts linked with Windows when WAM did not complete sign-in.
         Returns (should_proceed: bool, selected_account: Optional[dict]).
         """
         try:
@@ -4038,7 +4044,7 @@ class LauncherGUI(QMainWindow):
         if not linked_accounts:
             return True, None
 
-        dialog = WindowsLinkedAccountsDialog(linked_accounts, parent=self)
+        dialog = WindowsLinkedAccountsDialog(linked_accounts, parent=self, header_text=header_text)
         result = dialog.exec()
         if result != QDialog.DialogCode.Accepted:
             self.log("[System] Login cancelled by user.")
@@ -4052,62 +4058,83 @@ class LauncherGUI(QMainWindow):
         self.log(f"[System] Selected Windows-linked Microsoft account: {selected.get('email')}")
         return True, selected
 
-    def do_login(self):
-        self.clear_progress_error()
-        self.task_progress_bar.setVisible(False)
-        self.step_progress_bar.setVisible(True)
-        self.step_progress_bar.setRange(0, 100)
-        self.step_progress_bar.setValue(5)
-        self.step_progress_bar.setFormat("Checking accounts... (%p%)")
-        self.status_label.setText("Checking accounts...")
-        QApplication.processEvents()
+    def _revert_cancelled_auth_profile(self):
+        if getattr(self, "previous_active_profile", None):
+            accounts = load_accounts()
+            accounts["active_profile"] = self.previous_active_profile
+            save_accounts(accounts)
 
-        proceed, selected_win_acc = self._prompt_windows_linked_accounts()
-        if not proceed:
-            self._force_new_login = False
-            self.step_progress_bar.setVisible(False)
-            self.update_profile_banner()
-            self.update_ui_state()
-            return
+            cancelled_prof = getattr(self, "_auth_cancelled_profile", None)
+            if cancelled_prof and cancelled_prof != self.previous_active_profile:
+                import shutil
+                path = f".cache/{cancelled_prof}"
+                if os.path.exists(path):
+                    shutil.rmtree(path, ignore_errors=True)
 
+            self.previous_active_profile = None
+            self._auth_cancelled_profile = None
+
+    def _begin_auth_flow(
+        self,
+        from_launch: bool = False,
+        selected_win_acc: Optional[dict] = None,
+        force_popup: bool = False,
+        preserve_force_new: Optional[bool] = None,
+    ):
         self.clear_progress_error()
-        self.log("Starting Microsoft authentication...")
-        self.is_just_logging_in = True
+        if not from_launch:
+            self.log("Starting Microsoft authentication...")
+        self.is_just_logging_in = not from_launch
         self.is_authenticating = True
+        self._auth_from_launch = bool(from_launch)
         self._login_succeeded = False
         self._browser_auth_done = False
         self._pending_login_hint = selected_win_acc.get("email") if isinstance(selected_win_acc, dict) else None
 
-        self.status_label.setText("Authenticating with Microsoft...")
-        self.update_ui_state()
-        
-        self.step_progress_bar.setRange(0, 100)
-        self.step_progress_bar.setValue(20)
-        self.step_progress_bar.setFormat("Authenticating with Microsoft... (%p%)")
-        self.step_progress_bar.setVisible(True)
+        if from_launch:
+            self.set_progress_visible(True)
+            self.status_label.setText("[1/6] Authenticating with Microsoft...")
+            self.step_progress_bar.setRange(0, 100)
+            self.step_progress_bar.setValue(0)
+            self.step_progress_bar.setFormat("Step 1/6 - Authentication")
+            self.task_progress_bar.setRange(0, 0)
+            self.task_progress_bar.setFormat("Current Task: %p%")
+        else:
+            self.task_progress_bar.setVisible(False)
+            self.status_label.setText("Authenticating with Microsoft...")
+            self.step_progress_bar.setRange(0, 100)
+            self.step_progress_bar.setValue(20)
+            self.step_progress_bar.setFormat("Authenticating with Microsoft... (%p%)")
+            self.step_progress_bar.setVisible(True)
+            self.update_ui_state()
 
         current_profile = get_active_profile_id()
-        force = getattr(self, "_force_new_login", False)
+        force_new = getattr(self, "_force_new_login", False) if preserve_force_new is None else bool(preserve_force_new)
+        self._auth_was_force_new = force_new
         cached_pid = selected_win_acc.get("cached_profile_id") if isinstance(selected_win_acc, dict) else None
 
         if cached_pid:
-            # Reuse the existing profile associated with this Windows-linked Microsoft account
             self.previous_active_profile = current_profile
             accounts = load_accounts()
             accounts["active_profile"] = cached_pid
             save_accounts(accounts)
             self._auth_cancelled_profile = cached_pid
-        elif force or self._pending_login_hint:
+        elif force_new or self._pending_login_hint:
             self.previous_active_profile = current_profile
             self._auth_cancelled_profile = get_active_profile_id(True)
         else:
             self.previous_active_profile = None
             self._auth_cancelled_profile = current_profile
 
+        use_wam = sys.platform == "win32" and not force_popup
+        self._wam_fallback_eligible = use_wam
+
         cmd_args = [get_script_path("ms_accounts.py"), "--json", "--profile", self._auth_cancelled_profile]
-        if sys.platform == "win32" and isinstance(selected_win_acc, dict) and self._pending_login_hint:
-            cmd_args.extend(["--wam", "--login-hint", self._pending_login_hint, "--hwnd", str(int(self.winId()))])
-            wam_id = selected_win_acc.get("wam_account_id") or selected_win_acc.get("cid")
+        if use_wam:
+            cmd_args.extend(["--wam", "--hwnd", str(int(self.winId()))])
+            if self._pending_login_hint:
+                cmd_args.extend(["--login-hint", self._pending_login_hint])
+            wam_id = (selected_win_acc.get("wam_account_id") or selected_win_acc.get("cid")) if isinstance(selected_win_acc, dict) else None
             if wam_id:
                 cmd_args.extend(["--wam-id", str(wam_id)])
         else:
@@ -4123,6 +4150,17 @@ class LauncherGUI(QMainWindow):
         self.process.readyReadStandardError.connect(self.handle_stderr)
         self.process.finished.connect(self.auth_finished)
         self.process.start()
+
+    def do_login(self):
+        self.clear_progress_error()
+        self.task_progress_bar.setVisible(False)
+        self.step_progress_bar.setVisible(True)
+        self.step_progress_bar.setRange(0, 100)
+        self.step_progress_bar.setValue(5)
+        self.step_progress_bar.setFormat("Starting sign-in... (%p%)")
+        self.status_label.setText("Starting sign-in...")
+        QApplication.processEvents()
+        self._begin_auth_flow(from_launch=False)
 
     def update_profile_banner(self):
         # Clear existing banner and immediately clear self.banner_widget reference
@@ -4636,56 +4674,8 @@ class LauncherGUI(QMainWindow):
             self.start_download_pipeline()
             return
 
-        # Step 1: Authentication
-        proceed, selected_win_acc = self._prompt_windows_linked_accounts()
-        if not proceed:
-            self._force_new_login = False
-            self.is_pipeline_running = False
-            self.setWindowTitle("PyMcLauncher")
-            self.status_label.setText("Launch cancelled.")
-            self.update_ui_state()
-            return
-
-        self._pending_login_hint = selected_win_acc.get("email") if isinstance(selected_win_acc, dict) else None
-        cached_pid = selected_win_acc.get("cached_profile_id") if isinstance(selected_win_acc, dict) else None
-        if cached_pid:
-            accounts = load_accounts()
-            accounts["active_profile"] = cached_pid
-            save_accounts(accounts)
-            target_profile_id = cached_pid
-        else:
-            target_profile_id = get_active_profile_id(getattr(self, "_force_new_login", False))
-
-        self.is_authenticating = True
-        self.set_progress_visible(True)
-        self.status_label.setText("[1/6] Authenticating with Microsoft...")
-        self.step_progress_bar.setRange(0, 100)
-        self.step_progress_bar.setValue(0)
-        self.step_progress_bar.setFormat("Step 1/6 - Authentication")
-        self.task_progress_bar.setRange(0, 0)
-        self.task_progress_bar.setFormat("Current Task: %p%")
-        
-        self.is_just_logging_in = False
-        self._browser_auth_done = False
-        cmd_args = [get_script_path("ms_accounts.py"), "--json", "--profile", target_profile_id]
-        if sys.platform == "win32" and isinstance(selected_win_acc, dict) and self._pending_login_hint:
-            cmd_args.extend(["--wam", "--login-hint", self._pending_login_hint, "--hwnd", str(int(self.winId()))])
-            wam_id = selected_win_acc.get("wam_account_id") or selected_win_acc.get("cid")
-            if wam_id:
-                cmd_args.extend(["--wam-id", str(wam_id)])
-        else:
-            cmd_args.extend(["--popup", "--ipc-popup"])
-            if self._pending_login_hint:
-                cmd_args.extend(["--login-hint", self._pending_login_hint])
-
-        self.process = QProcess()
-        self.process.setProgram(get_python_cli_executable())
-        self.process.setArguments(cmd_args)
-        self._force_new_login = False
-        self.process.readyReadStandardOutput.connect(self.handle_auth_stdout)
-        self.process.readyReadStandardError.connect(self.handle_stderr)
-        self.process.finished.connect(self.auth_finished)
-        self.process.start()
+        # Step 1: Authentication (tries native Windows sign-in first on Windows, then linked-accounts fallback on close/failure)
+        self._begin_auth_flow(from_launch=True)
 
     def handle_auth_stdout(self):
         data = self.process.readAllStandardOutput().data().decode('utf-8')
@@ -4773,37 +4763,42 @@ class LauncherGUI(QMainWindow):
     def auth_finished(self, exitCode, exitStatus):
         self._cleanup_browser()
 
-        if exitCode != 0 or not self.auth_data:
+        if exitCode != 0 or not getattr(self, "_login_succeeded", False) or not self.auth_data:
+            self._revert_cancelled_auth_profile()
+
+            if getattr(self, "_wam_fallback_eligible", False) and sys.platform == "win32":
+                self._wam_fallback_eligible = False
+                from_launch = getattr(self, "_auth_from_launch", False)
+                preserve_force = getattr(self, "_auth_was_force_new", False)
+                self.log("[System] Windows sign-in did not complete; checking Windows-linked accounts...")
+                self.status_label.setText("Select an account or another sign-in method...")
+                proceed, selected_win_acc = self._prompt_windows_linked_accounts(
+                    header_text=(
+                        "Windows sign-in did not complete or was closed.\n"
+                        "Would you like to log in with one of these Windows-linked accounts?"
+                    )
+                )
+                if proceed:
+                    self._begin_auth_flow(
+                        from_launch=from_launch,
+                        selected_win_acc=selected_win_acc,
+                        force_popup=True,
+                        preserve_force_new=preserve_force,
+                    )
+                    return
+
             self.is_authenticating = False
             self.step_progress_bar.setVisible(False)
             self.step_progress_bar.setRange(0, 100)
             self.is_pipeline_running = False
+            self.setWindowTitle("PyMcLauncher")
             self.log("[Error] Authentication failed or cancelled.")
             self.status_label.setText("Authentication Failed.")
             self.show_progress_error("Authentication", "Login Failed or Cancelled")
-            
-            # Revert profile changes if cancelled
-            if getattr(self, 'previous_active_profile', None):
-                accounts = load_accounts()
-                accounts['active_profile'] = self.previous_active_profile
-                save_accounts(accounts)
-                
-                # Cleanup the cancelled profile folder
-                cancelled_prof = getattr(self, '_auth_cancelled_profile', None)
-                if cancelled_prof and cancelled_prof != self.previous_active_profile:
-                    import shutil, os
-                    path = f".cache/{cancelled_prof}"
-                    if os.path.exists(path):
-                        shutil.rmtree(path, ignore_errors=True)
-                
-                self.previous_active_profile = None
-                self._auth_cancelled_profile = None
 
-            self.auth_data = get_auth_cache() # Reload the reverted profile's auth data
-            self.update_profile_banner() # Show previous account's banner
-            is_logged_in = bool(self.auth_data)
-            self.logout_btn.setVisible(is_logged_in)
-            self.login_btn.setVisible(not is_logged_in)
+            self.auth_data = get_auth_cache()  # Reload reverted profile's auth data
+            self.update_profile_banner()  # Show previous account's banner
+            self._refresh_auth_buttons()
             self.update_running_instances_ui()
             self.update_ui_state()
             return
