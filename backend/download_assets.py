@@ -35,11 +35,11 @@ import requests
 import requests.adapters
 
 ASSET_CDN_URL = "https://resources.download.minecraft.net"
-MAX_WORKERS = (os.cpu_count() or 4) * 4  # Dynamically scale parallel downloads based on CPU cores
+MAX_WORKERS = min(32, max(16, (os.cpu_count() or 4) * 4))  # Dynamically scale parallel downloads based on CPU cores
 
-# Shared session for connection pooling
+# Shared session for connection pooling (sized well above MAX_WORKERS to avoid pool-full warnings)
 session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
+adapter = requests.adapters.HTTPAdapter(pool_connections=max(64, MAX_WORKERS * 2), pool_maxsize=max(64, MAX_WORKERS * 2))
 session.mount('https://', adapter)
 session.mount('http://', adapter)
 
@@ -151,26 +151,29 @@ def download_asset_worker(asset_name, asset_hash, asset_size, assets_dir):
                 continue
             return False, asset_name, asset_size
         
-def update_progress_display(total_assets):
-    """Display current progress with ETA."""
+def update_progress_display(total_assets, verify_only=False):
+    """Display current progress with ETA (0..20% verify, 20..100% download missing)."""
     with progress_lock:
         completed = progress_data['completed']
         completed_size = progress_data['completed_size']
         total_size = progress_data['total_size']
         start_time = progress_data['start_time']
         current_asset = progress_data['current_asset']
-    
+
     elapsed = time.time() - start_time
-    percent = (completed_size / total_size) * 100 if total_size > 0 else 0
-    
-    # Calculate speed based on completed asset size
+    if total_size > 0:
+        ratio = min(1.0, max(0.0, completed_size / total_size))
+    else:
+        ratio = min(1.0, max(0.0, completed / max(total_assets, 1)))
+    percent = ratio * 100.0
+    overall_pct = (ratio * 20.0) if verify_only else (20.0 + ratio * 80.0)
+
     if elapsed > 1:
         speed = completed_size / elapsed
     else:
         speed = 0
-    
-    # Calculate ETA based on remaining assets and average size per asset
-    remaining_assets = total_assets - completed
+
+    remaining_assets = max(0, total_assets - completed)
     if completed > 0 and speed > 0:
         avg_size_per_asset = completed_size / completed
         remaining_size = remaining_assets * avg_size_per_asset
@@ -178,26 +181,19 @@ def update_progress_display(total_assets):
         eta_str = format_time(eta_seconds)
     else:
         eta_str = "calculating..."
-    
-    # Display progress line with fixed width format to prevent wrapping
-    # Format: [completed/total] percent% | Speed: X/s | ETA: X | asset_name (truncated if needed)
+
     speed_str = format_size(speed) + "/s"
-    
-    # Limit asset name to fit in terminal (max 50 chars)
     asset_display = current_asset[:50] if current_asset else "assets"
-    
-    # Create the full status line
     status_line = f"[{completed}/{total_assets}] {percent:.1f}% | Speed: {speed_str:>9s} | ETA: {eta_str:>6s} | {asset_display}"
-    
+
     global json_output
     if globals().get('json_output', False):
         now = time.monotonic()
         last_json_t = globals().get('_last_json_emit_t', 0.0)
         if (now - last_json_t) >= 0.035 or completed >= total_assets or percent >= 100.0:
             globals()['_last_json_emit_t'] = now
-            print(json.dumps({"type": "progress", "progress": percent, "status": status_line}), flush=True)
+            print(json.dumps({"type": "progress", "progress": overall_pct, "status": status_line}), flush=True)
     else:
-        # Write to stdout with carriage return to overwrite the line
         sys.stdout.write(f"\r{status_line:<120}")
         sys.stdout.flush()
 
@@ -301,67 +297,80 @@ def download_assets(version_id, json_mode=None, is_dev_mode=None):
     progress_data['start_time'] = time.time()
     progress_data['current_asset'] = ''
     
-    # Phase 1: Verify existing
+    # Phase 1: Verify existing (0% -> 20%)
     last_verify_percent = -1
+    cached_count = 0
+    cached_size = 0
     for idx, (asset_name, asset_info) in enumerate(assets.items()):
         if globals().get('json_output', False):
-            percent = (idx / len(assets)) * 100
-            if percent - last_verify_percent >= 2.0 or idx == len(assets) - 1:
-                print(json.dumps({"type": "progress", "progress": percent, "status": f"Verifying Assets: {percent:.1f}%"}))
-                sys.stdout.flush()
-                last_verify_percent = percent
+            verify_pct = ((idx + 1) / max(len(assets), 1)) * 100.0
+            overall_pct = verify_pct * 0.20
+            if verify_pct - last_verify_percent >= 2.0 or idx == len(assets) - 1:
+                print(json.dumps({"type": "progress", "progress": overall_pct, "status": f"Verifying Assets: {verify_pct:.1f}%"}), flush=True)
+                last_verify_percent = verify_pct
 
         asset_hash = asset_info.get('hash', '')
         asset_size = asset_info.get('size', 0)
-        
+
         if not asset_hash:
             continue
-            
+
         if dev_mode:
             asset_path = assets_dir / asset_name
         else:
             asset_path = assets_dir / asset_hash[:2] / asset_hash
-            
+
         if asset_path.exists():
+            cached_count += 1
+            cached_size += asset_size
             progress_data['completed'] += 1
             progress_data['completed_size'] += asset_size
             progress_data['current_asset'] = asset_name
             if not globals().get('json_output', False):
-                update_progress_display(total_assets)
+                update_progress_display(total_assets, verify_only=True)
         else:
             missing_assets[asset_name] = asset_info
-            
+
     print()  # Newline after verify progress
-    
-    # Phase 2: Download missing
+
+    # Phase 2: Download missing (20% -> 100%)
     failed_assets = []
     if missing_assets:
         missing_size = sum(a.get('size', 0) for a in missing_assets.values())
-        print(f"Downloading {len(missing_assets)} missing assets ({format_size(missing_size)})...")
+        total_missing = len(missing_assets)
+        print(f"Downloading {total_missing} missing assets ({format_size(missing_size)})...")
         print(f"Starting parallel download with {MAX_WORKERS} concurrent connections...")
-        
-        progress_data['start_time'] = time.time()  # Reset timer for speed calculation
-        
+
+        with progress_lock:
+            progress_data['completed'] = 0
+            progress_data['completed_size'] = 0
+            progress_data['total_size'] = missing_size
+            progress_data['start_time'] = time.time()
+            progress_data['current_asset'] = ''
+
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {}
-            
+
             for asset_name, asset_info in missing_assets.items():
                 asset_hash = asset_info.get('hash', '')
                 asset_size = asset_info.get('size', 0)
-                
+
                 future = executor.submit(download_asset_worker, asset_name, asset_hash, asset_size, assets_dir)
                 futures[future] = asset_name
-            
+
             # Process completed downloads
             for future in as_completed(futures):
                 success, asset_name, asset_size = future.result()
-                
+
                 if not success:
                     with progress_lock:
                         progress_data['failed'] += 1
                     failed_assets.append(asset_name)
-                
-                update_progress_display(total_assets)
+
+                update_progress_display(total_missing, verify_only=False)
+    else:
+        if globals().get('json_output', False):
+            print(json.dumps({"type": "progress", "progress": 100.0, "status": f"Verified all {total_assets} assets."}), flush=True)
     
     # Final summary
     print()  # New line after progress

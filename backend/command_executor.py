@@ -361,6 +361,12 @@ class CommandExecutor:
         # Build base command
         # Always resolve the game directory from the active profile's base directory unless --dir was explicitly passed
         import utils
+        import shlex
+        if not getattr(self, 'explicit_dir', False):
+            try:
+                utils.ensure_profile_links()
+            except Exception as link_e:
+                logger.warning(f"Profile link check skipped: {link_e}")
         if getattr(self, 'explicit_dir', False) and self.variables.get('minecraft_downloads'):
             downloads_str = self.variables['minecraft_downloads']
         else:
@@ -399,8 +405,27 @@ class CommandExecutor:
             
         java_bin = self.variables.get('java_path', 'java')
 
-        # Build JVM args and classpath from version JSON when available (or skip in offline mode)
-        jvm_args = [f'-Xmx2G', f'-Xms1G', '-XX:+UseG1GC', '-Djava.util.Arrays.useLegacyMergeSort=true']
+        # Build JVM args and classpath from version JSON when available (respecting per-profile RAM/JVM prefs)
+        prof_launch = {}
+        try:
+            prof_launch = utils.get_profile_launch_settings() or {}
+        except Exception:
+            prof_launch = {}
+        ram_mb = prof_launch.get('ram_mb')
+        if isinstance(ram_mb, (int, float)) and int(ram_mb) >= 512:
+            ram_int = int(ram_mb)
+            jvm_args = [f'-Xmx{ram_int}M', f'-Xms{min(1024, ram_int)}M', '-XX:+UseG1GC', '-Djava.util.Arrays.useLegacyMergeSort=true']
+        else:
+            jvm_args = [f'-Xmx2G', f'-Xms1G', '-XX:+UseG1GC', '-Djava.util.Arrays.useLegacyMergeSort=true']
+        extra_prof_jvm = str(prof_launch.get('jvm_args') or '').strip()
+        if extra_prof_jvm:
+            try:
+                jvm_args.extend(shlex.split(extra_prof_jvm))
+            except Exception:
+                jvm_args.extend(extra_prof_jvm.split())
+        if prof_launch.get('win_width') and prof_launch.get('win_height'):
+            self.variables['resolution_width'] = str(prof_launch['win_width'])
+            self.variables['resolution_height'] = str(prof_launch['win_height'])
         main_class = 'net.minecraft.client.main.Main'
         asset_index_arg = self.minecraft_version
         classpath = []
@@ -453,21 +478,32 @@ class CommandExecutor:
                 if not is_correct_native_arch(lib.get('name', '')):
                     continue
                 
-                # If the library has a downloads.artifact.path, use that
+                # If the library has a downloads.artifact.path, resolve it (syncing from profile/base libraries if needed)
                 dl = lib.get('downloads', {})
                 art = dl.get('artifact')
                 if art and art.get('path'):
-                    classpath.append(str(utils.get_dir("libraries") / art.get('path')))
+                    resolved_lib = utils.resolve_library_file(art.get('path'), libraries_dir=libs_dir)
+                    if not resolved_lib.is_file():
+                        logger.warning(f"[Warning] Required library missing for classpath: {resolved_lib}")
+                    classpath.append(str(resolved_lib))
                 else:
-                    # fallback: construct path from name e.g., org:name:version -> org/name/version/name-version.jar
+                    # fallback: construct path from Maven name (supporting optional classifier & @ext)
                     name = lib.get('name')
                     if name:
-                        parts = name.split(':')
+                        coords = str(name)
+                        ext = 'jar'
+                        if '@' in coords:
+                            coords, ext = coords.rsplit('@', 1)
+                        parts = coords.split(':')
                         if len(parts) >= 3:
                             group, artifact, ver = parts[0], parts[1], parts[2]
-                            lib_dir = utils.get_dir("libraries")
-                            lib_path = lib_dir / Path(group.replace('.', '/')) / artifact / ver / f"{artifact}-{ver}.jar"
-                            classpath.append(str(lib_path))
+                            cls = parts[3] if len(parts) >= 4 else ''
+                            fname = f"{artifact}-{ver}-{cls}.{ext}" if cls else f"{artifact}-{ver}.{ext}"
+                            rel_p = str(Path(group.replace('.', '/')) / artifact / ver / fname)
+                            resolved_lib = utils.resolve_library_file(rel_p, libraries_dir=libs_dir)
+                            if not resolved_lib.is_file():
+                                logger.warning(f"[Warning] Required Maven library missing for classpath: {resolved_lib}")
+                            classpath.append(str(resolved_lib))
 
             # Identify natives classifiers and prepare extraction for the current platform
             natives_classifiers = []
@@ -497,21 +533,32 @@ class CommandExecutor:
                             # find artifact in downloads.classifiers
                             dl = lib.get('downloads', {})
                             classifiers = dl.get('classifiers', {})
-                            if val in classifiers:
-                                art = classifiers.get(val)
-                                path = art.get('path')
-                                if path:
-                                    natives_classifiers.append(str(utils.get_dir("libraries") / path))
+                            if isinstance(entry := classifiers.get(val), dict) and entry.get('path'):
+                                natives_classifiers.append(str(utils.resolve_library_file(entry.get('path'), libraries_dir=libs_dir)))
 
-            # Append version client jar(s) at the end of classpath (checking multiple layout formats)
-            v_dir = utils.get_dir("versions")
-            candidate_jars = [
-                v_dir / f'{self.minecraft_version}-client.jar',
-                v_dir / f'{self.minecraft_version}.jar',
-                v_dir / self.minecraft_version / f'{self.minecraft_version}-client.jar',
-                v_dir / self.minecraft_version / f'{self.minecraft_version}.jar',
-                v_dir / self.minecraft_version / 'client.jar',
-            ]
+            # Append version client jar(s) at the end of classpath (checking modded jar first, then inherited base jar)
+            v_roots = [utils.get_dir("versions")]
+            base_v = utils.get_dir("base") / "versions"
+            if base_v not in v_roots:
+                v_roots.append(base_v)
+            jar_ver = version_info.get("jar") or version_info.get("_jar_version_id") or self.minecraft_version
+            candidate_jars = []
+            for vr in v_roots:
+                candidate_jars.extend([
+                    vr / self.minecraft_version / f'{self.minecraft_version}.jar',
+                    vr / f'{self.minecraft_version}-client.jar',
+                    vr / f'{self.minecraft_version}.jar',
+                    vr / self.minecraft_version / f'{self.minecraft_version}-client.jar',
+                    vr / self.minecraft_version / 'client.jar',
+                ])
+                if jar_ver != self.minecraft_version:
+                    candidate_jars.extend([
+                        vr / f'{jar_ver}-client.jar',
+                        vr / f'{jar_ver}.jar',
+                        vr / jar_ver / f'{jar_ver}-client.jar',
+                        vr / jar_ver / f'{jar_ver}.jar',
+                        vr / jar_ver / 'client.jar',
+                    ])
             for c_jar in candidate_jars:
                 if c_jar.exists():
                     classpath.append(str(c_jar))
@@ -645,6 +692,9 @@ class CommandExecutor:
         self.variables['game_assets'] = str(assets_dir_path.absolute())
         self.variables['assets_root'] = str(assets_dir_path.absolute())
         self.variables['natives_directory'] = str(natives_dir.absolute())
+        self.variables['library_directory'] = str(libs_dir.absolute())
+        self.variables['libraries_directory'] = str(libs_dir.absolute())
+        self.variables['classpath_separator'] = os.pathsep
         
         # Extract variables needed
         _, variables_needed = extract_variables(command)

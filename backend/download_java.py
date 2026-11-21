@@ -276,7 +276,7 @@ def download_java_runtime(major_version: int, component: str, output_dir: Option
         if os.path.lexists(str(java_home)):
             if java_exec.exists():
                 if globals().get('json_output', False):
-                    print(json.dumps({"type": "progress", "progress": 100, "status": "Verifying Java installation..."}))
+                    print(json.dumps({"type": "progress", "progress": 0, "status": "Verifying Java installation..."}))
                     sys.stdout.flush()
                 if verify_java_installation(str(java_exec), expected_major_version=major_version):
                     logger.info(f"[OK] Java runtime {component} (v{major_version}) already downloaded")

@@ -77,26 +77,38 @@ def download_version(version_id, jar_type="client", json_mode=None, is_dev_mode=
         print(f"Error: Could not fetch metadata for version {version_id}")
         return False
     
+    # Check if a standalone pre-built jar exists (e.g., jarmodded Risugami profile)
+    version_dir = get_dir("versions")
+    version_dir.mkdir(parents=True, exist_ok=True)
+    custom_candidates = [
+        version_dir / version_id / f"{version_id}.jar",
+        version_dir / version_id / f"{version_id}-{jar_type}.jar",
+    ]
+    if jar_type == "client":
+        for custom_jar in custom_candidates:
+            if custom_jar.exists() and custom_jar.stat().st_size > 0 and not version_json.get("downloads"):
+                print(f"[OK] Custom modded JAR for {version_id} already exists.")
+                return True
+
     # Check if downloads section exists
     if 'downloads' not in version_json or jar_type not in version_json['downloads']:
         print(f"Error: No {jar_type} download available for version {version_id}")
         return False
-    
+
     jar_download = version_json['downloads'][jar_type]
     download_url = jar_download['url']
     expected_sha1 = jar_download.get('sha1', None)
-    
-    # Prepare file path
-    version_dir = get_dir("versions")
-    version_dir.mkdir(parents=True, exist_ok=True)
-    file_path = version_dir / f"{version_id}-{jar_type}.jar"
-    
+
+    # Inherited profiles share the parent vanilla client JAR unless they specify their own
+    jar_version_id = version_json.get("_jar_version_id") or version_json.get("jar") or version_id
+    file_path = version_dir / f"{jar_version_id}-{jar_type}.jar"
+
     # Check if already downloaded
     if file_path.exists():
         if expected_sha1:
             print(f"Verifying existing {jar_type}.jar (this may take a moment)...")
             if globals().get('json_output', False):
-                print(json.dumps({"type": "progress", "progress": 100, "status": f"Verifying {jar_type}.jar..."}))
+                print(json.dumps({"type": "progress", "progress": 0, "status": f"Verifying {jar_type}.jar..."}))
                 sys.stdout.flush()
             if verify_sha1(file_path, expected_sha1):
                 print(f"[OK] Version {version_id} ({jar_type}) already exists and verified.")

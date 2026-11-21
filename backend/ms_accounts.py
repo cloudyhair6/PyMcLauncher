@@ -1259,9 +1259,9 @@ class PurePythonAuthFlow:
 
         hint = (self.login_hint or self.obtained_msa_email or "").strip().lower()
         target_wam_id = self.wam_id or self.obtained_wam_account_id
-        if self.silent_only:
-            hint = hint or str(saved_tok.get("msa_email") or "").strip().lower()
-            target_wam_id = target_wam_id or saved_tok.get("wam_account_id")
+        # Always reuse saved WAM identity for existing profiles (fresh logins have an empty saved_tok)
+        hint = hint or str(saved_tok.get("msa_email") or "").strip().lower()
+        target_wam_id = target_wam_id or saved_tok.get("wam_account_id")
 
         res = None
         if hint or target_wam_id:

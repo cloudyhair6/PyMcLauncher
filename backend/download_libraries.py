@@ -26,6 +26,7 @@ from utils import (
     ensure_download_dir,
     get_available_versions,
     get_version_json,
+    resolve_library_file,
     verify_sha1,
     download_file,
     set_download_dir,
@@ -35,11 +36,11 @@ import requests
 import requests.adapters
 
 import os
-MAX_WORKERS = (os.cpu_count() or 4) * 4  # Dynamically scale parallel downloads based on CPU cores
+MAX_WORKERS = min(32, max(16, (os.cpu_count() or 4) * 4))  # Dynamically scale parallel downloads based on CPU cores
 
-# Shared session for connection pooling
+# Shared session for connection pooling (sized well above MAX_WORKERS to avoid pool-full warnings)
 session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
+adapter = requests.adapters.HTTPAdapter(pool_connections=max(64, MAX_WORKERS * 2), pool_maxsize=max(64, MAX_WORKERS * 2))
 session.mount('https://', adapter)
 session.mount('http://', adapter)
 
@@ -53,6 +54,8 @@ progress_lock = Lock()
 progress_data = {
     'completed_size': 0,
     'total_size': 0,
+    'eff_completed': 0,
+    'eff_total': 0,
     'completed': 0,
     'failed': 0,
     'start_time': 0,
@@ -96,10 +99,12 @@ def download_library_worker(lib_name, lib_url, lib_size, lib_hash, lib_path):
             response = session.get(lib_url, timeout=30, stream=True)
             response.raise_for_status()
 
+            actual_bytes = 0
             with open(lib_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=16384):
                     if chunk:
                         f.write(chunk)
+                        actual_bytes += len(chunk)
 
             # Verify SHA-1 if provided
             if lib_hash and not verify_sha1(lib_path, lib_hash):
@@ -113,12 +118,14 @@ def download_library_worker(lib_name, lib_url, lib_size, lib_hash, lib_path):
                     continue
                 return False, lib_name, lib_size
 
+            eff_size = lib_size if (lib_size and lib_size > 0) else 65536
             with progress_lock:
                 progress_data['completed'] += 1
-                progress_data['completed_size'] += lib_size
+                progress_data['completed_size'] += actual_bytes or lib_size
+                progress_data['eff_completed'] += eff_size
                 progress_data['current_lib'] = lib_name
 
-            return True, lib_name, lib_size
+            return True, lib_name, actual_bytes or lib_size
 
         except Exception as e:
             try:
@@ -132,23 +139,29 @@ def download_library_worker(lib_name, lib_url, lib_size, lib_hash, lib_path):
             return False, lib_name, lib_size
         
 def update_progress_display(total_libraries):
-    """Display current progress with ETA."""
+    """Display current progress with ETA (mapped cleanly to 20%..100% during downloads)."""
     with progress_lock:
         completed = progress_data['completed']
         completed_size = progress_data['completed_size']
-        total_size = progress_data['total_size']
+        eff_completed = progress_data.get('eff_completed', 0)
+        eff_total = progress_data.get('eff_total', 0)
         start_time = progress_data['start_time']
         current_lib = progress_data['current_lib']
-    
+
     elapsed = time.time() - start_time
-    percent = (completed_size / total_size) * 100 if total_size > 0 else 0
-    
+    if eff_total > 0:
+        dl_ratio = min(1.0, max(0.0, eff_completed / eff_total))
+    else:
+        dl_ratio = min(1.0, max(0.0, completed / max(total_libraries, 1)))
+    dl_percent = dl_ratio * 100.0
+    overall_percent = 20.0 + (dl_ratio * 80.0)
+
     # Calculate speed based on completed size
     if elapsed > 1:
         speed = completed_size / elapsed
     else:
         speed = 0
-    
+
     # Calculate ETA based on remaining files and average size per file
     remaining_files = total_libraries - completed
     if completed > 0 and speed > 0:
@@ -158,21 +171,19 @@ def update_progress_display(total_libraries):
         eta_str = format_time(eta_seconds)
     else:
         eta_str = "calculating..."
-    
-    # Display progress line with fixed width format
+
     speed_str = format_size(speed) + "/s"
-    
-    # Limit library name to fit in terminal (max 50 chars)
     lib_display = current_lib[:50] if current_lib else "libraries"
-    
-    # Create the full status line
-    status_line = f"[{completed}/{total_libraries}] {percent:.1f}% | Speed: {speed_str:>9s} | ETA: {eta_str:>6s} | {lib_display}"
-    
+    status_line = f"[{completed}/{total_libraries}] {dl_percent:.1f}% | Speed: {speed_str:>9s} | ETA: {eta_str:>6s} | {lib_display}"
+
     global json_output
     if globals().get('json_output', False):
-        print(json.dumps({"type": "progress", "progress": percent, "status": status_line}))
+        now = time.monotonic()
+        last_json_t = globals().get('_last_lib_json_emit_t', 0.0)
+        if (now - last_json_t) >= 0.035 or completed >= total_libraries:
+            globals()['_last_lib_json_emit_t'] = now
+            print(json.dumps({"type": "progress", "progress": overall_percent, "status": status_line}), flush=True)
     else:
-        # Write to stdout with carriage return to overwrite the line
         sys.stdout.write(f"\r{status_line:<120}")
         sys.stdout.flush()
 
@@ -252,18 +263,50 @@ def download_libraries(version_id, json_mode=None, is_dev_mode=None):
 
     candidate_items = []
     for library in libraries:
-        if 'downloads' not in library:
-            continue
-        downloads = library['downloads']
+        downloads = library.get('downloads') or {}
         if 'artifact' in downloads:
             artifact = downloads['artifact']
-            candidate_items.append((
-                artifact['path'].split('/')[-1],
-                artifact['url'],
-                artifact.get('size', 0),
-                artifact.get('sha1', ''),
-                libraries_dir / artifact['path'],
-            ))
+            if artifact.get('url'):
+                candidate_items.append((
+                    artifact['path'].split('/')[-1],
+                    artifact['url'],
+                    artifact.get('size', 0),
+                    artifact.get('sha1', ''),
+                    libraries_dir / artifact['path'],
+                ))
+            elif artifact.get('path'):
+                # Processor-generated local artifact (e.g. Forge/NeoForge -client.jar with empty url): sync from profile/base if needed
+                resolved_local = resolve_library_file(
+                    artifact['path'],
+                    libraries_dir=libraries_dir,
+                    expected_sha1=artifact.get('sha1') or None,
+                )
+                if not resolved_local.is_file():
+                    print(f"[Warning] Local processor-generated library missing: {resolved_local} (reinstall mod loader if launch fails)")
+        elif library.get('name'):
+            # Maven-style mod loader library entry (Fabric, Quilt, Forge, Legacy Fabric, Ornithe, etc.)
+            coords = library['name']
+            ext = 'jar'
+            if '@' in coords:
+                coords, ext = coords.rsplit('@', 1)
+            parts = coords.split(':')
+            if len(parts) >= 3:
+                grp, art, ver = parts[0], parts[1], parts[2]
+                cls = parts[3] if len(parts) >= 4 else ''
+                fname = f"{art}-{ver}-{cls}.{ext}" if cls else f"{art}-{ver}.{ext}"
+                rel_path = f"{grp.replace('.', '/')}/{art}/{ver}/{fname}"
+                base_url = library.get('url') or "https://libraries.minecraft.net/"
+                full_url = f"{base_url.rstrip('/')}/{rel_path}"
+                lib_target = resolve_library_file(rel_path, libraries_dir=libraries_dir, expected_sha1=library.get('sha1') or None)
+                # Avoid forcing re-download of local processor-generated Forge client/srg jars unless explicitly downloadable
+                if library.get('url') or not lib_target.exists():
+                    candidate_items.append((
+                        fname,
+                        full_url,
+                        library.get('size', 0),
+                        library.get('sha1', ''),
+                        libraries_dir / rel_path,
+                    ))
         if 'classifiers' in downloads:
             classifiers = downloads['classifiers']
             natives_map = library.get('natives')
@@ -302,6 +345,8 @@ def download_libraries(version_id, json_mode=None, is_dev_mode=None):
                 if classifier_key not in classifiers:
                     continue
                 classifier = classifiers[classifier_key]
+                if not isinstance(classifier, dict) or not classifier.get('url') or not classifier.get('path'):
+                    continue
                 candidate_items.append((
                     classifier['path'].split('/')[-1],
                     classifier['url'],
@@ -310,8 +355,19 @@ def download_libraries(version_id, json_mode=None, is_dev_mode=None):
                     libraries_dir / classifier['path'],
                 ))
 
+    # Deduplicate candidate libraries by target file path
+    dedup_items = []
+    seen_paths = set()
+    for it in candidate_items:
+        key = str(it[4]).lower()
+        if key not in seen_paths:
+            seen_paths.add(key)
+            dedup_items.append(it)
+    candidate_items = dedup_items
+
     libs_to_download = []
     total_size = 0
+    eff_total = 0
     print("Verifying existing libraries (this may take a moment)...")
 
     def _verify_lib_item(item):
@@ -325,20 +381,23 @@ def download_libraries(version_id, json_mode=None, is_dev_mode=None):
         for idx, (is_valid, item) in enumerate(verify_pool.map(_verify_lib_item, candidate_items)):
             lib_name, lib_url, lib_size, lib_hash, lib_path = item
             if globals().get('json_output', False):
-                percent = ((idx + 1) / total_candidates) * 100
-                if percent - last_verify_percent >= 2.0 or idx == total_candidates - 1:
-                    print(json.dumps({"type": "progress", "progress": percent, "status": f"Verifying Libraries: {percent:.1f}%"}))
-                    sys.stdout.flush()
-                    last_verify_percent = percent
+                verify_pct = ((idx + 1) / total_candidates) * 100.0
+                overall_pct = verify_pct * 0.20
+                if verify_pct - last_verify_percent >= 2.0 or idx == total_candidates - 1:
+                    print(json.dumps({"type": "progress", "progress": overall_pct, "status": f"Verifying Libraries: {verify_pct:.1f}%"}), flush=True)
+                    last_verify_percent = verify_pct
             if not is_valid:
                 libs_to_download.append(item)
-                total_size += lib_size
+                total_size += (lib_size or 0)
+                eff_total += (lib_size if (lib_size and lib_size > 0) else 65536)
             else:
                 with progress_lock:
                     progress_data['completed'] += 1
-                    progress_data['completed_size'] += lib_size
+                    progress_data['completed_size'] += (lib_size or 0)
     
     if not libs_to_download:
+        if globals().get('json_output', False):
+            print(json.dumps({"type": "progress", "progress": 100.0, "status": f"All {len(libraries)} libraries verified."}), flush=True)
         print(f"[OK] All {len(libraries)} libraries already downloaded")
         return True
     
@@ -352,6 +411,8 @@ def download_libraries(version_id, json_mode=None, is_dev_mode=None):
         progress_data['completed'] = 0
         progress_data['completed_size'] = 0
         progress_data['total_size'] = total_size
+        progress_data['eff_completed'] = 0
+        progress_data['eff_total'] = eff_total
         progress_data['start_time'] = time.time()
         progress_data['current_lib'] = ''
     

@@ -1,10 +1,15 @@
 """Shared utilities for Minecraft launcher scripts."""
 
 import base64
+from contextlib import contextmanager
 import json
 import os
+import platform
+import subprocess
 import sys
+import threading
 from pathlib import Path
+from typing import Optional
 import requests
 import requests.adapters
 
@@ -31,7 +36,7 @@ def get_image_path(rel_path: str) -> str:
 
 # Shared HTTP session with connection pooling to avoid repeated TCP/TLS handshakes across steps
 http_session = requests.Session()
-_http_adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
+_http_adapter = requests.adapters.HTTPAdapter(pool_connections=64, pool_maxsize=64)
 http_session.mount("https://", _http_adapter)
 http_session.mount("http://", _http_adapter)
 
@@ -59,36 +64,65 @@ def get_download_dir():
         return _custom_download_dir
     return DOWNLOAD_DIR
 
-def get_dir(name: str, profile_name: str = None) -> Path:
+LINKABLE_GAME_SUBFOLDERS = ("saves", "resourcepacks", "shaderpacks", "screenshots")
+_PROFILE_TLS = threading.local()
+
+
+@contextmanager
+def profile_context(profile_name: Optional[str]):
+    """Temporarily direct get_dir(name) calls in the current thread to profile_name without mutating config."""
+    prev = getattr(_PROFILE_TLS, "active_profile", None)
+    _PROFILE_TLS.active_profile = profile_name
+    try:
+        yield
+    finally:
+        _PROFILE_TLS.active_profile = prev
+
+
+def _resolve_profile_base(dirs: dict, active: str) -> Path:
+    if isinstance(dirs, dict) and dirs.get("base"):
+        b = Path(dirs["base"])
+        return b if b.is_absolute() else ROOT_DIR / b
+    return get_download_dir()
+
+
+def get_dir(name: str, profile_name: str = None, _seen: set = None) -> Path:
     """Get the path for a specific directory type from config or defaults."""
     if _custom_download_dir and not profile_name:
         base = _custom_download_dir
-        if name == 'base': return base
+        if name == 'base':
+            return base
         return base / name
-        
+
     config = load_launcher_config()
-    
-    active = profile_name or config.get("active_profile", "Default")
+    active = profile_name or getattr(_PROFILE_TLS, "active_profile", None) or config.get("active_profile", "Default")
     profiles = config.get("profiles", {})
-    
+
     if active in profiles:
         dirs = profiles[active]
     else:
         dirs = config.get("directories", {})
-        
-    # Resolve base
-    if "base" in dirs:
-        b = Path(dirs["base"])
-        base = b if b.is_absolute() else ROOT_DIR / b
-    else:
-        base = get_download_dir()
-        
-    if name == 'base': return base
-    
-    if name in dirs:
+    if not isinstance(dirs, dict):
+        dirs = {}
+
+    base = _resolve_profile_base(dirs, active)
+    if name == 'base':
+        return base
+
+    # Support linking saves / resourcepacks / shaderpacks / screenshots from another profile or custom folder
+    if name in LINKABLE_GAME_SUBFOLDERS:
+        link_mode = dirs.get(f"{name}_link_mode")
+        if link_mode == "profile":
+            target_prof = dirs.get(f"{name}_link_profile")
+            seen = set(_seen or ())
+            if target_prof and target_prof in profiles and target_prof not in seen:
+                seen.add(active)
+                return get_dir(name, profile_name=target_prof, _seen=seen)
+
+    if name in dirs and str(dirs[name] or "").strip():
         sub = Path(dirs[name])
         return sub if sub.is_absolute() else ROOT_DIR / sub
-    
+
     return base / name
 
 
@@ -99,6 +133,64 @@ def ensure_download_dir():
     get_dir("assets").mkdir(parents=True, exist_ok=True)
     get_dir("indexes").mkdir(parents=True, exist_ok=True)
     get_dir("libraries").mkdir(parents=True, exist_ok=True)
+
+
+def resolve_library_file(rel_path: str, libraries_dir: Path = None, expected_sha1: str = None) -> Path:
+    """Resolve a library JAR path inside `libraries_dir`, syncing from profile/base fallbacks if needed."""
+    import shutil
+    primary_dir = Path(libraries_dir) if libraries_dir else get_dir("libraries")
+    rel = Path(str(rel_path or "").replace("\\", "/"))
+    primary = primary_dir / rel
+    try:
+        if primary.is_file() and primary.stat().st_size > 0:
+            if not expected_sha1 or verify_sha1(primary, expected_sha1):
+                return primary
+    except Exception:
+        pass
+
+    candidates = [
+        get_dir("base") / "libraries",
+        get_download_dir() / "libraries",
+    ]
+    try:
+        cfg = load_launcher_config()
+        for pname, pdirs in (cfg.get("profiles") or {}).items():
+            if isinstance(pdirs, dict):
+                candidates.append(_resolve_profile_base(pdirs, pname) / "libraries")
+                if pdirs.get("libraries"):
+                    lp = Path(pdirs["libraries"])
+                    candidates.append(lp if lp.is_absolute() else ROOT_DIR / lp)
+    except Exception:
+        pass
+
+    seen = set()
+    try:
+        seen.add(str(primary_dir.resolve()).lower())
+    except Exception:
+        pass
+    for lib_root in candidates:
+        try:
+            key = str(lib_root.resolve()).lower()
+        except Exception:
+            key = str(lib_root).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cand = lib_root / rel
+        try:
+            if cand.is_file() and cand.stat().st_size > 0:
+                if expected_sha1 and not verify_sha1(cand, expected_sha1):
+                    continue
+                try:
+                    primary.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(cand, primary)
+                    if primary.is_file() and primary.stat().st_size > 0:
+                        return primary
+                except Exception:
+                    return cand
+        except Exception:
+            pass
+    return primary
     get_dir("java").mkdir(parents=True, exist_ok=True)
 
 def fetch_version_manifest(use_cache=True):
@@ -186,6 +278,7 @@ def get_version_info(version_id):
 
 def download_file(url, file_path, expected_sha1=None, show_progress=True, json_output=False):
     """Download a file and optionally verify its SHA-1 hash with retries."""
+    file_path = Path(file_path)
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -196,6 +289,7 @@ def download_file(url, file_path, expected_sha1=None, show_progress=True, json_o
             downloaded = 0
             last_percent = -1
 
+            file_path.parent.mkdir(parents=True, exist_ok=True)
             with open(file_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=65536):
                     if chunk:
@@ -228,7 +322,7 @@ def download_file(url, file_path, expected_sha1=None, show_progress=True, json_o
                     return False
             return True
 
-        except requests.RequestException as e:
+        except (requests.RequestException, OSError) as e:
             if attempt < max_retries - 1:
                 import time
                 time.sleep(1)
@@ -263,18 +357,82 @@ def verify_sha1(file_path, expected_sha1):
         print(f"Error verifying {file_path}: {e}")
         return False
 
-def get_version_json(version_id):
-    """Download and return the version.json for a specific version (with in-memory and disk cache)."""
+def _merge_inherited_version_json(child: dict, parent: dict) -> dict:
+    """Merge a child mod-loader version JSON onto its parent Mojang version JSON."""
+    merged = dict(parent)
+    for k, v in child.items():
+        if k in ("libraries", "arguments", "inheritsFrom"):
+            continue
+        merged[k] = v
+
+    # Libraries: child libraries first (so overrides/ASM/Mixin precede vanilla on classpath), then parent
+    child_libs = list(child.get("libraries") or [])
+    parent_libs = list(parent.get("libraries") or [])
+    seen_coords = set()
+    combined_libs = []
+    for lib in child_libs:
+        name = str(lib.get("name") or "")
+        parts = name.split(":")
+        # Distinguish distinct classifiers (4th part) while overriding same group:artifact:classifier
+        if len(parts) >= 2:
+            cls_part = parts[3] if len(parts) >= 4 else ""
+            seen_coords.add((parts[0], parts[1], cls_part))
+        combined_libs.append(lib)
+    for lib in parent_libs:
+        name = str(lib.get("name") or "")
+        parts = name.split(":")
+        if len(parts) >= 2:
+            cls_part = parts[3] if len(parts) >= 4 else ""
+            coord = (parts[0], parts[1], cls_part)
+            # Only drop duplicate when neither has platform-specific classifiers map
+            if coord in seen_coords and "natives" not in lib and not (len(parts) >= 4 and "natives" in cls_part):
+                continue
+        combined_libs.append(lib)
+    merged["libraries"] = combined_libs
+
+    # Arguments: concatenate JVM and game args preserving parent defaults + child additions
+    p_args = parent.get("arguments")
+    c_args = child.get("arguments")
+    if isinstance(p_args, dict) or isinstance(c_args, dict):
+        p_jvm = list((p_args or {}).get("jvm") or [])
+        c_jvm = list((c_args or {}).get("jvm") or [])
+        p_game = list((p_args or {}).get("game") or [])
+        c_game = list((c_args or {}).get("game") or [])
+        # Legacy parent (only minecraftArguments) + modern child (arguments.game) fallback
+        if not p_game and isinstance(parent.get("minecraftArguments"), str) and not c_game:
+            p_game = parent["minecraftArguments"].split()
+        merged["arguments"] = {
+            "jvm": p_jvm + c_jvm,
+            "game": p_game + c_game,
+        }
+
+    base_id = parent.get("_jar_version_id") or child.get("jar") or parent.get("jar") or parent.get("id")
+    if base_id:
+        merged["_jar_version_id"] = base_id
+    if child.get("inheritsFrom"):
+        merged["_inherits_from"] = child.get("inheritsFrom")
+    return merged
+
+
+def get_version_json(version_id, resolve_inheritance: bool = True, _seen: set = None):
+    """Download and return the version.json for a specific version (resolving inheritsFrom cleanly)."""
     import json
     from pathlib import Path
-    
+
+    if _seen is None:
+        _seen = set()
+    if version_id in _seen:
+        return None
+    _seen = _seen | {version_id}
+
     v_dir = get_dir("versions")
     b_dir = get_dir("base")
     local_path = v_dir / version_id / f'{version_id}.json'
-    cache_key = (str(local_path), version_id)
+    cache_key = (str(local_path), version_id, bool(resolve_inheritance))
     if cache_key in _version_json_memory_cache:
         return _version_json_memory_cache[cache_key]
 
+    raw_data = None
     # Try to load from local disk cache first across standard candidate locations
     for candidate_path in [
         local_path,
@@ -285,36 +443,44 @@ def get_version_json(version_id):
         if candidate_path.exists():
             try:
                 with open(candidate_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if isinstance(data, dict):
-                        _version_json_memory_cache[cache_key] = data
-                        return data
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        raw_data = loaded
+                        break
             except Exception:
                 pass
 
-    version_info = get_version_info(version_id)
-    if not version_info or 'url' not in version_info:
-        print(f"Version {version_id} not found or has no URL")
-        return None
-    
-    try:
-        response = http_session.get(version_info['url'], timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        _version_json_memory_cache[cache_key] = data
-        
-        # Save to local cache
+    if raw_data is None:
+        version_info = get_version_info(version_id)
+        if not version_info or 'url' not in version_info:
+            print(f"Version {version_id} not found or has no URL")
+            return None
+
         try:
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(local_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            print(f"Failed to cache version JSON: {e}")
-            
-        return data
-    except requests.RequestException as e:
-        print(f"Error fetching version JSON for {version_id}: {e}")
-        return None
+            response = http_session.get(version_info['url'], timeout=10)
+            response.raise_for_status()
+            raw_data = response.json()
+
+            # Save to local cache
+            try:
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(local_path, 'w', encoding='utf-8') as f:
+                    json.dump(raw_data, f, indent=2)
+            except Exception as e:
+                print(f"Failed to cache version JSON: {e}")
+        except requests.RequestException as e:
+            print(f"Error fetching version JSON for {version_id}: {e}")
+            return None
+
+    result = raw_data
+    parent_id = raw_data.get("inheritsFrom") if isinstance(raw_data, dict) else None
+    if resolve_inheritance and parent_id and parent_id != version_id:
+        parent_data = get_version_json(parent_id, resolve_inheritance=True, _seen=_seen)
+        if isinstance(parent_data, dict):
+            result = _merge_inherited_version_json(raw_data, parent_data)
+
+    _version_json_memory_cache[cache_key] = result
+    return result
 
 def load_launcher_config():
     """Load the launcher config with in-memory mtime caching."""
@@ -835,14 +1001,36 @@ def _deduplicate_accounts(accounts: dict, prefer_pid: str = None) -> tuple[dict,
         return accounts, False
 
     modified = False
-    for pid, pdata in profiles.items():
-        if isinstance(pdata, dict) and pdata.get("mc_uuid"):
+    cleaned_profiles = {}
+    for pid, pdata in list(profiles.items()):
+        if not isinstance(pdata, dict):
+            modified = True
+            continue
+        # Drop incomplete ghost profiles (e.g. test/interrupted entries lacking both token and UUID)
+        has_tok = bool(str(pdata.get("mc_access_token") or "").strip())
+        has_uuid = bool(str(pdata.get("mc_uuid") or "").strip())
+        if not has_tok and not has_uuid:
+            modified = True
+            continue
+        if pdata.get("mc_uuid"):
             expected_color = calculate_locator_bar_color(pdata.get("mc_uuid"))
             if expected_color != "#FFFFFF" and pdata.get("locator_bar_color") != expected_color:
                 pdata["locator_bar_color"] = expected_color
                 modified = True
+        cleaned_profiles[pid] = pdata
+
+    profiles = cleaned_profiles
+    accounts["profiles"] = profiles
+    active_id = prefer_pid or accounts.get("active_profile")
 
     if len(profiles) <= 1:
+        if active_id not in profiles:
+            accounts["active_profile"] = next(iter(profiles.keys()), None)
+            if accounts.get("active_profile") != active_id:
+                modified = True
+        elif prefer_pid and accounts.get("active_profile") != active_id:
+            accounts["active_profile"] = active_id
+            modified = True
         return accounts, modified
 
     import shutil
@@ -1012,12 +1200,25 @@ def clear_auth_cache(all_accounts=True):
             accounts["active_profile"] = remaining[0] if remaining else None
             save_accounts(accounts)
 
+def save_auth_cache_for_profile(profile_id, auth_data):
+    """Save auth_data under profile_id, set it active, deduplicate, and persist accounts."""
+    accounts = load_accounts()
+    pid = profile_id or accounts.get("active_profile") or str(uuid.uuid4())
+    if "profiles" not in accounts or not isinstance(accounts["profiles"], dict):
+        accounts["profiles"] = {}
+    accounts["profiles"][pid] = auth_data
+    accounts["active_profile"] = pid
+    accounts, _ = _deduplicate_accounts(accounts, prefer_pid=pid)
+    save_accounts(accounts)
+    return accounts.get("active_profile")
+
 def save_auth_cache(auth_data):
     accounts = load_accounts()
     active_id = accounts.get("active_profile")
-    if not active_id:
-        active_id = get_active_profile_id(force_new=True)
-    if "profiles" not in accounts:
+    if not active_id or active_id not in (accounts.get("profiles") or {}):
+        if not active_id:
+            active_id = str(uuid.uuid4())
+    if "profiles" not in accounts or not isinstance(accounts["profiles"], dict):
         accounts["profiles"] = {}
     accounts["profiles"][active_id] = auth_data
     accounts["active_profile"] = active_id
@@ -1265,6 +1466,18 @@ def fetch_player_textures(profile_id, uuid, gamerpic_url=None, progress_callback
             container.appendChild(skinViewer.canvas);
             window.skinViewer = skinViewer;
 
+            window.pauseViewer = function() {
+                if (window.skinViewer) {
+                    window.skinViewer.renderPaused = true;
+                }
+            };
+
+            window.resumeViewer = function() {
+                if (window.skinViewer) {
+                    window.skinViewer.renderPaused = false;
+                }
+            };
+
             window.__syncViewerSize = function() {
                 const r = container.getBoundingClientRect();
                 const w = Math.max(Math.round(r.width || window.innerWidth || 0), 1);
@@ -1439,6 +1652,102 @@ def is_minecraft_window_visible(pid: int = None, version: str = None) -> bool:
         WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
         user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
         return found[0]
+    except Exception:
+        return False
+
+
+def is_fullscreen_app_active(exclude_pid: int = None) -> bool:
+    """Return True when a third-party/game fullscreen window is in the foreground."""
+    import platform
+    my_pid = int(exclude_pid or os.getpid())
+    if platform.system() == 'Darwin':
+        try:
+            cmd = [
+                'osascript', '-e',
+                'tell application "System Events" to get value of attribute "AXFullScreen" '
+                'of front window of (first process whose frontmost is true)'
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=0.6)
+            return 'true' in res.stdout.lower()
+        except Exception:
+            return False
+
+    if os.name != 'nt':
+        return False
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        # 1. Inspect the foreground window first so our own launcher or desktop windows never pause the UI
+        user32 = ctypes.windll.user32
+        fg = user32.GetForegroundWindow()
+        if not fg or not user32.IsWindowVisible(fg) or user32.IsIconic(fg):
+            return False
+
+        fg_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
+        if int(fg_pid.value) == my_pid:
+            return False
+
+        cls_buf = ctypes.create_unicode_buffer(128)
+        user32.GetClassNameW(fg, cls_buf, 128)
+        if cls_buf.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+            return False
+
+        # Skip UWP/system cloaked windows or floating tool windows
+        try:
+            cloaked = ctypes.c_int(0)
+            if ctypes.windll.dwmapi.DwmGetWindowAttribute(fg, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked)) == 0 and cloaked.value:
+                return False
+        except Exception:
+            pass
+        ex_style = user32.GetWindowLongW(fg, -20)  # GWL_EXSTYLE
+        if ex_style & 0x00000080:  # WS_EX_TOOLWINDOW
+            return False
+
+        # 2. Native Windows D3D exclusive fullscreen / presentation state (ignore QUNS_BUSY=2 which triggers under Focus Assist/desktop)
+        try:
+            state = ctypes.c_int(0)
+            hr = ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state))
+            if hr == 0 and state.value in (3, 4):  # QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE
+                return True
+        except Exception:
+            pass
+
+        # 3. Borderless fullscreen check against nearest monitor, excluding normal maximized captioned desktop apps
+        style = user32.GetWindowLongW(fg, -16)  # GWL_STYLE
+        has_caption = (style & 0x00C00000) == 0x00C00000  # WS_CAPTION
+        if user32.IsZoomed(fg) and has_caption:
+            return False
+
+        win_rect = wintypes.RECT()
+        if not user32.GetWindowRect(fg, ctypes.byref(win_rect)):
+            return False
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        hmon = user32.MonitorFromWindow(fg, 2)  # MONITOR_DEFAULTTONEAREST
+        if not hmon:
+            return False
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            return False
+
+        mon = mi.rcMonitor
+        return (
+            win_rect.left <= mon.left + 2
+            and win_rect.top <= mon.top + 2
+            and win_rect.right >= mon.right - 2
+            and win_rect.bottom >= mon.bottom - 2
+        )
     except Exception:
         return False
 
@@ -2091,6 +2400,1078 @@ def is_allowed_by_rules(rules: list) -> bool:
             allowed = (action == 'allow')
 
     return allowed
+
+
+def safe_profile_folder_name(name: str) -> str:
+    """Return a clean filesystem-safe folder name for a profile."""
+    import re
+    cleaned = re.sub(r'[^A-Za-z0-9._-]+', '_', (name or '').strip()).strip('._-')
+    return cleaned or "profile"
+
+
+def build_profile_dirs(
+    profile_name: str,
+    base_dir: str = None,
+    isolate_versions: bool = False,
+    link_saves_mode: str = "isolated",
+    link_saves_profile: str = None,
+    custom_saves_dir: str = None,
+    **extra,
+) -> dict:
+    """Construct a complete, normalized profile directory entry for launcher_config.json."""
+    slug = safe_profile_folder_name(profile_name)
+    if base_dir:
+        base_str = str(base_dir).replace('\\', '/')
+    elif profile_name == "Default":
+        base_str = "minecraft_downloads"
+    else:
+        base_str = f"minecraft_downloads/profiles/{slug}"
+
+    shared_root = "minecraft_downloads"
+    if isolate_versions:
+        ver_str = f"{base_str.rstrip('/')}/versions"
+    else:
+        ver_str = f"{shared_root}/versions"
+
+    if link_saves_mode == "custom" and custom_saves_dir:
+        saves_str = str(custom_saves_dir).replace('\\', '/')
+    elif link_saves_mode == "profile" and link_saves_profile:
+        # Fallback path string if target removed later; live resolution follows saves_link_profile
+        saves_str = f"{base_str.rstrip('/')}/saves"
+    else:
+        link_saves_mode = "isolated"
+        saves_str = f"{base_str.rstrip('/')}/saves"
+
+    entry = {
+        "base": base_str,
+        "assets": f"{shared_root}/assets",
+        "libraries": f"{shared_root}/libraries",
+        "versions": ver_str,
+        "java": f"{shared_root}/java",
+        "saves": saves_str,
+        "indexes": f"{shared_root}/indexes",
+        "source": f"{shared_root}/source",
+        "isolate_versions": bool(isolate_versions),
+        "saves_link_mode": link_saves_mode,
+    }
+    if link_saves_profile:
+        entry["saves_link_profile"] = link_saves_profile
+    for k, v in extra.items():
+        if v is not None:
+            entry[k] = v
+    return entry
+
+
+def _is_reparse_or_symlink(p: Path) -> bool:
+    """Return True if path is a POSIX symlink or Windows symlink/NTFS directory junction."""
+    try:
+        if p.is_symlink():
+            return True
+    except Exception:
+        pass
+    if os.name == 'nt':
+        try:
+            st = os.lstat(str(p))
+            return bool(getattr(st, 'st_file_attributes', 0) & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+        except Exception:
+            pass
+    return False
+
+
+def _remove_link_only(link_path: Path) -> bool:
+    """Remove a symlink or Windows junction without deleting target directory contents."""
+    try:
+        if link_path.is_symlink():
+            link_path.unlink()
+            return True
+        if os.name == 'nt' and _is_reparse_or_symlink(link_path):
+            os.rmdir(str(link_path))
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _create_os_dir_link(link_p: Path, target_p: Path) -> tuple[bool, str]:
+    """Attempt native symlink (POSIX/macOS/Win DevMode) then Windows NTFS junction (`mklink /J`)."""
+    try:
+        os.symlink(str(target_p.resolve()), str(link_p), target_is_directory=True)
+        return True, f"Linked {link_p.name} -> {target_p}"
+    except OSError as sym_err:
+        if os.name == 'nt':
+            try:
+                res = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(link_p), str(target_p.resolve())],
+                    capture_output=True, text=True, timeout=10
+                )
+                if res.returncode == 0 and (link_p.exists() or _is_reparse_or_symlink(link_p)):
+                    return True, f"Junctioned {link_p.name} -> {target_p}"
+                err = (res.stderr or res.stdout or str(sym_err)).strip()
+                return False, err
+            except Exception as j_err:
+                return False, str(j_err)
+        return False, str(sym_err)
+
+
+def _sync_dir_newer(src: Path, dst: Path):
+    """Copy missing or newer files from `src` into `dst` safely without deleting existing extras."""
+    import shutil
+    if not src.exists() or not src.is_dir():
+        return
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in src.iterdir():
+        if item.name == ".pymc_link_target":
+            continue
+        out = dst / item.name
+        if item.is_dir():
+            _sync_dir_newer(item, out)
+        elif item.is_file():
+            try:
+                if not out.exists() or item.stat().st_mtime > out.stat().st_mtime + 0.5:
+                    shutil.copy2(str(item), str(out))
+            except Exception:
+                pass
+
+
+def link_profile_subfolder(link_path: Path, target_path: Path) -> tuple[bool, str]:
+    """
+    Create a safe directory link (symlink on POSIX/macOS, symlink or NTFS junction on Windows)
+    at `link_path` pointing to `target_path`, or fall back cleanly to bidirectional mirror sync
+    if the underlying filesystem disallows symlinks/junctions (e.g. exFAT / sandbox).
+    """
+    import shutil
+    try:
+        link_p = Path(link_path)
+        target_p = Path(target_path)
+        target_p.mkdir(parents=True, exist_ok=True)
+        link_p.parent.mkdir(parents=True, exist_ok=True)
+
+        if str(link_p.resolve()) == str(target_p.resolve()) and (link_p.exists() or _is_reparse_or_symlink(link_p)):
+            if _is_reparse_or_symlink(link_p):
+                return True, f"Already linked to {target_p}"
+            return True, f"Same directory ({target_p})"
+
+        # Probe whether OS directory links work in this parent folder BEFORE modifying link_p
+        probe = link_p.parent / f".pymc_link_probe_{os.getpid()}"
+        if probe.exists() or _is_reparse_or_symlink(probe):
+            _remove_link_only(probe)
+        can_link, link_msg = _create_os_dir_link(probe, target_p)
+        if _is_reparse_or_symlink(probe) or probe.exists():
+            _remove_link_only(probe)
+            if probe.exists():
+                try:
+                    probe.rmdir()
+                except Exception:
+                    pass
+
+        if can_link:
+            if _is_reparse_or_symlink(link_p):
+                _remove_link_only(link_p)
+            elif link_p.exists():
+                if link_p.is_dir():
+                    marker = link_p / ".pymc_link_target"
+                    if marker.exists():
+                        marker.unlink(missing_ok=True)
+                    for child in list(link_p.iterdir()):
+                        dest = target_p / child.name
+                        if dest.exists():
+                            dest = target_p / f"{child.name}_imported"
+                            idx = 2
+                            while dest.exists():
+                                dest = target_p / f"{child.name}_imported_{idx}"
+                                idx += 1
+                        shutil.move(str(child), str(dest))
+                    link_p.rmdir()
+                else:
+                    return False, f"Existing file conflicts with folder link: {link_p}"
+            ok, msg = _create_os_dir_link(link_p, target_p)
+            if ok:
+                return True, msg
+
+        # Filesystem fallback (e.g. exFAT or restricted sandbox): keep bidirectional newer-file sync + marker
+        link_p.mkdir(parents=True, exist_ok=True)
+        marker = link_p / ".pymc_link_target"
+        _sync_dir_newer(link_p, target_p)
+        _sync_dir_newer(target_p, link_p)
+        marker.write_text(str(target_p.resolve()), encoding="utf-8")
+        return True, f"Mirror-synced {link_p.name} <-> {target_p} ({link_msg})"
+    except Exception as e:
+        return False, str(e)
+
+
+def unlink_profile_subfolder(link_path: Path) -> bool:
+    """Break a folder link cleanly (never deleting target contents) and restore an isolated directory."""
+    link_p = Path(link_path)
+    if _is_reparse_or_symlink(link_p):
+        _remove_link_only(link_p)
+    marker = link_p / ".pymc_link_target"
+    if marker.is_file():
+        try:
+            marker.unlink()
+        except Exception:
+            pass
+    link_p.mkdir(parents=True, exist_ok=True)
+    return True
+
+
+def sync_profile_mirror_links_back(profile_name: str = None):
+    """Sync changes back to link targets for any folders using mirror-sync fallback (e.g. after game exit)."""
+    config = load_launcher_config()
+    active = profile_name or config.get("active_profile", "Default")
+    base_dir = get_dir("base", profile_name=active)
+    for folder in LINKABLE_GAME_SUBFOLDERS:
+        link_p = base_dir / folder
+        marker = link_p / ".pymc_link_target"
+        if not _is_reparse_or_symlink(link_p) and marker.is_file():
+            try:
+                target_str = marker.read_text(encoding="utf-8").strip()
+                if target_str:
+                    _sync_dir_newer(link_p, Path(target_str))
+            except Exception:
+                pass
+
+
+def ensure_profile_links(profile_name: str = None) -> list[str]:
+    """Synchronize linked subfolders (saves, resourcepacks, shaderpacks, screenshots) for a profile."""
+    messages = []
+    config = load_launcher_config()
+    profiles = config.get("profiles", {})
+    active = profile_name or config.get("active_profile", "Default")
+    dirs = profiles.get(active, {})
+    if not isinstance(dirs, dict):
+        return messages
+    base_dir = get_dir("base", profile_name=active)
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    for folder in LINKABLE_GAME_SUBFOLDERS:
+        mode = dirs.get(f"{folder}_link_mode", "isolated")
+        link_p = base_dir / folder
+        if mode in ("profile", "custom"):
+            target_p = get_dir(folder, profile_name=active)
+            if str(target_p.resolve()) != str(link_p.resolve()) or _is_reparse_or_symlink(link_p):
+                if str(target_p.resolve()) != str(link_p.resolve()):
+                    ok, msg = link_profile_subfolder(link_p, target_p)
+                    if ok:
+                        messages.append(msg)
+        else:
+            if _is_reparse_or_symlink(link_p) or (link_p / ".pymc_link_target").is_file():
+                unlink_profile_subfolder(link_p)
+                messages.append(f"Restored isolated {folder} folder for {active}")
+    return messages
+
+
+def _inspect_jar_mod_hint(jar_path: Path) -> Optional[str]:
+    """Return loader hint ('fabric', 'quilt', 'neoforge', 'forge') if jar looks like a mod archive."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(jar_path, "r") as z:
+            names = set(z.namelist())
+            if "quilt.mod.json" in names:
+                return "quilt"
+            if "fabric.mod.json" in names:
+                return "fabric"
+            if "META-INF/neoforge.mods.toml" in names:
+                return "neoforge"
+            if "META-INF/mods.toml" in names or "mcmod.info" in names:
+                return "forge"
+    except Exception:
+        pass
+    return None
+
+
+def _looks_like_mc_root_dir(d: Path) -> bool:
+    """Return True if folder `d` resembles a Minecraft/instance root directory."""
+    if not d.is_dir():
+        return False
+    markers = ("saves", "versions", "config", "options.txt", "servers.dat", "manifest.json", "modrinth.index.json", "instance.cfg", ".minecraft", "overrides")
+    return any((d / m).exists() for m in markers)
+
+
+def _discover_worlds_in_dir(root: Path, max_depth: int = 2) -> list[Path]:
+    """Find world directories (containing level.dat) up to `max_depth` below `root`, handling custom layouts."""
+    found: list[Path] = []
+    seen_resolved = set()
+    if (root / "level.dat").is_file():
+        rp = str(root.resolve())
+        seen_resolved.add(rp)
+        found.append(root)
+        return found
+
+    def _walk(cur: Path, depth: int):
+        if depth > max_depth or not cur.is_dir():
+            return
+        try:
+            entries = sorted(cur.iterdir(), key=lambda x: x.name.lower())
+        except Exception:
+            return
+        for item in entries:
+            if not item.is_dir():
+                continue
+            if item.name.lower() in ("assets", "libraries", "versions", "logs", "crash-reports", "natives", "runtime", ".cache"):
+                continue
+            if (item / "level.dat").is_file():
+                rp = str(item.resolve())
+                if rp not in seen_resolved:
+                    seen_resolved.add(rp)
+                    found.append(item)
+            elif depth < max_depth:
+                _walk(item, depth + 1)
+
+    _walk(root, 1)
+    return found
+
+
+def analyze_import_directory(source_dir: Path) -> dict:
+    """
+    Scan a Minecraft, Modpack, Prism/MultiMC, CurseForge, or mixed backup directory
+    and detect its contents, accidental subfolder selection, non-standard layouts, and loader/MC hints.
+    """
+    orig_dir = Path(source_dir)
+    if not orig_dir.exists():
+        return {"exists": False, "resolved_root": str(orig_dir)}
+
+    root = orig_dir
+    picked_subfolder_kind = None
+    parent_candidate = None
+    accidental_warning = None
+
+    # Auto-descend into nested .minecraft / minecraft / overrides folder if outer wrapper was picked
+    if (root / ".minecraft").is_dir() and not ((root / "mods").is_dir() or (root / "saves").is_dir()):
+        root = root / ".minecraft"
+    elif (root / "minecraft").is_dir() and not ((root / "mods").is_dir() or (root / "saves").is_dir()):
+        root = root / "minecraft"
+    elif (root / "overrides").is_dir() and not ((root / "mods").is_dir() or (root / "saves").is_dir()):
+        root = root / "overrides"
+
+    # Detect if the user accidentally clicked inside a subfolder (`mods/`, `saves/`, single world, `resourcepacks/`, etc.)
+    folder_lower = orig_dir.name.lower()
+    if (orig_dir / "level.dat").is_file() and not (orig_dir / "saves").is_dir():
+        picked_subfolder_kind = "single_world"
+        cand = orig_dir.parent.parent if orig_dir.parent.name.lower() in ("saves", "worlds") else orig_dir.parent
+        if _looks_like_mc_root_dir(cand):
+            parent_candidate = str(cand)
+            accidental_warning = (
+                f"It looks like you picked a single world folder ('{orig_dir.name}') inside '{cand.name}'. "
+                f"You can switch to '{cand.name}' to import the full Minecraft setup, or import just this world into saves/."
+            )
+    elif folder_lower in ("mods", "saves", "worlds", "resourcepacks", "shaderpacks", "config", "versions", "screenshots"):
+        has_mc_children = any((orig_dir / m).exists() for m in ("mods", "saves", "versions", "options.txt"))
+        if not has_mc_children:
+            picked_subfolder_kind = "saves" if folder_lower == "worlds" else folder_lower
+            if _looks_like_mc_root_dir(orig_dir.parent):
+                parent_candidate = str(orig_dir.parent)
+                accidental_warning = (
+                    f"It looks like you selected just a '{orig_dir.name}' subfolder inside '{orig_dir.parent.name}'. "
+                    f"Click 'Use Full Parent Folder' to import everything (worlds, mods & settings), or continue with only '{orig_dir.name}'."
+                )
+
+    detected_loader = None
+    detected_mc = None
+    suggested_name = root.parent.name if root.name.lower() in (".minecraft", "minecraft", "overrides") and root.parent.name else root.name
+    if picked_subfolder_kind and parent_candidate:
+        suggested_name = Path(parent_candidate).name
+
+    # Inspect Prism / MultiMC / CurseForge / Modrinth metadata in root or parent
+    for base_meta in (root, orig_dir, root.parent):
+        mmc_pack = base_meta / "mmc-pack.json"
+        if mmc_pack.is_file() and not detected_mc:
+            try:
+                pack_data = json.loads(mmc_pack.read_text(encoding="utf-8", errors="ignore"))
+                for comp in pack_data.get("components", []):
+                    uid = str(comp.get("uid", "")).lower()
+                    ver = str(comp.get("version", ""))
+                    if uid == "net.minecraft":
+                        detected_mc = ver
+                    elif "fabric" in uid:
+                        detected_loader = "fabric"
+                    elif "quilt" in uid:
+                        detected_loader = "quilt"
+                    elif "neoforge" in uid:
+                        detected_loader = "neoforge"
+                    elif "forge" in uid:
+                        detected_loader = "forge"
+            except Exception:
+                pass
+
+        inst_cfg = base_meta / "instance.cfg"
+        if inst_cfg.is_file():
+            try:
+                for line in inst_cfg.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if line.startswith("name=") and line.split("=", 1)[1].strip():
+                        suggested_name = line.split("=", 1)[1].strip()
+                        break
+            except Exception:
+                pass
+
+        cf_manifest = base_meta / "manifest.json"
+        if cf_manifest.is_file() and not detected_mc:
+            try:
+                cf = json.loads(cf_manifest.read_text(encoding="utf-8", errors="ignore"))
+                if cf.get("name"):
+                    suggested_name = str(cf["name"]).strip()
+                mc_blk = cf.get("minecraft") or {}
+                if mc_blk.get("version"):
+                    detected_mc = str(mc_blk["version"])
+                for ml in mc_blk.get("modLoaders", []):
+                    ml_id = str(ml.get("id", "")).lower()
+                    for cand in ("neoforge", "fabric", "quilt", "forge"):
+                        if cand in ml_id:
+                            detected_loader = cand
+                            break
+            except Exception:
+                pass
+
+        mr_idx = base_meta / "modrinth.index.json"
+        if mr_idx.is_file() and not detected_mc:
+            try:
+                mr = json.loads(mr_idx.read_text(encoding="utf-8", errors="ignore"))
+                if mr.get("name"):
+                    suggested_name = str(mr["name"]).strip()
+                deps = mr.get("dependencies") or {}
+                if deps.get("minecraft"):
+                    detected_mc = str(deps["minecraft"])
+                for k in ("fabric-loader", "quilt-loader", "neoforge", "forge"):
+                    if k in deps:
+                        detected_loader = k.replace("-loader", "")
+                        break
+            except Exception:
+                pass
+
+    # Collect mods cleanly whether inside mods/, picked directly, or loose in custom layout
+    mod_paths: list[Path] = []
+    seen_mods = set()
+    mods_scan_dirs = [root / "mods"] if (root / "mods").is_dir() else []
+    if (root / "overrides" / "mods").is_dir():
+        mods_scan_dirs.append(root / "overrides" / "mods")
+    if picked_subfolder_kind == "mods":
+        mods_scan_dirs.append(orig_dir)
+    for md in mods_scan_dirs:
+        for p in sorted(md.iterdir(), key=lambda x: x.name.lower()):
+            if p.is_file() and (p.suffix.lower() in (".jar", ".zip") or p.name.lower().endswith(".jar.disabled")):
+                rp = str(p.resolve())
+                if rp not in seen_mods:
+                    seen_mods.add(rp)
+                    mod_paths.append(p)
+                    if not detected_loader and p.suffix.lower() == ".jar":
+                        detected_loader = _inspect_jar_mod_hint(p)
+
+    loose_mods: list[Path] = []
+    if picked_subfolder_kind != "mods":
+        for p in sorted(root.iterdir(), key=lambda x: x.name.lower()):
+            if p.is_file() and p.suffix.lower() == ".jar":
+                hint = _inspect_jar_mod_hint(p)
+                if hint or "client" not in p.name.lower():
+                    rp = str(p.resolve())
+                    if rp not in seen_mods:
+                        seen_mods.add(rp)
+                        loose_mods.append(p)
+                        mod_paths.append(p)
+                        if hint and not detected_loader:
+                            detected_loader = hint
+
+    # Also catch mod folders if user picked a `mods` folder whose contents are ONLY loose jars -> classify cleanly without warning confusion
+    if not mod_paths and not picked_subfolder_kind:
+        pass
+
+    # Discover worlds cleanly regardless of folder nesting (`saves/`, `Worlds/`, loose, or single world)
+    world_paths = _discover_worlds_in_dir(root, max_depth=2)
+    saves_sub = (root / "saves").resolve() if (root / "saves").is_dir() else None
+    loose_worlds = [w for w in world_paths if not saves_sub or w.parent.resolve() != saves_sub]
+    is_single_world = (root / "level.dat").is_file() and not (root / "saves").exists()
+
+    versions_found = []
+    if (root / "versions").is_dir():
+        for d in (root / "versions").iterdir():
+            if d.is_dir() and (d / f"{d.name}.json").is_file():
+                versions_found.append(d.name)
+            elif d.is_file() and d.suffix.lower() == ".json":
+                versions_found.append(d.stem)
+
+    resourcepacks = [p for p in ((root / "resourcepacks").iterdir() if (root / "resourcepacks").is_dir() else []) if not p.name.startswith(".")]
+    shaderpacks = [p for p in ((root / "shaderpacks").iterdir() if (root / "shaderpacks").is_dir() else []) if not p.name.startswith(".")]
+    screenshots = [p for p in ((root / "screenshots").iterdir() if (root / "screenshots").is_dir() else []) if p.is_file()]
+
+    # Detect non-standard / custom layout (e.g. loose worlds/mods without standard saves/mods/versions folders)
+    has_nonstandard_layout = bool(
+        (loose_worlds and not is_single_world and not (root / "saves").is_dir())
+        or loose_mods
+        or (root / "overrides").is_dir()
+    )
+
+    return {
+        "exists": True,
+        "resolved_root": str(root),
+        "orig_dir": str(orig_dir),
+        "suggested_name": suggested_name or "Imported Profile",
+        "detected_loader": detected_loader or "none",
+        "detected_mc_version": detected_mc,
+        "picked_subfolder_kind": picked_subfolder_kind,
+        "parent_candidate": parent_candidate,
+        "accidental_warning": accidental_warning,
+        "has_nonstandard_layout": has_nonstandard_layout,
+        "mods_count": len(mod_paths),
+        "loose_mods_count": len(loose_mods),
+        "mod_paths": [str(p) for p in mod_paths],
+        "worlds_count": len(world_paths),
+        "loose_worlds_count": len(loose_worlds),
+        "world_paths": [str(w) for w in world_paths],
+        "versions_found": sorted(set(versions_found)),
+        "resourcepacks_count": len(resourcepacks),
+        "shaderpacks_count": len(shaderpacks),
+        "screenshots_count": len(screenshots),
+        "has_config": (root / "config").is_dir() or (root / "overrides" / "config").is_dir(),
+        "has_options_txt": (root / "options.txt").is_file(),
+        "has_servers_dat": (root / "servers.dat").is_file(),
+        "is_single_world": is_single_world,
+    }
+
+
+def _copy_merge_tree(src: Path, dst: Path):
+    import shutil
+    if src.is_dir():
+        dst.mkdir(parents=True, exist_ok=True)
+        for item in src.iterdir():
+            _copy_merge_tree(item, dst / item.name)
+    elif src.is_file():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if not dst.exists():
+            shutil.copy2(str(src), str(dst))
+
+
+def import_worlds_to_profile(sources: list, profile_name: str, as_links: bool = False) -> list[str]:
+    """
+    Import worlds from any list of world folders, saves/ folders, custom backup folders, or .zip archives
+    Cleanly organizes discovered `level.dat` worlds into `get_dir("saves", profile_name=profile_name)`.
+    """
+    import zipfile
+    import tempfile
+    import shutil
+    saves_dir = get_dir("saves", profile_name=profile_name)
+    saves_dir.mkdir(parents=True, exist_ok=True)
+    imported_names: list[str] = []
+
+    def _next_dest(w_name: str) -> Path:
+        cand = saves_dir / w_name
+        if not cand.exists():
+            return cand
+        idx = 2
+        while (saves_dir / f"{w_name}_{idx}").exists():
+            idx += 1
+        return saves_dir / f"{w_name}_{idx}"
+
+    for raw_src in sources:
+        sp = Path(raw_src)
+        if sp.is_file() and sp.suffix.lower() == ".zip":
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as ztd:
+                try:
+                    with zipfile.ZipFile(sp, "r") as zf:
+                        zf.extractall(ztd)
+                    for w_dir in _discover_worlds_in_dir(Path(ztd), max_depth=3):
+                        w_name = sp.stem if w_dir == Path(ztd) else w_dir.name
+                        dest = _next_dest(w_name)
+                        shutil.copytree(str(w_dir), str(dest))
+                        imported_names.append(dest.name)
+                except Exception:
+                    pass
+        elif sp.is_dir():
+            for w_dir in _discover_worlds_in_dir(sp, max_depth=2):
+                dest = _next_dest(w_dir.name)
+                if as_links:
+                    ok, _ = link_profile_subfolder(dest, w_dir)
+                    if ok:
+                        imported_names.append(dest.name)
+                else:
+                    shutil.copytree(str(w_dir), str(dest))
+                    imported_names.append(dest.name)
+    return imported_names
+
+
+def import_mods_to_profile(sources: list, profile_name: str) -> tuple[list[str], list[str]]:
+    """
+    Copy selected .jar/.jar.disabled mod files or folders of mods into the profile's mods/ folder.
+    Returns `(imported_filenames, detected_loader_hints)`.
+    """
+    import shutil
+    mods_dir = get_dir("mods", profile_name=profile_name)
+    mods_dir.mkdir(parents=True, exist_ok=True)
+    imported: list[str] = []
+    hints: list[str] = []
+
+    def _collect(p: Path):
+        if p.is_file() and (p.suffix.lower() in (".jar", ".zip") or p.name.lower().endswith(".jar.disabled")):
+            dest = mods_dir / p.name
+            if not dest.exists():
+                shutil.copy2(str(p), str(dest))
+            imported.append(p.name)
+            if p.suffix.lower() == ".jar":
+                h = _inspect_jar_mod_hint(p)
+                if h and h not in hints:
+                    hints.append(h)
+        elif p.is_dir():
+            scan = p / "mods" if (p / "mods").is_dir() else p
+            for ch in sorted(scan.iterdir(), key=lambda x: x.name.lower()):
+                if ch.is_file():
+                    _collect(ch)
+
+    for raw in sources:
+        _collect(Path(raw))
+    return imported, hints
+
+
+def import_profile_from_directory(
+    source_dir: Path,
+    profile_name: str,
+    mode: str = "organize",
+    share_versions: bool = True,
+    link_saves_from: str = None,
+    auto_sort_loose: bool = True,
+    preferred_loader: str = None,
+    preferred_version: str = None,
+    set_active: bool = True,
+    ram_mb: int = None,
+    include_mods: bool = True,
+    include_worlds: bool = True,
+    include_resourcepacks: bool = True,
+    include_shaderpacks: bool = True,
+    include_config: bool = True,
+    include_versions: bool = True,
+) -> dict:
+    """
+    Create or import a launcher profile from `source_dir`:
+    - mode='organize': copies & auto-sorts files cleanly into `minecraft_downloads/profiles/<slug>/`
+    - mode='in_place': points profile directly at the resolved directory (optionally sorting loose files inside it)
+    Supports selective imports and non-standard / accidentally-selected `mods/` or `saves/` layouts.
+    """
+    import shutil
+    info = analyze_import_directory(source_dir)
+    if not info.get("exists"):
+        raise FileNotFoundError(f"Directory does not exist: {source_dir}")
+
+    src_root = Path(info["resolved_root"])
+    p_name = (profile_name or info.get("suggested_name") or "Imported").strip()
+    slug = safe_profile_folder_name(p_name)
+
+    copied_items = 0
+    if mode == "organize":
+        rel_base = f"minecraft_downloads/profiles/{slug}"
+        target_base = ROOT_DIR / rel_base
+        target_base.mkdir(parents=True, exist_ok=True)
+
+        folders_map = []
+        if include_mods:
+            folders_map.append("mods")
+        if include_config:
+            folders_map.append("config")
+        if include_resourcepacks:
+            folders_map.append("resourcepacks")
+        if include_shaderpacks:
+            folders_map.append("shaderpacks")
+        folders_map.append("screenshots")
+        if include_worlds and not link_saves_from:
+            folders_map.append("saves")
+        if include_versions and not share_versions and (src_root / "versions").is_dir():
+            folders_map.append("versions")
+
+        for sub in folders_map:
+            for base_cand in (src_root, src_root / "overrides"):
+                src_sub = base_cand / sub
+                if src_sub.is_dir():
+                    _copy_merge_tree(src_sub, target_base / sub)
+                    copied_items += 1
+
+        # Copy all discovered worlds (including nested custom folders or single world picks) cleanly into saves/
+        if include_worlds and not link_saves_from:
+            saves_dest = target_base / "saves"
+            saves_dest.mkdir(parents=True, exist_ok=True)
+            for wp_str in info.get("world_paths") or []:
+                wp = Path(wp_str)
+                if wp.is_dir():
+                    dest_w = saves_dest / wp.name
+                    if not dest_w.exists():
+                        _copy_merge_tree(wp, dest_w)
+                        copied_items += 1
+
+        # Copy all discovered mods (handling picked mods/ folder OR loose mod jars in root)
+        if include_mods and auto_sort_loose:
+            (target_base / "mods").mkdir(parents=True, exist_ok=True)
+            for mp_str in info.get("mod_paths") or []:
+                mp = Path(mp_str)
+                if mp.is_file():
+                    dest = target_base / "mods" / mp.name
+                    if not dest.exists():
+                        shutil.copy2(str(mp), str(dest))
+                        copied_items += 1
+
+        if include_config:
+            for base_cand in (src_root, src_root / "overrides"):
+                for fname in ("options.txt", "servers.dat"):
+                    fp = base_cand / fname
+                    if fp.is_file() and not (target_base / fname).exists():
+                        shutil.copy2(str(fp), str(target_base / fname))
+                        copied_items += 1
+
+        base_cfg_val = rel_base
+    else:
+        target_base = src_root
+        target_base.mkdir(parents=True, exist_ok=True)
+        if auto_sort_loose and not info.get("is_single_world"):
+            for p in list(target_base.iterdir()):
+                if p.is_file() and p.suffix.lower() == ".jar":
+                    hint = _inspect_jar_mod_hint(p)
+                    if hint or "client" not in p.name.lower():
+                        (target_base / "mods").mkdir(parents=True, exist_ok=True)
+                        dest = target_base / "mods" / p.name
+                        if not dest.exists():
+                            shutil.move(str(p), str(dest))
+                            copied_items += 1
+                elif p.is_dir() and (p / "level.dat").exists():
+                    (target_base / "saves").mkdir(parents=True, exist_ok=True)
+                    dest = target_base / "saves" / p.name
+                    if not dest.exists():
+                        shutil.move(str(p), str(dest))
+                        copied_items += 1
+        base_cfg_val = str(target_base.resolve()).replace('\\', '/')
+
+    link_mode = "profile" if link_saves_from else "isolated"
+    entry = build_profile_dirs(
+        p_name,
+        base_dir=base_cfg_val,
+        isolate_versions=not bool(share_versions),
+        link_saves_mode=link_mode,
+        link_saves_profile=link_saves_from,
+        preferred_loader=preferred_loader or info.get("detected_loader"),
+        preferred_version=preferred_version or (info["versions_found"][0] if info.get("versions_found") else None),
+        ram_mb=ram_mb,
+    )
+
+    config = load_launcher_config()
+    profiles = config.get("profiles") or {}
+    if not isinstance(profiles, dict):
+        profiles = {}
+    profiles[p_name] = entry
+    config["profiles"] = profiles
+    if set_active:
+        config["active_profile"] = p_name
+    save_launcher_config(config)
+
+    link_msgs = ensure_profile_links(p_name)
+    return {
+        "profile_name": p_name,
+        "entry": entry,
+        "analysis": info,
+        "copied_items": copied_items,
+        "link_messages": link_msgs,
+    }
+
+
+def inspect_profile_directory_links(profile_name: str) -> list[dict]:
+    """
+    Inspect every directory path of `profile_name` and automatically detect:
+    - Configured cross-profile links (`saves_link_profile`, etc.)
+    - Active filesystem symlinks, Windows NTFS junctions, or mirror-sync fallback markers
+    - Shared engine/version directories used by multiple profiles
+    - Reverse links where OTHER profiles link to or share this exact directory!
+    """
+    config = load_launcher_config()
+    profiles = config.get("profiles") or {}
+    dirs = profiles.get(profile_name, {})
+    if not isinstance(dirs, dict):
+        dirs = {}
+
+    dir_defs = [
+        ("base", "Base (Game Dir)"),
+        ("saves", "Saves (Worlds)"),
+        ("versions", "Versions"),
+        ("mods", "Mods"),
+        ("resourcepacks", "Resource Packs"),
+        ("shaderpacks", "Shader Packs"),
+        ("screenshots", "Screenshots"),
+        ("assets", "Assets"),
+        ("libraries", "Libraries"),
+        ("indexes", "Indexes"),
+        ("java", "Java"),
+        ("source", "Source"),
+    ]
+
+    # Map every resolved path -> set of OTHER profiles pointing to that same path
+    reverse_users: dict[tuple[str, str], list[str]] = {}
+    for other_name in profiles.keys():
+        if other_name == profile_name:
+            continue
+        for k, _ in dir_defs:
+            try:
+                rp = str(get_dir(k, profile_name=other_name).resolve())
+                reverse_users.setdefault((k, rp), []).append(other_name)
+            except Exception:
+                pass
+
+    results: list[dict] = []
+    base_dir = get_dir("base", profile_name=profile_name)
+    for key, label in dir_defs:
+        resolved_p = get_dir(key, profile_name=profile_name)
+        resolved_str = str(resolved_p.resolve())
+        cfg_val = str(dirs.get(key) or "")
+        link_p = (base_dir / key) if key in LINKABLE_GAME_SUBFOLDERS else resolved_p
+
+        link_mode = dirs.get(f"{key}_link_mode", "isolated") if key in LINKABLE_GAME_SUBFOLDERS else None
+        link_target_prof = dirs.get(f"{key}_link_profile") if key in LINKABLE_GAME_SUBFOLDERS else None
+
+        is_sym = False
+        is_junc = False
+        is_mirror = False
+        real_fs_target = None
+        if _is_reparse_or_symlink(link_p):
+            try:
+                if link_p.is_symlink():
+                    is_sym = True
+                else:
+                    is_junc = True
+                real_fs_target = str(link_p.resolve())
+            except Exception:
+                pass
+        elif (link_p / ".pymc_link_target").is_file():
+            is_mirror = True
+            try:
+                real_fs_target = (link_p / ".pymc_link_target").read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+
+        shared_by = reverse_users.get((key, resolved_str), [])
+
+        if link_mode == "profile" and link_target_prof:
+            mech = "Symlink" if is_sym else ("Junction" if is_junc else ("Mirror Sync" if is_mirror else "Pending Link"))
+            badge = f"Linked -> Profile '{link_target_prof}' ({mech})"
+            status = "linked_profile"
+        elif link_mode == "custom":
+            mech = "Symlink" if is_sym else ("Junction" if is_junc else ("Mirror Sync" if is_mirror else "Custom"))
+            badge = f"Linked -> Custom Folder ({mech})"
+            status = "linked_custom"
+        elif is_sym or is_junc:
+            mech = "OS Symlink" if is_sym else "NTFS Junction"
+            badge = f"{mech} -> {real_fs_target or resolved_str}"
+            status = "os_symlink" if is_sym else "os_junction"
+        elif is_mirror:
+            badge = f"Mirror-Synced <-> {real_fs_target or resolved_str}"
+            status = "mirror_sync"
+        elif shared_by:
+            preview = ", ".join(shared_by[:3]) + ("..." if len(shared_by) > 3 else "")
+            badge = f"Shared with {len(shared_by)} profile(s): {preview}"
+            status = "shared_with_others"
+        else:
+            badge = "Isolated (This profile only)"
+            status = "isolated"
+
+        results.append({
+            "key": key,
+            "label": label,
+            "configured": cfg_val or str(resolved_p),
+            "resolved": resolved_str,
+            "exists": resolved_p.exists(),
+            "status": status,
+            "badge": badge,
+            "shared_by": shared_by,
+        })
+    return results
+
+
+def get_profile_stats(profile_name: str) -> dict:
+    """Return quick counts of worlds, mods, packs, versions, and link settings for a profile."""
+    config = load_launcher_config()
+    dirs = (config.get("profiles") or {}).get(profile_name, {})
+    if not isinstance(dirs, dict):
+        dirs = {}
+    base_dir = get_dir("base", profile_name=profile_name)
+    saves_dir = get_dir("saves", profile_name=profile_name)
+    mods_dir = get_dir("mods", profile_name=profile_name)
+    rp_dir = get_dir("resourcepacks", profile_name=profile_name)
+    sp_dir = get_dir("shaderpacks", profile_name=profile_name)
+
+    worlds = []
+    if saves_dir.exists():
+        worlds = [d.name for d in saves_dir.iterdir() if d.is_dir() and (d / "level.dat").exists()]
+    active_mods = []
+    disabled_mods = []
+    if mods_dir.exists():
+        for f in mods_dir.iterdir():
+            if f.is_file():
+                if f.suffix.lower() == ".jar":
+                    active_mods.append(f.name)
+                elif f.name.lower().endswith(".jar.disabled"):
+                    disabled_mods.append(f.name)
+
+    rp_cnt = len([p for p in rp_dir.iterdir() if not p.name.startswith(".")]) if rp_dir.exists() else 0
+    sp_cnt = len([p for p in sp_dir.iterdir() if not p.name.startswith(".")]) if sp_dir.exists() else 0
+    vers = get_downloaded_versions(profile_name=profile_name)
+
+    ver_cfg = str(dirs.get("versions", "")).replace("\\", "/")
+    is_isolated_vers = bool(dirs.get("isolate_versions")) or (ver_cfg and str((base_dir / "versions").resolve()).replace("\\", "/") == str(get_dir("versions", profile_name=profile_name).resolve()).replace("\\", "/"))
+
+    return {
+        "base_dir": str(base_dir),
+        "saves_dir": str(saves_dir),
+        "mods_dir": str(mods_dir),
+        "worlds": sorted(worlds),
+        "active_mods": sorted(active_mods),
+        "disabled_mods": sorted(disabled_mods),
+        "resourcepacks_count": rp_cnt,
+        "shaderpacks_count": sp_cnt,
+        "versions": sorted(vers),
+        "isolate_versions": is_isolated_vers,
+        "saves_link_mode": dirs.get("saves_link_mode", "isolated"),
+        "saves_link_profile": dirs.get("saves_link_profile"),
+        "preferred_loader": dirs.get("preferred_loader"),
+        "preferred_version": dirs.get("preferred_version"),
+        "ram_mb": dirs.get("ram_mb"),
+    }
+
+
+def rename_profile_in_config(old_name: str, new_name: str) -> tuple[bool, str]:
+    new_n = (new_name or "").strip()
+    if not new_n:
+        return False, "Profile name cannot be empty."
+    config = load_launcher_config()
+    profiles = config.get("profiles") or {}
+    if old_name not in profiles:
+        return False, f"Profile '{old_name}' not found."
+    if new_n in profiles and new_n != old_name:
+        return False, f"Profile '{new_n}' already exists."
+    if new_n == old_name:
+        return True, "Unchanged."
+
+    new_profiles = {}
+    for k, v in profiles.items():
+        key = new_n if k == old_name else k
+        if isinstance(v, dict):
+            for folder in LINKABLE_GAME_SUBFOLDERS:
+                if v.get(f"{folder}_link_profile") == old_name:
+                    v[f"{folder}_link_profile"] = new_n
+        new_profiles[key] = v
+    config["profiles"] = new_profiles
+    if config.get("active_profile") == old_name:
+        config["active_profile"] = new_n
+    save_launcher_config(config)
+    return True, f"Renamed '{old_name}' to '{new_n}'."
+
+
+def duplicate_profile_in_config(
+    src_name: str,
+    new_name: str,
+    copy_mods: bool = True,
+    copy_saves: bool = False,
+    isolate_versions: bool = None,
+) -> tuple[bool, str]:
+    import shutil
+    new_n = (new_name or "").strip()
+    if not new_n:
+        return False, "New profile name cannot be empty."
+    config = load_launcher_config()
+    profiles = config.get("profiles") or {}
+    if src_name not in profiles:
+        return False, f"Source profile '{src_name}' not found."
+    if new_n in profiles:
+        return False, f"Profile '{new_n}' already exists."
+
+    src_dirs = profiles[src_name] if isinstance(profiles[src_name], dict) else {}
+    src_stats = get_profile_stats(src_name)
+    iso_v = src_stats["isolate_versions"] if isolate_versions is None else bool(isolate_versions)
+
+    new_entry = build_profile_dirs(
+        new_n,
+        isolate_versions=iso_v,
+        link_saves_mode=src_dirs.get("saves_link_mode", "isolated") if not copy_saves else "isolated",
+        link_saves_profile=src_dirs.get("saves_link_profile") if not copy_saves else None,
+        preferred_loader=src_dirs.get("preferred_loader"),
+        preferred_version=src_dirs.get("preferred_version"),
+        ram_mb=src_dirs.get("ram_mb"),
+    )
+    new_base = ROOT_DIR / new_entry["base"]
+    new_base.mkdir(parents=True, exist_ok=True)
+    src_base = get_dir("base", profile_name=src_name)
+
+    def _copy_if_exists(sub: str):
+        s = src_base / sub
+        if s.exists():
+            d = new_base / sub
+            if s.is_dir():
+                shutil.copytree(str(s), str(d), dirs_exist_ok=True)
+            elif s.is_file():
+                d.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(s), str(d))
+
+    for item_name in ("config", "resourcepacks", "shaderpacks", "options.txt", "servers.dat"):
+        _copy_if_exists(item_name)
+    if copy_mods:
+        _copy_if_exists("mods")
+    if copy_saves:
+        _copy_if_exists("saves")
+
+    profiles[new_n] = new_entry
+    config["profiles"] = profiles
+    save_launcher_config(config)
+    ensure_profile_links(new_n)
+    return True, f"Duplicated '{src_name}' into '{new_n}'."
+
+
+def get_profile_launch_settings(profile_name: str = None) -> dict:
+    """Return optional per-profile launch settings (ram_mb, jvm_args, resolution, preferred loader/version)."""
+    config = load_launcher_config()
+    active = profile_name or config.get("active_profile", "Default")
+    dirs = (config.get("profiles") or {}).get(active, {})
+    if not isinstance(dirs, dict):
+        dirs = {}
+    return {
+        "ram_mb": dirs.get("ram_mb"),
+        "jvm_args": dirs.get("jvm_args", ""),
+        "win_width": dirs.get("win_width"),
+        "win_height": dirs.get("win_height"),
+        "preferred_loader": dirs.get("preferred_loader"),
+        "preferred_version": dirs.get("preferred_version"),
+    }
+
+
+def make_install_queue_id(profile: str, loader_id: str, mc_version: str, build_ver: str = "") -> str:
+    return f"{profile or 'Default'}|{(loader_id or 'none').lower()}|{mc_version}|{build_ver or ''}"
+
+
+def get_pending_install_queue() -> list[dict]:
+    """Return persisted list of queued install targets for the Play tab & Versions tab."""
+    cfg = load_launcher_config()
+    q = cfg.get("pending_install_queue")
+    return [dict(item) for item in q if isinstance(item, dict)] if isinstance(q, list) else []
+
+
+def save_pending_install_queue(items: list[dict]):
+    cfg = load_launcher_config()
+    cfg["pending_install_queue"] = [dict(item) for item in (items or []) if isinstance(item, dict)]
+    save_launcher_config(cfg)
+
+
+def add_pending_install_items(new_items: list[dict]) -> list[dict]:
+    """Add new install targets to the persisted queue (deduplicated by target id)."""
+    existing = get_pending_install_queue()
+    seen = {str(x.get("id") or make_install_queue_id(x.get("profile", "Default"), x.get("loader_id", "none"), x.get("mc_version", ""), str((x.get("build_entry") or {}).get("version") or ""))) for x in existing}
+    added = []
+    for raw in (new_items or []):
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        bver = str((item.get("build_entry") or {}).get("version") or item.get("build_version") or "")
+        qid = str(item.get("id") or make_install_queue_id(item.get("profile", "Default"), item.get("loader_id", "none"), item.get("mc_version", ""), bver))
+        item["id"] = qid
+        if qid not in seen:
+            seen.add(qid)
+            existing.append(item)
+            added.append(item)
+    save_pending_install_queue(existing)
+    return added
+
+
+def remove_pending_install_items(item_ids: set[str]) -> list[dict]:
+    """Remove install targets matching item_ids from the persisted queue."""
+    existing = get_pending_install_queue()
+    kept = [x for x in existing if str(x.get("id") or "") not in item_ids]
+    save_pending_install_queue(kept)
+    return kept
 
 
 if __name__ == "__main__":
