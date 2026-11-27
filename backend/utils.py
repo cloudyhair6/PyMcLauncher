@@ -16,23 +16,49 @@ import requests.adapters
 MINECRAFT_VERSION_MANIFEST_URL = "https://launchermeta.mojang.com/mc/game/version_manifest.json"
 
 def get_root_dir() -> Path:
+    """Resolve persistent app data/executable root directory (works for both source & compiled builds)."""
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).resolve()
+        if sys.platform == "darwin":
+            for parent in exe.parents:
+                if parent.suffix == ".app":
+                    app_parent = parent.parent
+                    if os.access(app_parent, os.W_OK):
+                        return app_parent
+                    support_dir = Path.home() / "Library" / "Application Support" / "PyMcLauncher"
+                    support_dir.mkdir(parents=True, exist_ok=True)
+                    return support_dir
+        return exe.parent
     p = Path(__file__).resolve().parent
     if p.name == "backend":
         return p.parent
     return p
 
+
+def get_resource_dir() -> Path:
+    """Resolve read-only bundled resource root (sys._MEIPASS when compiled, else project root)."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if getattr(sys, "frozen", False) and meipass:
+        return Path(meipass)
+    p = Path(__file__).resolve().parent
+    if p.name == "backend":
+        return p.parent
+    return p
+
+
 ROOT_DIR = get_root_dir()
+RESOURCE_DIR = get_resource_dir()
 DOWNLOAD_DIR = ROOT_DIR / "minecraft_downloads"
 
+
 def get_image_path(rel_path: str) -> str:
-    """Resolve an image path from the 'images' folder (with fallback to 'files')."""
-    p = ROOT_DIR / "images" / rel_path
-    if p.exists():
-        return str(p)
-    p_files = ROOT_DIR / "files" / rel_path
-    if p_files.exists():
-        return str(p_files)
-    return str(p)
+    """Resolve an image path from disk overrides or bundled resources ('images' or 'files')."""
+    for base in (ROOT_DIR, RESOURCE_DIR):
+        for folder in ("images", "files"):
+            cand = base / folder / rel_path
+            if cand.exists():
+                return str(cand)
+    return str(ROOT_DIR / "images" / rel_path)
 
 # Shared HTTP session with connection pooling to avoid repeated TCP/TLS handshakes across steps
 http_session = requests.Session()

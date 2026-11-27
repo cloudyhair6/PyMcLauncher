@@ -1661,8 +1661,17 @@ def main():
             print("Account discovery requires utils.py.")
         return
 
-    _pkg_dir = Path(__file__).resolve().parent
-    _root_dir = _pkg_dir.parent if _pkg_dir.name == "backend" else _pkg_dir
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).resolve()
+        _root_dir = exe.parent
+        if sys.platform == "darwin":
+            for _parent in exe.parents:
+                if _parent.suffix == ".app":
+                    _root_dir = _parent.parent if os.access(_parent.parent, os.W_OK) else (Path.home() / "Library" / "Application Support" / "PyMcLauncher")
+                    break
+    else:
+        _pkg_dir = Path(__file__).resolve().parent
+        _root_dir = _pkg_dir.parent if _pkg_dir.name == "backend" else _pkg_dir
     cache_dir = _root_dir / ".cache" / args.profile / "minecraft-auth-cache"
 
     if args.logout:

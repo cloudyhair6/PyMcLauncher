@@ -7,43 +7,85 @@
 *.bash text eol=lf
 *.zsh text eol=lf
 
-# Source code and configuration files: enforce LF line endings
+# Source code, packaging, and configuration files: enforce LF line endings
 *.py text eol=lf
+*.pyw text eol=lf
+*.pyi text eol=lf
+*.spec text eol=lf
 *.json text eol=lf
+*.mcmeta text eol=lf
 *.md text eol=lf
 *.txt text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+*.cfg text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 *.xml text eol=lf
+*.manifest text eol=lf
 *.svg text eol=lf
 *.css text eol=lf
 *.html text eol=lf
 *.plist text eol=lf
 .gitattributes text eol=lf
 .gitignore text eol=lf
+.gitmodules text eol=lf
 
-# Windows batch files must retain CRLF line endings
+# Windows batch and PowerShell scripts must retain CRLF line endings
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
 
-# Binary files (do not touch line endings or modify bytes)
+# Compiled code, executables, and bundle binaries (do not touch bytes)
 *.jar binary
 *.class binary
+*.pyc binary
+*.pyo binary
+*.pyd binary
 *.dll binary
 *.exe binary
 *.dylib binary
 *.so binary
+*.dmg binary
+*.pkg binary
+*.msi binary
+*.app/Contents/MacOS/* binary
+**/*.app/Contents/MacOS/* binary
+
+# Code-signing certificates / keystores
+*.pfx binary
+*.p12 binary
+*.der binary
+
+# Images, icons, fonts, and audio
 *.png binary
 *.jpg binary
 *.jpeg binary
 *.gif binary
+*.webp binary
+*.bmp binary
 *.ico binary
 *.icns binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.ogg binary
+*.wav binary
+*.mp3 binary
+
+# Archives and Minecraft / local database data files
 *.zip binary
+*.tar binary
 *.tar.gz binary
+*.tgz binary
 *.gz binary
+*.bz2 binary
+*.xz binary
+*.7z binary
 *.archive binary
 *.dat binary
 *.nbt binary
 *.db binary
+*.sqlite binary
+*.sqlite3 binary

@@ -7,13 +7,32 @@ import logging
 from typing import Optional, List, Dict
 from pathlib import Path
 
+def _resolve_launcher_root_dir() -> Path:
+    """Resolve persistent app data/executable root directory (works in source & compiled builds)."""
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).resolve()
+        if sys.platform == "darwin":
+            for parent in exe.parents:
+                if parent.suffix == ".app":
+                    app_parent = parent.parent
+                    if os.access(app_parent, os.W_OK):
+                        return app_parent
+                    support_dir = Path.home() / "Library" / "Application Support" / "PyMcLauncher"
+                    support_dir.mkdir(parents=True, exist_ok=True)
+                    return support_dir
+        return exe.parent
+    return Path(__file__).resolve().parent
+
+
 # Redirect Python bytecode cache (__pycache__) into .cache/pycache to keep workspace root clean
-_root_dir = Path(__file__).resolve().parent
+_root_dir = _resolve_launcher_root_dir()
+_resource_dir = Path(getattr(sys, "_MEIPASS", _root_dir))
 _cache_dir = _root_dir / ".cache"
 _pycache_dir = _cache_dir / "pycache"
 try:
-    _pycache_dir.mkdir(parents=True, exist_ok=True)
-    sys.pycache_prefix = str(_pycache_dir)
+    if not getattr(sys, "frozen", False):
+        _pycache_dir.mkdir(parents=True, exist_ok=True)
+        sys.pycache_prefix = str(_pycache_dir)
 except Exception:
     pass
 
@@ -24,7 +43,9 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 def get_python_cli_executable() -> str:
-    """Return python.exe (not pythonw.exe) so child QProcesses have working stdout/stderr pipes."""
+    """Return python.exe (not pythonw.exe) or compiled executable for child QProcesses."""
+    if getattr(sys, "frozen", False):
+        return str(Path(sys.executable).resolve())
     exe = Path(sys.executable)
     if exe.name.lower() == "pythonw.exe":
         console_exe = exe.with_name("python.exe")
@@ -33,7 +54,9 @@ def get_python_cli_executable() -> str:
     return sys.executable
 
 def get_python_gui_executable() -> str:
-    """Return pythonw.exe (if available) so Desktop/Start shortcuts don't spawn a console window."""
+    """Return pythonw.exe (if available) or compiled executable so shortcuts don't spawn a console window."""
+    if getattr(sys, "frozen", False):
+        return str(Path(sys.executable).resolve())
     exe = Path(sys.executable)
     if exe.name.lower() == "python.exe":
         gui_exe = exe.with_name("pythonw.exe")
@@ -43,30 +66,30 @@ def get_python_gui_executable() -> str:
 
 # Ensure backend directory is in sys.path
 _backend_dir = _root_dir / "backend"
-if str(_backend_dir) not in sys.path:
-    sys.path.insert(0, str(_backend_dir))
-if str(_root_dir) not in sys.path:
-    sys.path.insert(0, str(_root_dir))
+_res_backend_dir = _resource_dir / "backend"
+for _p in (_backend_dir, _res_backend_dir, _root_dir, _resource_dir):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 def get_script_path(script_name: str) -> str:
     """Resolve backend script path, preferring backend/ directory."""
-    b_path = _backend_dir / script_name
-    if b_path.exists():
-        return str(b_path)
-    r_path = _root_dir / script_name
-    if r_path.exists():
-        return str(r_path)
+    for base in (_root_dir, _resource_dir):
+        b_path = base / "backend" / script_name
+        if b_path.exists():
+            return str(b_path)
+        r_path = base / script_name
+        if r_path.exists():
+            return str(r_path)
     return script_name
 
 def get_image_path(rel_path: str) -> str:
-    """Resolve image path from images/ (with fallback to files/)."""
-    img_path = _root_dir / "images" / rel_path
-    if img_path.exists():
-        return str(img_path)
-    files_path = _root_dir / "files" / rel_path
-    if files_path.exists():
-        return str(files_path)
-    return str(img_path)
+    """Resolve image path from images/ (checking disk root then bundled resources)."""
+    for base in (_root_dir, _resource_dir):
+        for folder in ("images", "files"):
+            cand = base / folder / rel_path
+            if cand.exists():
+                return str(cand)
+    return str(_root_dir / "images" / rel_path)
 
 # Pre-import download and launch modules in-process so they share Mojang manifest/version caches
 # and avoid repeated Python interpreter startup overhead during the launch pipeline
@@ -775,8 +798,13 @@ class CreateShortcutDialog(QDialog):
         ver = self.version_combo.currentData()
         qp = self.qp_combo.currentData()
 
-        launcher_script = str(Path(__file__).resolve())
-        arg_parts = [f'"{launcher_script}"', "--shortcut-launch"]
+        if getattr(sys, "frozen", False):
+            target_exe = str(Path(sys.executable).resolve())
+            arg_parts = ["--shortcut-launch"]
+        else:
+            launcher_script = str(Path(__file__).resolve())
+            arg_parts = [f'"{launcher_script}"', "--shortcut-launch"]
+            target_exe = get_python_gui_executable()
         if prof:
             arg_parts.append(f'--profile "{prof}"')
         if ver:
@@ -789,7 +817,6 @@ class CreateShortcutDialog(QDialog):
                 arg_parts.append(f'--quick-play-display "{clean_disp}"')
 
         arguments_str = " ".join(arg_parts)
-        target_exe = get_python_gui_executable()
         working_dir = str(_root_dir)
 
         icon_src = self._get_effective_icon_source()
@@ -6955,7 +6982,8 @@ class LauncherGUI(QMainWindow):
             self._refresh_profile_id = get_active_profile_id()
             self.refresh_process = QProcess()
             self.refresh_process.setProgram(get_python_cli_executable())
-            self.refresh_process.setArguments([get_script_path("ms_accounts.py"), "--json", "--silent", "--profile", self._refresh_profile_id])
+            refresh_head = "--internal-ms-auth" if getattr(sys, "frozen", False) else get_script_path("ms_accounts.py")
+            self.refresh_process.setArguments([refresh_head, "--json", "--silent", "--profile", self._refresh_profile_id])
             self.refresh_process.readyReadStandardOutput.connect(self.handle_refresh_stdout)
             self.refresh_process.start()
 
@@ -8354,7 +8382,8 @@ class LauncherGUI(QMainWindow):
         use_wam = sys.platform == "win32" and not force_popup
         self._wam_fallback_eligible = use_wam
 
-        cmd_args = [get_script_path("ms_accounts.py"), "--json", "--profile", target_pid]
+        auth_head = "--internal-ms-auth" if getattr(sys, "frozen", False) else get_script_path("ms_accounts.py")
+        cmd_args = [auth_head, "--json", "--profile", target_pid]
         if use_wam:
             cmd_args.extend(["--wam", "--hwnd", str(int(self.winId()))])
             if self._pending_login_hint:
@@ -10763,6 +10792,22 @@ class LauncherGUI(QMainWindow):
             QApplication.processEvents()
 
 if __name__ == '__main__':
+    if '--internal-ms-auth' in sys.argv[1:]:
+        sys.argv = [sys.argv[0]] + [a for a in sys.argv[1:] if a != '--internal-ms-auth']
+        try:
+            import ms_accounts
+        except ImportError:
+            from backend import ms_accounts
+        sys.exit(ms_accounts.main() or 0)
+
+    if '--internal-update' in sys.argv[1:]:
+        rem_args = [a for a in sys.argv[1:] if a != '--internal-update']
+        try:
+            import launcher_update
+        except ImportError:
+            from backend import launcher_update
+        sys.exit(launcher_update.run_cli(rem_args) or 0)
+
     import argparse
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--shortcut-launch", "--auto-launch", action="store_true", dest="shortcut_launch")
@@ -10792,6 +10837,14 @@ if __name__ == '__main__':
 
     os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
     app = QApplication(sys.argv)
+    app.setApplicationName("PyMcLauncher")
+    app.setApplicationDisplayName("PyMcLauncher")
+    app.setOrganizationName("cloudyhair6")
+    try:
+        import launcher_update as _lu_meta
+        app.setApplicationVersion(getattr(_lu_meta, "DEFAULT_LAUNCHER_VERSION", "v3.1"))
+    except Exception:
+        pass
     apply_launcher_theme()
     try:
         app.setWindowIcon(get_pymclauncher_icon())

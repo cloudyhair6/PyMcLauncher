@@ -3,6 +3,8 @@ minecraft-launcher-lib
 nbt
 nbtlib
 certifi
+pillow>=10.0.0
+pyinstaller>=6.0.0
 msal[broker]>=1.30.0; sys_platform == 'win32'
 msal>=1.30.0; sys_platform != 'win32'
 PyQt6<6.8.0; sys_platform == 'darwin' and platform_release < '21.0.0'
